@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 extern "C" {
+#include "cras_alert.h"
 #include "cras_system_state.h"
 #include "cras_types.h"
 }
@@ -27,6 +28,12 @@ static void *rm_callback_arg;
 static size_t alert_pending_called;
 static char* device_config_dir;
 static const char* cras_alsa_card_config_dir;
+static size_t cras_observer_notify_output_volume_called;
+static size_t cras_observer_notify_output_mute_called;
+static size_t cras_observer_notify_capture_gain_called;
+static size_t cras_observer_notify_capture_mute_called;
+static size_t cras_observer_notify_suspend_changed_called;
+static size_t cras_observer_notify_num_active_streams_called;
 
 static void ResetStubData() {
   cras_alsa_card_create_called = 0;
@@ -40,27 +47,12 @@ static void ResetStubData() {
   alert_pending_called = 0;
   device_config_dir = reinterpret_cast<char *>(3);
   cras_alsa_card_config_dir = NULL;
-}
-
-static void volume_changed(void *arg) {
-}
-
-static void volume_limits_changed(void *arg) {
-}
-
-static void volume_limits_changed_2(void *arg) {
-}
-
-static void capture_gain_changed(void *arg) {
-}
-
-static void mute_changed(void *arg) {
-}
-
-static void capture_mute_changed(void *arg) {
-}
-
-static void capture_mute_changed_2(void *arg) {
+  cras_observer_notify_output_volume_called = 0;
+  cras_observer_notify_output_mute_called = 0;
+  cras_observer_notify_capture_gain_called = 0;
+  cras_observer_notify_capture_mute_called = 0;
+  cras_observer_notify_suspend_changed_called = 0;
+  cras_observer_notify_num_active_streams_called = 0;
 }
 
 static int add_stub(int fd, void (*cb)(void *data),
@@ -99,6 +91,7 @@ TEST(SystemStateSuite, SetVolume) {
   cras_system_set_volume(CRAS_MAX_SYSTEM_VOLUME + 1);
   EXPECT_EQ(CRAS_MAX_SYSTEM_VOLUME, cras_system_get_volume());
   cras_system_state_deinit();
+  EXPECT_EQ(4, cras_observer_notify_output_volume_called);
 }
 
 TEST(SystemStateSuite, SetMinMaxVolume) {
@@ -119,241 +112,132 @@ TEST(SystemStateSuite, SetCaptureVolume) {
   cras_system_set_capture_gain(-10000);
   EXPECT_EQ(-5000, cras_system_get_capture_gain());
   cras_system_state_deinit();
+  EXPECT_EQ(3, cras_observer_notify_capture_gain_called);
 }
 
-TEST(SystemStateSuite, VolumeChangedCallback) {
-  void * const fake_user_arg = (void *)1;
-  const size_t fake_volume = 55;
-  const size_t fake_volume_2 = 44;
-  int rc;
-
+TEST(SystemStateSuite, SetCaptureVolumeStoreTarget) {
   cras_system_state_init(device_config_dir);
-  ResetStubData();
-  cras_system_register_volume_changed_cb(volume_changed, fake_user_arg);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)volume_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg, add_callback_arg);
+  cras_system_set_capture_gain_limits(-2000, 2000);
+  cras_system_set_capture_gain(3000);
+  // Gain is within the limit.
+  EXPECT_EQ(2000, cras_system_get_capture_gain());
 
-  cras_system_set_volume(fake_volume);
-  EXPECT_EQ(fake_volume, cras_system_get_volume());
-  EXPECT_EQ(1, alert_pending_called);
+  // Assume the range is changed.
+  cras_system_set_capture_gain_limits(-4000, 4000);
 
-  rc = cras_system_remove_volume_changed_cb(volume_changed, fake_user_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)volume_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_user_arg, rm_callback_arg);
+  // Gain is also changed because target gain is re-applied.
+  EXPECT_EQ(3000, cras_system_get_capture_gain());
 
-  cras_system_set_volume(fake_volume_2);
-  EXPECT_EQ(fake_volume_2, cras_system_get_volume());
-  EXPECT_EQ(2, alert_pending_called);
   cras_system_state_deinit();
 }
 
-TEST(SystemStateSuite, VolumeLimitChangedCallbackMultiple) {
-  void * const fake_user_arg = (void *)1;
-  void * const fake_user_arg_2 = (void *)2;
-  const size_t fake_min = -10000;
-  const size_t fake_max = 800;
-  const size_t fake_min_2 = -4500;
-  const size_t fake_max_2 = -600;
-  int rc;
-
+TEST(SystemStateSuite, SetMinMaxCaptureGain) {
   cras_system_state_init(device_config_dir);
-  ResetStubData();
-  rc = cras_system_register_volume_limits_changed_cb(volume_limits_changed,
-                                                     fake_user_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)volume_limits_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg, add_callback_arg);
-
-  cras_system_register_volume_limits_changed_cb(volume_limits_changed_2,
-                                                fake_user_arg_2);
-  EXPECT_EQ(2, add_callback_called);
-  EXPECT_EQ((void *)volume_limits_changed_2, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg_2, add_callback_arg);
-
-  cras_system_set_volume_limits(fake_min, fake_max);
-  cras_system_set_capture_gain_limits(fake_min_2, fake_max_2);
-  EXPECT_EQ(fake_min, cras_system_get_min_volume());
-  EXPECT_EQ(fake_max, cras_system_get_max_volume());
-  EXPECT_EQ(2, alert_pending_called);
-
-  cras_system_remove_volume_limits_changed_cb(volume_limits_changed,
-                                              fake_user_arg);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)volume_limits_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_user_arg, rm_callback_arg);
-
-  cras_system_set_volume_limits(fake_min_2, fake_max_2);
-  EXPECT_EQ(fake_min_2, cras_system_get_min_volume());
-  EXPECT_EQ(fake_max_2, cras_system_get_max_volume());
-  EXPECT_EQ(3, alert_pending_called);
-
-  cras_system_remove_volume_limits_changed_cb(volume_limits_changed_2,
-                                              fake_user_arg_2);
-
-  cras_system_set_volume_limits(fake_min, fake_max);
-  EXPECT_EQ(fake_min, cras_system_get_min_volume());
-  EXPECT_EQ(fake_max, cras_system_get_max_volume());
-  EXPECT_EQ(4, alert_pending_called);
+  cras_system_set_capture_gain(3000);
+  cras_system_set_capture_gain_limits(-2000, 2000);
+  EXPECT_EQ(-2000, cras_system_get_min_capture_gain());
+  EXPECT_EQ(2000, cras_system_get_max_capture_gain());
+  // Current gain is adjusted for range.
+  EXPECT_EQ(2000, cras_system_get_capture_gain());
   cras_system_state_deinit();
 }
 
-TEST(SystemStateSuite, CaptureVolumeChangedCallback) {
-  void * const fake_user_arg = (void *)1;
-  const long fake_capture_gain = 2200;
-  const long fake_capture_gain_2 = -1600;
-  int rc;
-
-  cras_system_state_init(device_config_dir);
+TEST(SystemStateSuite, SetUserMute) {
   ResetStubData();
-  cras_system_register_capture_gain_changed_cb(capture_gain_changed,
-                                               fake_user_arg);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)capture_gain_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg, add_callback_arg);
+  cras_system_state_init(device_config_dir);
 
-  cras_system_set_capture_gain(fake_capture_gain);
-  EXPECT_EQ(fake_capture_gain, cras_system_get_capture_gain());
-  EXPECT_EQ(1, alert_pending_called);
+  EXPECT_EQ(0, cras_system_get_mute());
 
-  rc = cras_system_remove_capture_gain_changed_cb(capture_gain_changed,
-                                                  fake_user_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)capture_gain_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_user_arg, rm_callback_arg);
+  cras_system_set_user_mute(0);
+  EXPECT_EQ(0, cras_system_get_mute());
+  EXPECT_EQ(0, cras_observer_notify_output_mute_called);
 
-  cras_system_set_capture_gain(fake_capture_gain_2);
-  EXPECT_EQ(fake_capture_gain_2, cras_system_get_capture_gain());
-  EXPECT_EQ(2, alert_pending_called);
+  cras_system_set_user_mute(1);
+  EXPECT_EQ(1, cras_system_get_mute());
+  EXPECT_EQ(1, cras_observer_notify_output_mute_called);
+
+  cras_system_set_user_mute(22);
+  EXPECT_EQ(1, cras_system_get_mute());
+  EXPECT_EQ(1, cras_observer_notify_output_mute_called);
+
   cras_system_state_deinit();
 }
 
 TEST(SystemStateSuite, SetMute) {
+  ResetStubData();
   cras_system_state_init(device_config_dir);
+
   EXPECT_EQ(0, cras_system_get_mute());
+
   cras_system_set_mute(0);
   EXPECT_EQ(0, cras_system_get_mute());
+  EXPECT_EQ(0, cras_observer_notify_output_mute_called);
+
   cras_system_set_mute(1);
   EXPECT_EQ(1, cras_system_get_mute());
+  EXPECT_EQ(1, cras_observer_notify_output_mute_called);
+
   cras_system_set_mute(22);
   EXPECT_EQ(1, cras_system_get_mute());
-  cras_system_state_deinit();
-}
+  EXPECT_EQ(1, cras_observer_notify_output_mute_called);
 
-TEST(SystemStateSuite, MuteChangedCallback) {
-  void * const fake_user_arg = (void *)1;
-  int rc;
-
-  cras_system_state_init(device_config_dir);
-  ResetStubData();
-  cras_system_register_mute_changed_cb(mute_changed, fake_user_arg);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)mute_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg, add_callback_arg);
-
-  cras_system_set_mute(1);
-  EXPECT_EQ(1, cras_system_get_mute());
-  EXPECT_EQ(1, alert_pending_called);
-
-  rc = cras_system_remove_mute_changed_cb(mute_changed, fake_user_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)mute_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_user_arg, rm_callback_arg);
-
-  cras_system_set_mute(0);
-  EXPECT_EQ(0, cras_system_get_mute());
-  EXPECT_EQ(2, alert_pending_called);
   cras_system_state_deinit();
 }
 
 TEST(SystemStateSuite, CaptureMuteChangedCallbackMultiple) {
-  void * const fake_arg = (void *)1;
-  void * const fake_arg_2 = (void *)2;
-  int rc;
-
   cras_system_state_init(device_config_dir);
   ResetStubData();
-  rc = cras_system_register_capture_mute_changed_cb(capture_mute_changed,
-                                                    fake_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)capture_mute_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_arg, add_callback_arg);
-
-  rc = cras_system_register_capture_mute_changed_cb(capture_mute_changed_2,
-                                                    fake_arg_2);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(2, add_callback_called);
-  EXPECT_EQ((void *)capture_mute_changed_2, (void *)add_callback_cb);
-  EXPECT_EQ(fake_arg_2, add_callback_arg);
 
   cras_system_set_capture_mute(1);
   EXPECT_EQ(1, cras_system_get_capture_mute());
-  EXPECT_EQ(1, alert_pending_called);
-
-  rc = cras_system_remove_capture_mute_changed_cb(capture_mute_changed,
-                                                  fake_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)capture_mute_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_arg, rm_callback_arg);
-
+  EXPECT_EQ(1, cras_observer_notify_capture_mute_called);
   cras_system_set_capture_mute(0);
   EXPECT_EQ(0, cras_system_get_capture_mute());
-  EXPECT_EQ(2, alert_pending_called);
+  EXPECT_EQ(2, cras_observer_notify_capture_mute_called);
 
-  rc = cras_system_remove_capture_mute_changed_cb(capture_mute_changed_2,
-                                                  fake_arg_2);
-  EXPECT_EQ(0, rc);
   cras_system_state_deinit();
 }
 
 TEST(SystemStateSuite, MuteLocked) {
-  void * const fake_user_arg = (void *)1;
-  int rc;
-
   cras_system_state_init(device_config_dir);
   ResetStubData();
-
-  cras_system_register_mute_changed_cb(mute_changed, fake_user_arg);
-  EXPECT_EQ(1, add_callback_called);
-  EXPECT_EQ((void *)mute_changed, (void *)add_callback_cb);
-  EXPECT_EQ(fake_user_arg, add_callback_arg);
 
   cras_system_set_mute(1);
   EXPECT_EQ(1, cras_system_get_mute());
   EXPECT_EQ(0, cras_system_get_mute_locked());
-  EXPECT_EQ(1, alert_pending_called);
+  EXPECT_EQ(1, cras_observer_notify_output_mute_called);
 
   cras_system_set_mute_locked(1);
   cras_system_set_mute(0);
   EXPECT_EQ(1, cras_system_get_mute());
   EXPECT_EQ(1, cras_system_get_mute_locked());
-  EXPECT_EQ(1, alert_pending_called);
+  EXPECT_EQ(2, cras_observer_notify_output_mute_called);
 
-  rc = cras_system_remove_mute_changed_cb(mute_changed, fake_user_arg);
-  EXPECT_EQ(0, rc);
-  EXPECT_EQ(1, rm_callback_called);
-  EXPECT_EQ((void *)mute_changed, (void *)rm_callback_cb);
-  EXPECT_EQ(fake_user_arg, rm_callback_arg);
-
-  cras_system_register_capture_mute_changed_cb(capture_mute_changed,
-                                               fake_user_arg);
   cras_system_set_capture_mute(1);
   EXPECT_EQ(1, cras_system_get_capture_mute());
   EXPECT_EQ(0, cras_system_get_capture_mute_locked());
-  EXPECT_EQ(2, alert_pending_called);
+  EXPECT_EQ(1, cras_observer_notify_capture_mute_called);
 
   cras_system_set_capture_mute_locked(1);
   cras_system_set_capture_mute(0);
   EXPECT_EQ(1, cras_system_get_capture_mute());
   EXPECT_EQ(1, cras_system_get_capture_mute_locked());
-  EXPECT_EQ(2, alert_pending_called);
+  cras_system_state_deinit();
+  EXPECT_EQ(2, cras_observer_notify_capture_mute_called);
+}
+
+TEST(SystemStateSuite, Suspend) {
+  cras_system_state_init(device_config_dir);
+  ResetStubData();
+
+  cras_system_set_suspended(1);
+  EXPECT_EQ(1, cras_observer_notify_suspend_changed_called);
+  EXPECT_EQ(1, cras_system_get_suspended());
+
+  cras_system_set_suspended(0);
+  EXPECT_EQ(2, cras_observer_notify_suspend_changed_called);
+  EXPECT_EQ(0, cras_system_get_suspended());
+
   cras_system_state_deinit();
 }
 
@@ -368,6 +252,7 @@ TEST(SystemStateSuite, AddCardFailCreate) {
   EXPECT_EQ(-ENOMEM, cras_system_add_alsa_card(&info));
   EXPECT_EQ(1, cras_alsa_card_create_called);
   EXPECT_EQ(cras_alsa_card_config_dir, device_config_dir);
+  cras_system_state_deinit();
 }
 
 TEST(SystemStateSuite, AddCard) {
@@ -387,6 +272,7 @@ TEST(SystemStateSuite, AddCard) {
   // Removing card should destroy it.
   cras_system_remove_alsa_card(0);
   EXPECT_EQ(1, cras_alsa_card_destroy_called);
+  cras_system_state_deinit();
 }
 
 TEST(SystemSettingsRegisterSelectDescriptor, AddSelectFd) {
@@ -454,6 +340,7 @@ TEST(SystemSettingsStreamCount, StreamCountByDirection) {
 	cras_system_state_get_active_streams_by_direction(
 		CRAS_STREAM_POST_MIX_PRE_DSP));
   EXPECT_EQ(3, cras_system_state_get_active_streams());
+  EXPECT_EQ(3, cras_observer_notify_num_active_streams_called);
   cras_system_state_stream_removed(CRAS_STREAM_OUTPUT);
   cras_system_state_stream_removed(CRAS_STREAM_INPUT);
   cras_system_state_stream_removed(CRAS_STREAM_POST_MIX_PRE_DSP);
@@ -467,6 +354,7 @@ TEST(SystemSettingsStreamCount, StreamCountByDirection) {
 	cras_system_state_get_active_streams_by_direction(
 		CRAS_STREAM_POST_MIX_PRE_DSP));
   EXPECT_EQ(0, cras_system_state_get_active_streams());
+  EXPECT_EQ(6, cras_observer_notify_num_active_streams_called);
 
   cras_system_state_deinit();
 }
@@ -500,7 +388,8 @@ void cras_device_blacklist_destroy(struct cras_device_blacklist *blacklist)
 {
 }
 
-struct cras_alert *cras_alert_create(cras_alert_prepare prepare)
+struct cras_alert *cras_alert_create(cras_alert_prepare prepare,
+                                     unsigned int flags)
 {
   return NULL;
 }
@@ -538,6 +427,38 @@ cras_tm *cras_tm_init() {
 
 void cras_tm_deinit(cras_tm *tm) {
   free(tm);
+}
+
+void cras_observer_notify_output_volume(int32_t volume)
+{
+  cras_observer_notify_output_volume_called++;
+}
+
+void cras_observer_notify_output_mute(int muted, int user_muted,
+				      int mute_locked)
+{
+  cras_observer_notify_output_mute_called++;
+}
+
+void cras_observer_notify_capture_gain(int32_t gain)
+{
+  cras_observer_notify_capture_gain_called++;
+}
+
+void cras_observer_notify_capture_mute(int muted, int mute_locked)
+{
+  cras_observer_notify_capture_mute_called++;
+}
+
+void cras_observer_notify_suspend_changed(int suspended)
+{
+  cras_observer_notify_suspend_changed_called++;
+}
+
+void cras_observer_notify_num_active_streams(enum CRAS_STREAM_DIRECTION dir,
+					     uint32_t num_active_streams)
+{
+  cras_observer_notify_num_active_streams_called++;
 }
 
 }  // extern "C"

@@ -22,6 +22,9 @@
 /* Assert the channel is defined in CRAS_CHANNELS. */
 #define ALSA_CH_VALID(ch) ((ch >= SND_CHMAP_FL) && (ch <= SND_CHMAP_FRC))
 
+/* Time difference between two consecutive underrun logs. */
+#define UNDERRUN_LOG_TIME_SECS 30
+
 /* Chances to give mmap_begin to work. */
 static const size_t MAX_MMAP_BEGIN_ATTEMPTS = 3;
 /* Time to sleep between resume attempts. */
@@ -81,6 +84,8 @@ static snd_pcm_chmap_query_t *cras_chmap_caps_match(
 		for (ch = 0; ch < CRAS_CH_MAX; ch++) {
 			idx = fmt->channel_layout[ch];
 			if (idx == -1)
+				continue;
+			if ((unsigned)idx >= (*chmap)->map.channels)
 				continue;
 			if ((*chmap)->map.pos[idx] != CH_TO_ALSA(ch)) {
 				matches = 0;
@@ -255,6 +260,47 @@ int cras_alsa_pcm_drain(snd_pcm_t *handle)
 	return snd_pcm_drain(handle);
 }
 
+int cras_alsa_resume_appl_ptr(snd_pcm_t *handle, snd_pcm_uframes_t ahead)
+{
+	int rc;
+	snd_pcm_uframes_t period_frames, buffer_frames;
+	snd_pcm_sframes_t to_move, avail_frames;
+	rc = snd_pcm_avail(handle);
+	if (rc == -EPIPE || rc == -ESTRPIPE) {
+		cras_alsa_attempt_resume(handle);
+		avail_frames = 0;
+	} else if (rc < 0) {
+		syslog(LOG_ERR, "Fail to get avail frames: %s",
+		       snd_strerror(rc));
+		return rc;
+	} else {
+		avail_frames = rc;
+	}
+
+	rc = snd_pcm_get_params(handle, &buffer_frames, &period_frames);
+	if (rc < 0) {
+		syslog(LOG_ERR, "Fail to get buffer size: %s",
+		       snd_strerror(rc));
+		return rc;
+	}
+
+	to_move = avail_frames - buffer_frames + ahead;
+	if (to_move > 0) {
+		rc = snd_pcm_forward(handle, to_move);
+	} else if (to_move < 0) {
+		rc = snd_pcm_rewind(handle, -to_move);
+	} else {
+		return 0;
+	}
+
+	if (rc < 0) {
+		syslog(LOG_ERR, "Fail to resume appl_ptr: %s",
+		       snd_strerror(rc));
+		return rc;
+	}
+	return 0;
+}
+
 int cras_alsa_set_channel_map(snd_pcm_t *handle,
 			      struct cras_audio_format *fmt)
 {
@@ -417,7 +463,8 @@ int cras_alsa_fill_properties(const char *dev, snd_pcm_stream_t stream,
 }
 
 int cras_alsa_set_hwparams(snd_pcm_t *handle, struct cras_audio_format *format,
-			   snd_pcm_uframes_t *buffer_frames)
+			   snd_pcm_uframes_t *buffer_frames, int period_wakeup,
+			   unsigned int dma_period_time)
 {
 	unsigned int rate, ret_rate;
 	int err;
@@ -444,12 +491,31 @@ int cras_alsa_set_hwparams(snd_pcm_t *handle, struct cras_audio_format *format,
 		syslog(LOG_ERR, "Setting interleaved %s\n", snd_strerror(err));
 		return err;
 	}
-	/* Try to disable ALSA wakeups, we'll keep a timer. */
-	if (snd_pcm_hw_params_can_disable_period_wakeup(hwparams)) {
+	/* If period_wakeup flag is not set, try to disable ALSA wakeups,
+	 * we'll keep a timer. */
+	if (!period_wakeup &&
+	    snd_pcm_hw_params_can_disable_period_wakeup(hwparams)) {
 		err = snd_pcm_hw_params_set_period_wakeup(handle, hwparams, 0);
 		if (err < 0)
 			syslog(LOG_WARNING, "disabling wakeups %s\n",
 			       snd_strerror(err));
+	}
+	/* Setup the period time so that the hardware pulls the right amount
+	 * of data at the right time. */
+	if (dma_period_time) {
+		int dir = 0;
+		unsigned int original = dma_period_time;
+
+		err = snd_pcm_hw_params_set_period_time_near(
+				handle, hwparams, &dma_period_time, &dir);
+		if (err < 0) {
+			syslog(LOG_ERR, "could not set period time: %s",
+			       snd_strerror(err));
+			return err;
+		} else if (original != dma_period_time) {
+			syslog(LOG_DEBUG, "period time set to: %u",
+			       dma_period_time);
+		}
 	}
 	/* Set the sample format. */
 	err = snd_pcm_hw_params_set_format(handle, hwparams,
@@ -505,11 +571,10 @@ int cras_alsa_set_hwparams(snd_pcm_t *handle, struct cras_audio_format *format,
 		       ret_rate, format->num_channels, format->format);
 		return err;
 	}
-
 	return 0;
 }
 
-int cras_alsa_set_swparams(snd_pcm_t *handle)
+int cras_alsa_set_swparams(snd_pcm_t *handle, int *enable_htimestamp)
 {
 	int err;
 	snd_pcm_sw_params_t *swparams;
@@ -546,7 +611,53 @@ int cras_alsa_set_swparams(snd_pcm_t *handle)
 		return err;
 	}
 
+	if (*enable_htimestamp) {
+		/* Use MONOTONIC_RAW time-stamps. */
+		err = snd_pcm_sw_params_set_tstamp_type(
+				handle, swparams,
+				SND_PCM_TSTAMP_TYPE_MONOTONIC_RAW);
+		if (err < 0) {
+			syslog(LOG_ERR, "set_tstamp_type: %s\n",
+			       snd_strerror(err));
+			return err;
+		}
+		err = snd_pcm_sw_params_set_tstamp_mode(
+				handle, swparams, SND_PCM_TSTAMP_ENABLE);
+		if (err < 0) {
+			syslog(LOG_ERR, "set_tstamp_mode: %s\n",
+			       snd_strerror(err));
+			return err;
+		}
+	}
+
+	/* This hack is required because ALSA-LIB does not provide any way to
+	 * detect whether MONOTONIC_RAW timestamps are supported by the kernel.
+	 * In ALSA-LIB, the code checks the hardware protocol version. */
 	err = snd_pcm_sw_params(handle, swparams);
+	if (err == -EINVAL && *enable_htimestamp) {
+		*enable_htimestamp = 0;
+		syslog(LOG_WARNING,
+		       "MONOTONIC_RAW timestamps are not supported.");
+
+		err = snd_pcm_sw_params_set_tstamp_type(
+				handle, swparams,
+				SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY);
+		if (err < 0) {
+			syslog(LOG_ERR, "set_tstamp_type: %s\n",
+			       snd_strerror(err));
+			return err;
+		}
+		err = snd_pcm_sw_params_set_tstamp_mode(
+				handle, swparams, SND_PCM_TSTAMP_NONE);
+		if (err < 0) {
+			syslog(LOG_ERR, "set_tstamp_mode: %s\n",
+			       snd_strerror(err));
+			return err;
+		}
+
+		err = snd_pcm_sw_params(handle, swparams);
+	}
+
 	if (err < 0) {
 		syslog(LOG_ERR, "sw_params: %s\n", snd_strerror(err));
 		return err;
@@ -555,22 +666,63 @@ int cras_alsa_set_swparams(snd_pcm_t *handle)
 }
 
 int cras_alsa_get_avail_frames(snd_pcm_t *handle, snd_pcm_uframes_t buf_size,
-			       snd_pcm_uframes_t *used)
+			       snd_pcm_uframes_t severe_underrun_frames,
+			       const char *dev_name,
+			       snd_pcm_uframes_t *avail,
+			       struct timespec *tstamp,
+			       unsigned int *underruns)
 {
 	snd_pcm_sframes_t frames;
 	int rc = 0;
+	static struct timespec tstamp_last_underrun_log =
+			{.tv_sec = 0, .tv_nsec = 0};
 
+	/* Use snd_pcm_avail still to ensure that the hardware pointer is
+	 * up to date. Otherwise, we could use the deprecated snd_pcm_hwsync().
+	 * IMO this is a deficiency in the ALSA API.
+	 */
 	frames = snd_pcm_avail(handle);
-	if (frames == -EPIPE || frames == -ESTRPIPE) {
-		cras_alsa_attempt_resume(handle);
-		frames = 0;
-	} else if (frames < 0) {
-		syslog(LOG_INFO, "pcm_avail error %s\n", snd_strerror(frames));
+	if (frames >= 0)
+		rc = snd_pcm_htimestamp(handle, avail, tstamp);
+	else
 		rc = frames;
-		frames = 0;
-	} else if (frames > (snd_pcm_sframes_t)buf_size)
-		frames = buf_size;
-	*used = frames;
+	if (rc == -EPIPE || rc == -ESTRPIPE) {
+		cras_alsa_attempt_resume(handle);
+		rc = 0;
+		goto error;
+	} else if (rc < 0) {
+		syslog(LOG_ERR, "pcm_avail error %s, %s\n",
+		       dev_name, snd_strerror(rc));
+		goto error;
+	} else if (frames >= (snd_pcm_sframes_t)buf_size) {
+		struct timespec tstamp_now;
+		*underruns = *underruns + 1;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &tstamp_now);
+		/* Limit the log rate. */
+		if ((tstamp_now.tv_sec - tstamp_last_underrun_log.tv_sec) >
+		    UNDERRUN_LOG_TIME_SECS) {
+			syslog(LOG_ERR,
+			       "pcm_avail returned frames larger than buf_size: "
+			       "%s: %ld > %lu for %u times\n",
+			       dev_name, frames, buf_size, *underruns);
+			tstamp_last_underrun_log.tv_sec = tstamp_now.tv_sec;
+			tstamp_last_underrun_log.tv_nsec = tstamp_now.tv_nsec;
+		}
+		if ((frames - (snd_pcm_sframes_t)buf_size) >
+		    (snd_pcm_sframes_t)severe_underrun_frames) {
+			rc = -EPIPE;
+			goto error;
+		} else {
+			frames = buf_size;
+		}
+	}
+	*avail = frames;
+	return 0;
+
+error:
+	*avail = 0;
+	tstamp->tv_sec = 0;
+	tstamp->tv_nsec = 0;
 	return rc;
 }
 
@@ -605,6 +757,24 @@ int cras_alsa_attempt_resume(snd_pcm_t *handle)
 			       snd_strerror(rc));
 	}
 	return rc;
+}
+
+int cras_alsa_mmap_get_whole_buffer(snd_pcm_t *handle, uint8_t **dst,
+				    unsigned int *underruns)
+{
+	snd_pcm_uframes_t offset;
+	/* The purpose of calling cras_alsa_mmap_begin is to get the base
+	 * address of the buffer. The requested and retrieved frames are not
+	 * meaningful here.
+	 * However, we need to set a non-zero requested frames to get a
+	 * non-zero retrieved frames. This is to avoid the error checking in
+	 * snd_pcm_mmap_begin, where it judges retrieved frames being 0 as a
+	 * failure.
+	 */
+	snd_pcm_uframes_t frames = 1;
+
+	return cras_alsa_mmap_begin(
+			handle, 0, dst, &offset, &frames, underruns);
 }
 
 int cras_alsa_mmap_begin(snd_pcm_t *handle, unsigned int format_bytes,

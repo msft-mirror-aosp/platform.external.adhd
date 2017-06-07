@@ -26,7 +26,8 @@ enum cras_bt_device_profile {
 
 enum cras_bt_device_profile cras_bt_device_profile_from_uuid(const char *uuid);
 
-struct cras_bt_device *cras_bt_device_create(const char *object_path);
+struct cras_bt_device *cras_bt_device_create(DBusConnection *conn,
+					     const char *object_path);
 void cras_bt_device_destroy(struct cras_bt_device *device);
 void cras_bt_device_reset();
 
@@ -54,6 +55,18 @@ void cras_bt_device_set_append_iodev_cb(struct cras_bt_device *device,
 int cras_bt_device_supports_profile(const struct cras_bt_device *device,
 				    enum cras_bt_device_profile profile);
 
+/* Sets if the BT audio device should use hardware volume.
+ * Args:
+ *    device - The remote bluetooth audio device.
+ *    use_hardware_volume - Set to true to indicate hardware volume
+ *        is preferred over software volume.
+ */
+void cras_bt_device_set_use_hardware_volume(struct cras_bt_device *device,
+					    int use_hardware_volume);
+
+/* Gets if the BT audio device should use hardware volume. */
+int cras_bt_device_get_use_hardware_volume(struct cras_bt_device *device);
+
 /* Forces disconnect the bt device. Used when handling audio error
  * that we want to make the device be completely disconnected from
  * host to reflect the state that an error has occurred.
@@ -72,13 +85,6 @@ int cras_bt_device_sco_connect(struct cras_bt_device *device);
 
 /* Queries the preffered mtu value for SCO socket. */
 int cras_bt_device_sco_mtu(struct cras_bt_device *device, int sco_socket);
-
-/* Sets the speaker gain for bt device, note this is for HFP/HSP mode.
- * Args:
- *    device - The device object to set speaker gain.
- *    gain - value between 0-100.
- */
-int cras_bt_device_set_speaker_gain(struct cras_bt_device *device, int gain);
 
 /* Appends an iodev to bt device.
  * Args:
@@ -105,25 +111,25 @@ int cras_bt_device_get_active_profile(const struct cras_bt_device *device);
 void cras_bt_device_set_active_profile(struct cras_bt_device *device,
 				       unsigned int profile);
 
-/* Calls this function after configures the active profile of bt device
- * will reactivate the bt_ios associated with the bluetooth device. So it
- * can switch to the new active profile at open.
+/* Switches profile after the active profile of bt device has changed and
+ * enables bt iodev immediately. This function is used for profile switching
+ * at iodev open.
  * Args:
  *    device - The bluetooth device.
  *    bt_iodev - The iodev triggers the reactivaion.
  */
-int cras_bt_device_switch_profile_on_open(struct cras_bt_device *device,
-					  struct cras_iodev *bt_iodev);
+int cras_bt_device_switch_profile_enable_dev(struct cras_bt_device *device,
+					     struct cras_iodev *bt_iodev);
 
-/* Calls this function after configures the active profile of bt device
- * will reactivate the bt_ios associated with the bluetooth device. So it
- * can switch to the new active profile at device close.
+/* Switches profile after the active profile of bt device has changed. This
+ * function is used when we want to switch profile without changing the
+ * iodev's status.
  * Args:
  *    device - The bluetooth device.
  *    bt_iodev - The iodev triggers the reactivaion.
  */
-int cras_bt_device_switch_profile_on_close(struct cras_bt_device *device,
-					   struct cras_iodev *bt_iodev);
+int cras_bt_device_switch_profile(struct cras_bt_device *device,
+				  struct cras_iodev *bt_iodev);
 
 /* Calls this function when the buffer size of an underlying profile iodev
  * has changed and update it for the virtual bt iodev. */
@@ -139,14 +145,26 @@ int cras_bt_device_has_a2dp(struct cras_bt_device *device);
  */
 int cras_bt_device_can_switch_to_a2dp(struct cras_bt_device *device);
 
-/* Adds an a2dp delay timer to this device. */
-void cras_bt_device_add_a2dp_delay_timer(struct cras_bt_device *device,
-					 struct cras_timer *timer);
+/* Updates the volume to bt_device when a volume change event is reported. */
+void cras_bt_device_update_hardware_volume(struct cras_bt_device *device,
+					   int volume);
 
-/* Cancels the a2dp delay timer if it's not been trigered yet. */
-void cras_bt_device_cancel_a2dp_delay_timer(struct cras_bt_device *device);
+/* Notifies bt_device that a2dp connection is configured. */
+void cras_bt_device_a2dp_configured(struct cras_bt_device *device);
 
-/* Removes any a2dp delay timer from this device. */
-void cras_bt_device_rm_a2dp_delay_timer(struct cras_bt_device *device);
+/* Cancels any scheduled suspension of device. */
+int cras_bt_device_cancel_suspend(struct cras_bt_device *device);
+
+/* Schedules device to suspend after given delay. */
+int cras_bt_device_schedule_suspend(struct cras_bt_device *device,
+				    unsigned int msec);
+
+/* Notifies bt device that audio gateway is initialized.
+ * Args:
+ *   device - The bluetooth device.
+ * Returns:
+ *   0 on success, error code otherwise.
+ */
+int cras_bt_device_audio_gateway_initialized(struct cras_bt_device *device);
 
 #endif /* CRAS_BT_DEVICE_H_ */

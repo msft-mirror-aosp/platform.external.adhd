@@ -106,14 +106,30 @@ unsigned cras_shm_check_write_offset(const struct cras_audio_shm *shm,
 	return offset;
 }
 
-/* Get a pointer to the current read buffer */
+/* Get the number of frames readable in current read buffer */
 static inline
-uint8_t *cras_shm_get_curr_read_buffer(const struct cras_audio_shm *shm)
+unsigned cras_shm_get_curr_read_frames(const struct cras_audio_shm *shm)
 {
 	unsigned i = shm->area->read_buf_idx & CRAS_SHM_BUFFERS_MASK;
+	unsigned read_offset, write_offset;
 
-	return cras_shm_buff_for_idx(shm, i) +
+	read_offset =
 		cras_shm_check_read_offset(shm, shm->area->read_offset[i]);
+	write_offset =
+		cras_shm_check_write_offset(shm, shm->area->write_offset[i]);
+
+	if (read_offset > write_offset)
+		return 0;
+	else
+		return (write_offset - read_offset) / shm->config.frame_bytes;
+}
+
+/* Get the base of the current read buffer. */
+static inline
+uint8_t *cras_shm_get_read_buffer_base(const struct cras_audio_shm *shm)
+{
+	unsigned i = shm->area->read_buf_idx & CRAS_SHM_BUFFERS_MASK;
+	return cras_shm_buff_for_idx(shm, i);
 }
 
 /* Get the base of the current write buffer. */
@@ -246,23 +262,27 @@ size_t cras_shm_get_num_writeable(const struct cras_audio_shm *shm)
 	return shm->config.used_size / shm->config.frame_bytes;
 }
 
-/* Flags an overrun if writing would cause one. */
-static inline void cras_shm_check_write_overrun(struct cras_audio_shm *shm)
+/* Flags an overrun if writing would cause one and reset the write offset.
+ * Return 1 if overrun happens, otherwise return 0. */
+static inline int cras_shm_check_write_overrun(struct cras_audio_shm *shm)
 {
+	int ret = 0;
 	size_t write_buf_idx = shm->area->write_buf_idx & CRAS_SHM_BUFFERS_MASK;
-	size_t read_buf_idx = shm->area->read_buf_idx & CRAS_SHM_BUFFERS_MASK;
 
 	if (!shm->area->write_in_progress[write_buf_idx]) {
 		unsigned int used_size = shm->config.used_size;
 
-		if (write_buf_idx != read_buf_idx)
+		if (shm->area->write_offset[write_buf_idx]) {
 			shm->area->num_overruns++; /* Will over-write unread */
+			ret = 1;
+		}
 
 		memset(cras_shm_buff_for_idx(shm, write_buf_idx), 0, used_size);
 
 		shm->area->write_in_progress[write_buf_idx] = 1;
 		shm->area->write_offset[write_buf_idx] = 0;
 	}
+	return ret;
 }
 
 /* Increment the write pointer for the current buffer. */
@@ -462,5 +482,32 @@ static inline void cras_shm_copy_shared_config(struct cras_audio_shm *shm)
 {
 	memcpy(&shm->config, &shm->area->config, sizeof(shm->config));
 }
+
+/* Open a read/write shared memory area with the given name.
+ * Args:
+ *    name - Name of the shared-memory area.
+ *    size - Size of the shared-memory area.
+ * Returns:
+ *    >= 0 file descriptor value, or negative errno value on error.
+ */
+int cras_shm_open_rw (const char *name, size_t size);
+
+/* Reopen an existing shared memory area read-only.
+ * Args:
+ *    name - Name of the shared-memory area.
+ *    fd - Existing file descriptor.
+ * Returns:
+ *    >= 0 new file descriptor value, or negative errno value on error.
+ */
+int cras_shm_reopen_ro (const char *name, int fd);
+
+/* Close and delete a shared memory area.
+ * Args:
+ *    name - Name of the shared-memory area.
+ *    fd - Existing file descriptor.
+ * Returns:
+ *    >= 0 new file descriptor value, or negative errno value on error.
+ */
+void cras_shm_close_unlink (const char *name, int fd);
 
 #endif /* CRAS_SHM_H_ */

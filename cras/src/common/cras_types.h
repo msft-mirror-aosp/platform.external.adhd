@@ -53,7 +53,7 @@ enum CRAS_TEST_IODEV_CMD {
 enum CRAS_STREAM_DIRECTION {
 	CRAS_STREAM_OUTPUT,
 	CRAS_STREAM_INPUT,
-	CRAS_STREAM_UNIFIED, /* This has been removed, don't use it. */
+	CRAS_STREAM_UNDEFINED,
 	CRAS_STREAM_POST_MIX_PRE_DSP,
 	CRAS_NUM_DIRECTIONS
 };
@@ -105,7 +105,28 @@ static inline int cras_stream_is_loopback(enum CRAS_STREAM_DIRECTION dir)
 /* Types of audio streams. */
 enum CRAS_STREAM_TYPE {
 	CRAS_STREAM_TYPE_DEFAULT,
+	CRAS_STREAM_TYPE_MULTIMEDIA,
+	CRAS_STREAM_TYPE_VOICE_COMMUNICATION,
+	CRAS_STREAM_TYPE_SPEECH_RECOGNITION,
+	CRAS_STREAM_TYPE_PRO_AUDIO,
+	CRAS_STREAM_NUM_TYPES,
 };
+
+#define ENUM_STR(x) case x: return #x;
+
+static inline const char *cras_stream_type_str(
+		enum CRAS_STREAM_TYPE stream_type)
+{
+	switch(stream_type) {
+	ENUM_STR(CRAS_STREAM_TYPE_DEFAULT)
+	ENUM_STR(CRAS_STREAM_TYPE_MULTIMEDIA)
+	ENUM_STR(CRAS_STREAM_TYPE_VOICE_COMMUNICATION)
+	ENUM_STR(CRAS_STREAM_TYPE_SPEECH_RECOGNITION)
+	ENUM_STR(CRAS_STREAM_TYPE_PRO_AUDIO)
+	default:
+		return "INVALID_STREAM_TYPE";
+	}
+}
 
 /* Information about a client attached to the server. */
 struct __attribute__ ((__packed__)) cras_attached_client_info {
@@ -139,6 +160,7 @@ static inline uint32_t node_index_of(cras_node_id_t id)
 #define CRAS_MAX_IODEVS 20
 #define CRAS_MAX_IONODES 20
 #define CRAS_MAX_ATTACHED_CLIENTS 20
+#define CRAS_HOTWORD_STRING_SIZE 256
 #define MAX_DEBUG_DEVS 4
 #define MAX_DEBUG_STREAMS 8
 #define AUDIO_THREAD_EVENT_LOG_SIZE (1024*6)
@@ -148,8 +170,11 @@ enum AUDIO_THREAD_LOG_EVENTS {
 	AUDIO_THREAD_WAKE,
 	AUDIO_THREAD_SLEEP,
 	AUDIO_THREAD_READ_AUDIO,
+	AUDIO_THREAD_READ_AUDIO_TSTAMP,
 	AUDIO_THREAD_READ_AUDIO_DONE,
+	AUDIO_THREAD_READ_OVERRUN,
 	AUDIO_THREAD_FILL_AUDIO,
+	AUDIO_THREAD_FILL_AUDIO_TSTAMP,
 	AUDIO_THREAD_FILL_AUDIO_DONE,
 	AUDIO_THREAD_WRITE_STREAMS_WAIT,
 	AUDIO_THREAD_WRITE_STREAMS_WAIT_TO,
@@ -175,6 +200,11 @@ enum AUDIO_THREAD_LOG_EVENTS {
 	AUDIO_THREAD_IODEV_CB,
 	AUDIO_THREAD_PB_MSG,
 	AUDIO_THREAD_ODEV_NO_STREAMS,
+	AUDIO_THREAD_ODEV_START,
+	AUDIO_THREAD_ODEV_LEAVE_NO_STREAMS,
+	AUDIO_THREAD_ODEV_DEFAULT_NO_STREAMS,
+	AUDIO_THREAD_FILL_ODEV_ZEROS,
+	AUDIO_THREAD_SEVERE_UNDERRUN,
 };
 
 struct __attribute__ ((__packed__)) audio_thread_event {
@@ -202,12 +232,15 @@ struct __attribute__ ((__packed__)) audio_dev_debug_info {
 	uint32_t num_channels;
 	double est_rate_ratio;
 	uint8_t direction;
+	uint32_t num_underruns;
+	uint32_t num_severe_underruns;
 };
 
 struct __attribute__ ((__packed__)) audio_stream_debug_info {
 	uint64_t stream_id;
 	uint32_t dev_idx;
 	uint32_t direction;
+	uint32_t stream_type;
 	uint32_t buffer_frames;
 	uint32_t cb_threshold;
 	uint32_t flags;
@@ -215,6 +248,7 @@ struct __attribute__ ((__packed__)) audio_stream_debug_info {
 	uint32_t num_channels;
 	uint32_t longest_fetch_sec;
 	uint32_t longest_fetch_nsec;
+	uint32_t num_overruns;
 	int8_t channel_layout[CRAS_CH_MAX];
 };
 
@@ -238,6 +272,12 @@ struct __attribute__ ((__packed__)) audio_debug_info {
  *    mute_locked - 0 = unlocked, 1 = locked.
  *    suspended - 1 = suspended, 0 = resumed.
  *    capture_gain - Capture gain in dBFS * 100.
+ *    capture_gain_target - Target capture gain in dBFS * 100. The actual
+ *                          capture gain will be subjected to current
+ *                          supported range. When active device/node changes,
+ *                          supported range changes accordingly. System state
+ *                          should try to re-apply target gain subjected to new
+ *                          range.
  *    capture_mute - 0 = unmuted, 1 = muted.
  *    capture_mute_locked - 0 = unlocked, 1 = locked.
  *    min_capture_gain - Min allowed capture gain in dBFS * 100.
@@ -264,7 +304,7 @@ struct __attribute__ ((__packed__)) audio_debug_info {
  *        use it.
  */
 #define CRAS_SERVER_STATE_VERSION 2
-struct __attribute__ ((__packed__)) cras_server_state {
+struct __attribute__ ((packed, aligned(4))) cras_server_state {
 	uint32_t state_version;
 	uint32_t volume;
 	int32_t min_volume_dBFS;
@@ -274,6 +314,7 @@ struct __attribute__ ((__packed__)) cras_server_state {
 	int32_t mute_locked;
 	int32_t suspended;
 	int32_t capture_gain;
+	int32_t capture_gain_target;
 	int32_t capture_mute;
 	int32_t capture_mute_locked;
 	int32_t min_capture_gain;
@@ -310,6 +351,7 @@ enum cras_notify_device_action { /* Must match gavd action definitions.  */
  *      lowered priority.
  *    usb_vendor_id - vendor ID if the device is on the USB bus.
  *    usb_product_id - product ID if the device is on the USB bus.
+ *    usb_serial_number - serial number if the device is on the USB bus.
  *    usb_desc_checksum - the checksum of the USB descriptors if the device
  *      is on the USB bus.
  */
@@ -317,11 +359,13 @@ enum CRAS_ALSA_CARD_TYPE {
 	ALSA_CARD_TYPE_INTERNAL,
 	ALSA_CARD_TYPE_USB,
 };
+#define USB_SERIAL_NUMBER_BUFFER_SIZE 64
 struct __attribute__ ((__packed__)) cras_alsa_card_info {
 	enum CRAS_ALSA_CARD_TYPE card_type;
 	uint32_t card_index;
 	uint32_t usb_vendor_id;
 	uint32_t usb_product_id;
+	char usb_serial_number[USB_SERIAL_NUMBER_BUFFER_SIZE];
 	uint32_t usb_desc_checksum;
 };
 
@@ -342,17 +386,36 @@ enum CRAS_NODE_TYPE {
 	CRAS_NODE_TYPE_INTERNAL_SPEAKER,
 	CRAS_NODE_TYPE_HEADPHONE,
 	CRAS_NODE_TYPE_HDMI,
+	CRAS_NODE_TYPE_HAPTIC,
+	CRAS_NODE_TYPE_LINEOUT,
 	/* These value can be used for input nodes. */
-	CRAS_NODE_TYPE_INTERNAL_MIC,
 	CRAS_NODE_TYPE_MIC,
-	CRAS_NODE_TYPE_AOKR,
+	CRAS_NODE_TYPE_HOTWORD,
 	CRAS_NODE_TYPE_POST_MIX_PRE_DSP,
 	CRAS_NODE_TYPE_POST_DSP,
 	/* These value can be used for both output and input nodes. */
 	CRAS_NODE_TYPE_USB,
 	CRAS_NODE_TYPE_BLUETOOTH,
-	CRAS_NODE_TYPE_KEYBOARD_MIC,
 	CRAS_NODE_TYPE_UNKNOWN,
+};
+
+/* Position values to described where a node locates on the system.
+ * NODE_POSITION_EXTERNAL - The node works only when peripheral
+ *     is plugged.
+ * NODE_POSITION_INTERNAL - The node lives on the system and doesn't
+ *     have specific direction.
+ * NODE_POSITION_FRONT - The node locates on the side of system that
+ *     faces user.
+ * NODE_POSITION_REAR - The node locates on the opposite side of
+ *     the system that faces user.
+ * NODE_POSITION_KEYBOARD - The node locates under the keyboard.
+ */
+enum CRAS_NODE_POSITION {
+	NODE_POSITION_EXTERNAL,
+	NODE_POSITION_INTERNAL,
+	NODE_POSITION_FRONT,
+	NODE_POSITION_REAR,
+	NODE_POSITION_KEYBOARD,
 };
 
 #endif /* CRAS_TYPES_H_ */

@@ -6,13 +6,41 @@
 #ifndef CRAS_AUDIO_FORMAT_H_
 #define CRAS_AUDIO_FORMAT_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <string.h>
 
 #ifdef __ANDROID__
+#include <hardware/audio.h>
 #include <tinyalsa/asoundlib.h>
 #define PCM_FORMAT_WIDTH(format) pcm_format_to_bits(format)
 typedef enum pcm_format snd_pcm_format_t;
+
+/* libasound audio formats. */
+#define SND_PCM_FORMAT_UNKNOWN -1
+#define SND_PCM_FORMAT_U8       1
+#define SND_PCM_FORMAT_S16_LE   2
+#define SND_PCM_FORMAT_S24_LE   6
+#define SND_PCM_FORMAT_S32_LE  10
+
+static inline int audio_format_to_cras_format(audio_format_t audio_format)
+{
+    switch (audio_format) {
+    case AUDIO_FORMAT_PCM_16_BIT:
+        return SND_PCM_FORMAT_S16_LE;
+    case AUDIO_FORMAT_PCM_8_BIT:
+        return SND_PCM_FORMAT_U8;
+    case AUDIO_FORMAT_PCM_32_BIT:
+        return SND_PCM_FORMAT_S32_LE;
+    case AUDIO_FORMAT_PCM_8_24_BIT:
+        return SND_PCM_FORMAT_S24_LE;
+    default:
+        return SND_PCM_FORMAT_UNKNOWN;
+    }
+}
 #else
 #include <alsa/asoundlib.h>
 #define PCM_FORMAT_WIDTH(format) snd_pcm_format_physical_width(format)
@@ -124,5 +152,9 @@ void cras_channel_conv_matrix_destroy(float **mtx, size_t out_ch);
  */
 float **cras_channel_conv_matrix_create(const struct cras_audio_format *in,
 					const struct cras_audio_format *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CRAS_AUDIO_FORMAT_H_ */

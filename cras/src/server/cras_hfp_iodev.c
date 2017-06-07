@@ -22,7 +22,6 @@ struct hfp_io {
 	struct cras_bt_device *device;
 	struct hfp_slc_handle *slc;
 	struct hfp_info *info;
-	int opened;
 };
 
 static int update_supported_formats(struct cras_iodev *iodev)
@@ -49,13 +48,17 @@ static int update_supported_formats(struct cras_iodev *iodev)
 	return 0;
 }
 
-static int frames_queued(const struct cras_iodev *iodev)
+static int frames_queued(const struct cras_iodev *iodev,
+			 struct timespec *tstamp)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
 	if (!hfp_info_running(hfpio->info))
 		return -1;
 
+	/* Do not enable timestamp mechanism on HFP device because last time
+	 * stamp might be a long time ago and it is not really useful. */
+	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
 	return hfp_buf_queued(hfpio->info, iodev);
 }
 
@@ -65,7 +68,7 @@ static void hfp_packet_size_changed(void *data)
 	struct hfp_io *hfpio = (struct hfp_io *)data;
 	struct cras_iodev *iodev = &hfpio->base;
 
-	if (!iodev->is_open(iodev))
+	if (!cras_iodev_is_open(iodev))
 		return;
 	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev);
 	cras_bt_device_iodev_buffer_size_changed(hfpio->device);
@@ -101,7 +104,6 @@ add_dev:
 	hfp_set_call_status(hfpio->slc, 1);
 
 	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev);
-	hfpio->opened = 1;
 
 	return 0;
 error:
@@ -113,7 +115,6 @@ static int close_dev(struct cras_iodev *iodev)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
-	hfpio->opened = 0;
 	hfp_info_rm_iodev(hfpio->info, iodev);
 	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info)) {
 		hfp_info_stop(hfpio->info);
@@ -125,20 +126,23 @@ static int close_dev(struct cras_iodev *iodev)
 	return 0;
 }
 
-static int is_open(const struct cras_iodev *iodev)
+static void set_hfp_volume(struct cras_iodev *iodev)
 {
+	size_t volume;
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
-	return hfpio->opened;
-}
 
-static int dev_running(const struct cras_iodev *iodev)
-{
-	return iodev->is_open(iodev);
+	volume = cras_system_get_volume();
+	if (iodev->active_node)
+		volume = cras_iodev_adjust_node_volume(iodev->active_node, volume);
+
+	hfp_event_speaker_gain(hfpio->slc, volume);
 }
 
 static int delay_frames(const struct cras_iodev *iodev)
 {
-	return frames_queued(iodev);
+	struct timespec tstamp;
+
+	return frames_queued(iodev, &tstamp);
 }
 
 static int get_buffer(struct cras_iodev *iodev,
@@ -186,7 +190,8 @@ static int flush_buffer(struct cras_iodev *iodev)
 	return 0;
 }
 
-static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
+static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
+			       unsigned dev_enabled)
 {
 }
 
@@ -235,11 +240,10 @@ struct cras_iodev *hfp_iodev_create(
 			cras_bt_device_object_path(device),
 			strlen(cras_bt_device_object_path(device)),
 			strlen(cras_bt_device_object_path(device)));
+	iodev->info.stable_id_new = iodev->info.stable_id;
 
 	iodev->open_dev= open_dev;
-	iodev->is_open = is_open;
 	iodev->frames_queued = frames_queued;
-	iodev->dev_running = dev_running;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
@@ -247,7 +251,7 @@ struct cras_iodev *hfp_iodev_create(
 	iodev->close_dev = close_dev;
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
-	iodev->software_volume_needed = 1;
+	iodev->set_volume = set_hfp_volume;
 
 	node = (struct cras_ionode *)calloc(1, sizeof(*node));
 	node->dev = iodev;

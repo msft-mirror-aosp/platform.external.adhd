@@ -70,20 +70,10 @@ static unsigned int current_level(const struct cras_iodev *iodev)
  * iodev callbacks.
  */
 
-static int is_open(const struct cras_iodev *iodev)
+static int frames_queued(const struct cras_iodev *iodev,
+			 struct timespec *tstamp)
 {
-	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
-
-	return empty_iodev->open;
-}
-
-static int dev_running(const struct cras_iodev *iodev)
-{
-	return 1;
-}
-
-static int frames_queued(const struct cras_iodev *iodev)
-{
+	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
 	return current_level(iodev);
 }
 
@@ -125,11 +115,15 @@ static int get_buffer(struct cras_iodev *iodev,
 		      unsigned *frames)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
+	unsigned int avail, current;
 
-	if (iodev->direction == CRAS_STREAM_OUTPUT)
-		*frames = MIN(*frames, EMPTY_FRAMES - current_level(iodev));
-	else
-		*frames = MIN(*frames, current_level(iodev));
+	if (iodev->direction == CRAS_STREAM_OUTPUT) {
+		avail = EMPTY_FRAMES - current_level(iodev);
+		*frames = MIN(*frames, avail);
+	} else {
+		current = current_level(iodev);
+		*frames = MIN(*frames, current);
+	}
 
 	iodev->area->frames = *frames;
 	cras_audio_area_config_buf_pointers(iodev->area, iodev->format,
@@ -163,13 +157,18 @@ static int put_buffer(struct cras_iodev *iodev, unsigned frames)
 static int flush_buffer(struct cras_iodev *iodev)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
+
 	empty_iodev->buffer_level = current_level(iodev);
-	if (iodev->direction == CRAS_STREAM_INPUT)
+	if (iodev->direction == CRAS_STREAM_INPUT) {
 		empty_iodev->buffer_level = 0;
+		clock_gettime(CLOCK_MONOTONIC_RAW,
+			      &empty_iodev->last_buffer_access);
+	}
 	return 0;
 }
 
-static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
+static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
+			       unsigned dev_enabled)
 {
 }
 
@@ -195,18 +194,17 @@ struct cras_iodev *empty_iodev_create(enum CRAS_STREAM_DIRECTION direction)
 	iodev->supported_rates = empty_supported_rates;
 	iodev->supported_channel_counts = empty_supported_channel_counts;
 	iodev->supported_formats = empty_supported_formats;
-	iodev->buffer_size = EMPTY_BUFFER_SIZE;
+	iodev->buffer_size = EMPTY_FRAMES;
 
 	iodev->open_dev = open_dev;
 	iodev->close_dev = close_dev;
-	iodev->is_open = is_open;
 	iodev->frames_queued = frames_queued;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
 	iodev->flush_buffer = flush_buffer;
-	iodev->dev_running = dev_running;
 	iodev->update_active_node = update_active_node;
+	iodev->no_stream = cras_iodev_default_no_stream_playback;
 
 	/* Create a dummy ionode */
 	node = (struct cras_ionode *)calloc(1, sizeof(*node));

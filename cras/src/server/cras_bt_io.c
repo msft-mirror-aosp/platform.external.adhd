@@ -7,9 +7,10 @@
 
 #include "cras_bt_io.h"
 #include "cras_bt_device.h"
-#include "cras_dbus_util.h"
+#include "cras_utf8.h"
 #include "cras_iodev.h"
 #include "cras_iodev_list.h"
+#include "sfh.h"
 #include "utlist.h"
 
 #define DEFAULT_BT_DEVICE_NAME "BLUETOOTH"
@@ -66,6 +67,9 @@ static struct cras_ionode *add_profile_dev(struct cras_iodev *bt_iodev,
 	n->base.idx = btio->next_node_id++;
 	n->base.type = CRAS_NODE_TYPE_BLUETOOTH;
 	n->base.volume = 100;
+	n->base.stable_id = dev->info.stable_id;
+	n->base.stable_id_new = dev->info.stable_id_new;
+	n->base.max_software_gain = 0;
 	gettimeofday(&n->base.plugged_time, NULL);
 
 	strcpy(n->base.name, dev->info.name);
@@ -129,7 +133,7 @@ static int update_supported_formats(struct cras_iodev *iodev)
 	    iodev->direction == CRAS_STREAM_INPUT) {
 		bt_switch_to_profile(btio->device,
 				     CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY);
-		cras_bt_device_switch_profile_on_open(btio->device, iodev);
+		cras_bt_device_switch_profile_enable_dev(btio->device, iodev);
 		return -EAGAIN;
 	}
 
@@ -206,8 +210,7 @@ static int close_dev(struct cras_iodev *iodev)
 	    cras_bt_device_has_a2dp(btio->device)) {
 		cras_bt_device_set_active_profile(btio->device,
 				CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
-		cras_bt_device_switch_profile_on_close(btio->device,
-						       iodev);
+		cras_bt_device_switch_profile(btio->device, iodev);
 	}
 
 	rc = dev->close_dev(dev);
@@ -223,32 +226,22 @@ static void set_bt_volume(struct cras_iodev *iodev)
 
 	if (dev->active_node)
 		dev->active_node->volume = iodev->active_node->volume;
-	if (dev->set_volume)
+
+	/* The parent bt_iodev could set software_volume_needed flag for cases
+	 * that software volume provides better experience across profiles
+	 * (HFP and A2DP). Otherwise, use the profile specific implementation
+	 * to adjust volume. */
+	if (dev->set_volume && !iodev->software_volume_needed)
 		dev->set_volume(dev);
 }
 
-static int is_open(const struct cras_iodev *iodev)
-{
-	struct cras_iodev *dev = active_profile_dev(iodev);
-	if (!dev)
-		return 0;
-	return dev->is_open(dev);
-}
-
-static int frames_queued(const struct cras_iodev *iodev)
+static int frames_queued(const struct cras_iodev *iodev,
+			 struct timespec *tstamp)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
 	if (!dev)
 		return -EINVAL;
-	return dev->frames_queued(dev);
-}
-
-static int dev_running(const struct cras_iodev *iodev)
-{
-	struct cras_iodev *dev = active_profile_dev(iodev);
-	if (!dev)
-		return -EINVAL;
-	return dev->dev_running(dev);
+	return dev->frames_queued(dev, tstamp);
 }
 
 static int delay_frames(const struct cras_iodev *iodev)
@@ -288,7 +281,8 @@ static int flush_buffer(struct cras_iodev *iodev)
 /* If the first private iodev doesn't match the active profile stored on
  * device, select to the correct private iodev.
  */
-static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
+static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
+			       unsigned dev_enabled)
 {
 	struct bt_io *btio = (struct bt_io *)iodev;
 	struct cras_ionode *node;
@@ -307,10 +301,7 @@ static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
 			active->profile = n->profile;
 			active->profile_dev = n->profile_dev;
 
-			/* Fill all volume related stuff to/from the
-			 * profile dev. */
-			iodev->software_volume_needed =
-				active->profile_dev->software_volume_needed;
+			/* Set volume for the new profile. */
 			set_bt_volume(iodev);
 		}
 	}
@@ -338,11 +329,10 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->direction = dev->direction;
 	strcpy(iodev->info.name, dev->info.name);
 	iodev->info.stable_id = dev->info.stable_id;
+	iodev->info.stable_id_new = dev->info.stable_id_new;
 
 	iodev->open_dev = open_dev;
-	iodev->is_open = is_open; /* Needed by thread_add_stream */
 	iodev->frames_queued = frames_queued;
-	iodev->dev_running = dev_running;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
@@ -350,8 +340,9 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->close_dev = close_dev;
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
-	iodev->software_volume_needed = dev->software_volume_needed;
+	iodev->software_volume_needed = 1;
 	iodev->set_volume = set_bt_volume;
+	iodev->no_stream = cras_iodev_default_no_stream_playback;
 
 	/* Create the dummy node set to plugged so it's the only node exposed
 	 * to UI, and point it to the first profile dev. */
@@ -363,6 +354,11 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	active->base.type = CRAS_NODE_TYPE_BLUETOOTH;
 	active->base.volume = 100;
 	active->base.plugged = 1;
+	active->base.stable_id = SuperFastHash(
+		cras_bt_device_object_path(device),
+		strlen(cras_bt_device_object_path(device)),
+		strlen(cras_bt_device_object_path(device)));
+	active->base.stable_id_new = active->base.stable_id;
 	active->profile = profile;
 	active->profile_dev = dev;
 	gettimeofday(&active->base.plugged_time, NULL);
@@ -450,7 +446,7 @@ int cras_bt_io_append(struct cras_iodev *bt_iodev,
 	    cras_bt_device_can_switch_to_a2dp(btio->device)) {
 		bt_switch_to_profile(btio->device,
 				     CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
-		cras_bt_device_switch_profile_on_open(btio->device, bt_iodev);
+		cras_bt_device_switch_profile(btio->device, bt_iodev);
 		syslog(LOG_ERR, "Switch to A2DP on append");
 	}
 	return 0;
@@ -522,7 +518,7 @@ int cras_bt_io_remove(struct cras_iodev *bt_iodev,
 
 	/* The node of active profile could have been removed, update it.
 	 * Return err when fail to locate the active profile dev. */
-	update_active_node(bt_iodev, 0);
+	update_active_node(bt_iodev, 0, 1);
 	btnode = (struct bt_node *)bt_iodev->active_node;
 	if ((btnode->profile == 0) || (btnode->profile_dev == NULL))
 		return -EINVAL;

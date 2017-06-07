@@ -10,10 +10,12 @@
 #include <string.h>
 #include <syslog.h>
 
+#include "audio_thread.h"
 #include "cras_dbus.h"
 #include "cras_dbus_control.h"
 #include "cras_dbus_util.h"
 #include "cras_iodev_list.h"
+#include "cras_observer.h"
 #include "cras_system_state.h"
 #include "cras_util.h"
 #include "utlist.h"
@@ -91,6 +93,14 @@
     "    <method name=\"GetNumberOfActiveInputStreams\">\n"             \
     "      <arg name=\"num\" type=\"i\" direction=\"out\"/>\n"          \
     "    </method>\n"                                                   \
+    "    <method name=\"SetGlobalOutputChannelRemix\">\n"               \
+    "      <arg name=\"num_channels\" type=\"i\" direction=\"in\"/>\n"  \
+    "      <arg name=\"coefficient\" type=\"ad\" direction=\"in\"/>\n"  \
+    "    </method>\n"                                                   \
+    "    <method name=\"SetHotwordModel\">\n"                           \
+    "      <arg name=\"node_id\" type=\"t\" direction=\"in\"/>\n"       \
+    "      <arg name=\"model_name\" type=\"s\" direction=\"in\"/>\n"    \
+    "    </method>\n"                                                   \
     "  </interface>\n"                                                  \
     "  <interface name=\"" DBUS_INTERFACE_INTROSPECTABLE "\">\n"        \
     "    <method name=\"Introspect\">\n"                                \
@@ -101,9 +111,9 @@
 
 struct cras_dbus_control {
 	DBusConnection *conn;
+	struct cras_observer_client *observer;
 };
 static struct cras_dbus_control dbus_control;
-static cras_node_id_t last_output, last_input;
 
 /* helper to extract a single argument from a DBus message. */
 static int get_single_arg(DBusMessage *message, int dbus_type, void *arg)
@@ -126,7 +136,7 @@ static int get_single_arg(DBusMessage *message, int dbus_type, void *arg)
 }
 
 /* Helper to send an empty reply. */
-static void send_empty_reply(DBusMessage *message)
+static void send_empty_reply(DBusConnection *conn, DBusMessage *message)
 {
 	DBusMessage *reply;
 	dbus_uint32_t serial = 0;
@@ -135,7 +145,27 @@ static void send_empty_reply(DBusMessage *message)
 	if (!reply)
 		return;
 
-	dbus_connection_send(dbus_control.conn, reply, &serial);
+	dbus_connection_send(conn, reply, &serial);
+
+	dbus_message_unref(reply);
+}
+
+/* Helper to send an int32 reply. */
+static void send_int32_reply(DBusConnection *conn,
+			     DBusMessage *message,
+			     dbus_int32_t value)
+{
+	DBusMessage *reply;
+	dbus_uint32_t serial = 0;
+
+	reply = dbus_message_new_method_return(message);
+	if (!reply)
+		return;
+
+	dbus_message_append_args(reply,
+				 DBUS_TYPE_INT32, &value,
+				 DBUS_TYPE_INVALID);
+	dbus_connection_send(conn, reply, &serial);
 
 	dbus_message_unref(reply);
 }
@@ -155,7 +185,7 @@ static DBusHandlerResult handle_set_output_volume(
 
 	cras_system_set_volume(new_vol);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -184,7 +214,7 @@ static DBusHandlerResult handle_set_output_node_volume(
 
 	cras_iodev_list_set_node_attr(id, IONODE_ATTR_VOLUME, new_vol);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -214,7 +244,7 @@ static DBusHandlerResult handle_swap_left_right(
 	cras_iodev_list_set_node_attr(id, IONODE_ATTR_SWAP_LEFT_RIGHT,
 				      swap);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -233,7 +263,7 @@ static DBusHandlerResult handle_set_output_mute(
 
 	cras_system_set_mute(new_mute);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -252,7 +282,7 @@ static DBusHandlerResult handle_set_output_user_mute(
 
 	cras_system_set_user_mute(new_mute);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -270,7 +300,7 @@ static DBusHandlerResult handle_set_suspend_audio(
 
 	cras_system_set_suspended(suspend);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -289,7 +319,7 @@ static DBusHandlerResult handle_set_input_gain(
 
 	cras_system_set_capture_gain(new_gain);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -318,7 +348,7 @@ static DBusHandlerResult handle_set_input_node_gain(
 
 	cras_iodev_list_set_node_attr(id, IONODE_ATTR_CAPTURE_GAIN, new_gain);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -337,7 +367,7 @@ static DBusHandlerResult handle_set_input_mute(
 
 	cras_system_set_capture_mute(new_mute);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -371,7 +401,7 @@ static DBusHandlerResult handle_get_volume_state(
 				 DBUS_TYPE_BOOLEAN, &user_muted,
 				 DBUS_TYPE_INVALID);
 
-	dbus_connection_send(dbus_control.conn, reply, &serial);
+	dbus_connection_send(conn, reply, &serial);
 
 	dbus_message_unref(reply);
 
@@ -389,7 +419,8 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 	dbus_bool_t is_input;
 	dbus_uint64_t id;
 	const char *dev_name = dev->name;
-	dbus_uint64_t stable_dev_id = dev->stable_id;
+	dbus_uint64_t stable_dev_id = node->stable_id;
+	dbus_uint64_t stable_dev_id_new = node->stable_id_new;
 	const char *node_type = node->type;
 	const char *node_name = node->name;
 	const char *mic_positions = node->mic_positions;
@@ -398,6 +429,7 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 		node->plugged_time.tv_usec;
 	dbus_uint64_t node_volume = node->volume;
 	dbus_int64_t node_capture_gain = node->capture_gain;
+	char *models, *empty_models = "";
 
 	is_input = (direction == CRAS_STREAM_INPUT);
 	id = node->iodev_idx;
@@ -418,6 +450,9 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 		return FALSE;
 	if (!append_key_value(&dict, "StableDeviceId", DBUS_TYPE_UINT64,
 			      DBUS_TYPE_UINT64_AS_STRING, &stable_dev_id))
+		return FALSE;
+	if (!append_key_value(&dict, "StableDeviceIdNew", DBUS_TYPE_UINT64,
+			      DBUS_TYPE_UINT64_AS_STRING, &stable_dev_id_new))
 		return FALSE;
 	if (!append_key_value(&dict, "Type", DBUS_TYPE_STRING,
 			      DBUS_TYPE_STRING_AS_STRING, &node_type))
@@ -440,6 +475,16 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 	if (!append_key_value(&dict, "NodeCaptureGain", DBUS_TYPE_INT64,
 			      DBUS_TYPE_INT64_AS_STRING, &node_capture_gain))
 		return FALSE;
+
+	models = cras_iodev_list_get_hotword_models(id);
+	if (!append_key_value(&dict, "HotwordModels", DBUS_TYPE_STRING,
+			      DBUS_TYPE_STRING_AS_STRING,
+			      models ? &models : &empty_models)) {
+		free(models);
+		return FALSE;
+	}
+	free(models);
+
 	if (!dbus_message_iter_close_container(iter, &dict))
 		return FALSE;
 
@@ -496,7 +541,7 @@ static DBusHandlerResult handle_get_nodes(DBusConnection *conn,
 		return DBUS_HANDLER_RESULT_NEED_MEMORY;
 	if (!append_nodes(CRAS_STREAM_INPUT, &array))
 		return DBUS_HANDLER_RESULT_NEED_MEMORY;
-	dbus_connection_send(dbus_control.conn, reply, &serial);
+	dbus_connection_send(conn, reply, &serial);
 	dbus_message_unref(reply);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
@@ -517,7 +562,7 @@ handle_set_active_node(DBusConnection *conn,
 
 	cras_iodev_list_select_node(direction, id);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -537,7 +582,7 @@ handle_add_active_node(DBusConnection *conn,
 
 	cras_iodev_list_add_active_node(direction, id);
 
-	send_empty_reply(message);
+	send_empty_reply(conn, message);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -557,7 +602,7 @@ handle_rm_active_node(DBusConnection *conn,
 
         cras_iodev_list_rm_active_node(direction, id);
 
-        send_empty_reply(message);
+        send_empty_reply(conn, message);
 
         return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -567,18 +612,7 @@ static DBusHandlerResult handle_get_num_active_streams(
 	DBusMessage *message,
 	void *arg)
 {
-	DBusMessage *reply;
-	dbus_uint32_t serial = 0;
-	dbus_int32_t num;
-
-	reply = dbus_message_new_method_return(message);
-	num = cras_system_state_get_active_streams();
-	dbus_message_append_args(reply,
-				 DBUS_TYPE_INT32, &num,
-				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, reply, &serial);
-	dbus_message_unref(reply);
-
+	send_int32_reply(conn, message, cras_system_state_get_active_streams());
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
@@ -587,23 +621,14 @@ static DBusHandlerResult handle_get_num_active_streams_use_input_hw(
 	DBusMessage *message,
 	void *arg)
 {
-	DBusMessage *reply;
-	dbus_uint32_t serial = 0;
 	dbus_int32_t num = 0;
 	unsigned i;
-
-	reply = dbus_message_new_method_return(message);
 
 	for (i = 0; i < CRAS_NUM_DIRECTIONS; i++) {
 		if (cras_stream_uses_input_hw(i))
 			num += cras_system_state_get_active_streams_by_direction(i);
 	}
-
-	dbus_message_append_args(reply,
-				 DBUS_TYPE_INT32, &num,
-				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, reply, &serial);
-	dbus_message_unref(reply);
+	send_int32_reply(conn, message, num);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -613,23 +638,85 @@ static DBusHandlerResult handle_get_num_active_streams_use_output_hw(
 	DBusMessage *message,
 	void *arg)
 {
-	DBusMessage *reply;
-	dbus_uint32_t serial = 0;
 	dbus_int32_t num = 0;
 	unsigned i;
-
-	reply = dbus_message_new_method_return(message);
 
 	for (i = 0; i < CRAS_NUM_DIRECTIONS; i++) {
 		if (cras_stream_uses_output_hw(i))
 			num += cras_system_state_get_active_streams_by_direction(i);
 	}
+	send_int32_reply(conn, message, num);
 
-	dbus_message_append_args(reply,
-				 DBUS_TYPE_INT32, &num,
-				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, reply, &serial);
-	dbus_message_unref(reply);
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult handle_set_global_output_channel_remix(
+	DBusConnection *conn,
+	DBusMessage *message,
+	void *arg)
+{
+	dbus_int32_t num_channels;
+	double *coeff_array;
+	dbus_int32_t count;
+	DBusError dbus_error;
+	float *coefficient;
+	int i;
+
+	dbus_error_init(&dbus_error);
+
+	if (!dbus_message_get_args(message, &dbus_error,
+			DBUS_TYPE_INT32, &num_channels,
+			DBUS_TYPE_ARRAY,
+			      DBUS_TYPE_DOUBLE, &coeff_array, &count,
+			      DBUS_TYPE_INVALID)) {
+		syslog(LOG_WARNING, "Set global output channel remix error: %s",
+			dbus_error.message);
+		dbus_error_free(&dbus_error);
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+	}
+
+	coefficient = (float *)calloc(count, sizeof(*coefficient));
+	if (!coefficient)
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+	for (i = 0; i < count; i++)
+		coefficient[i] = coeff_array[i];
+
+	audio_thread_config_global_remix(
+			cras_iodev_list_get_audio_thread(),
+			num_channels,
+			coefficient);
+
+	send_empty_reply(conn, message);
+	free(coefficient);
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult handle_set_hotword_model(
+	DBusConnection *conn,
+	DBusMessage *message,
+	void *arg)
+{
+	cras_node_id_t id;
+	const char *model_name;
+	DBusError dbus_error;
+	dbus_int32_t ret;
+
+	dbus_error_init(&dbus_error);
+
+	if (!dbus_message_get_args(message, &dbus_error,
+				   DBUS_TYPE_UINT64, &id,
+				   DBUS_TYPE_STRING, &model_name,
+				   DBUS_TYPE_INVALID)) {
+		syslog(LOG_WARNING,
+		       "Bad method received: %s",
+		       dbus_error.message);
+		dbus_error_free(&dbus_error);
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+	}
+
+	ret = cras_iodev_list_set_hotword_model(id, model_name);
+	send_int32_reply(conn, message, ret);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -751,7 +838,17 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 						   "GetNumberOfActiveOutputStreams")) {
 		return handle_get_num_active_streams_use_output_hw(
 				conn, message, arg);
+	} else if (dbus_message_is_method_call(message,
+					       CRAS_CONTROL_INTERFACE,
+					       "SetGlobalOutputChannelRemix")) {
+		return handle_set_global_output_channel_remix(
+				conn, message, arg);
+	} else if (dbus_message_is_method_call(message,
+					       CRAS_CONTROL_INTERFACE,
+					       "SetHotwordModel")) {
+		return handle_set_hotword_model(conn, message, arg);
 	}
+
 
 	return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 }
@@ -771,11 +868,11 @@ static DBusMessage *create_dbus_message(const char *name)
 
 /* Handlers for system updates that generate DBus signals. */
 
-static void signal_volume(void *arg)
+static void signal_output_volume(void *context, int32_t volume)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_int32_t volume;
 
 	msg = create_dbus_message("OutputVolumeChanged");
 	if (!msg)
@@ -785,16 +882,16 @@ static void signal_volume(void *arg)
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_INT32, &volume,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_mute(void *arg)
+static void signal_output_mute(void *context, int muted, int user_muted,
+			       int mute_locked)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_bool_t muted;
-	dbus_bool_t user_muted;
 
 	msg = create_dbus_message("OutputMuteChanged");
 	if (!msg)
@@ -806,48 +903,47 @@ static void signal_mute(void *arg)
 				 DBUS_TYPE_BOOLEAN, &muted,
 				 DBUS_TYPE_BOOLEAN, &user_muted,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_capture_gain(void *arg)
+static void signal_capture_gain(void *context, int32_t gain)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_int32_t gain;
 
 	msg = create_dbus_message("InputGainChanged");
 	if (!msg)
 		return;
 
-	gain = cras_system_get_capture_gain();
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_INT32, &gain,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_capture_mute(void *arg)
+static void signal_capture_mute(void *context, int muted, int mute_locked)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_bool_t muted;
 
 	msg = create_dbus_message("InputMuteChanged");
 	if (!msg)
 		return;
 
-	muted = cras_system_get_capture_mute();
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_BOOLEAN, &muted,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_nodes_changed(void *arg)
+static void signal_nodes_changed(void *context)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
 
@@ -855,112 +951,96 @@ static void signal_nodes_changed(void *arg)
 	if (!msg)
 		return;
 
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_with_node_id(const char *name, cras_node_id_t id)
+static void signal_active_node_changed(void *context,
+				       enum CRAS_STREAM_DIRECTION dir,
+				       cras_node_id_t node_id)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	DBusMessage *msg;
 	dbus_uint32_t serial = 0;
 
-	msg = create_dbus_message(name);
+	msg = create_dbus_message((dir == CRAS_STREAM_OUTPUT)
+			? "ActiveOutputNodeChanged"
+			: "ActiveInputNodeChanged");
 	if (!msg)
 		return;
 	dbus_message_append_args(msg,
-				 DBUS_TYPE_UINT64, &id,
+				 DBUS_TYPE_UINT64, &node_id,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_active_node_changed(void *arg)
-{
-	cras_node_id_t output, input;
-
-	output = cras_iodev_list_get_active_node_id(CRAS_STREAM_OUTPUT);
-	input = cras_iodev_list_get_active_node_id(CRAS_STREAM_INPUT);
-
-	if (last_output != output) {
-		last_output = output;
-		signal_with_node_id("ActiveOutputNodeChanged", output);
-	}
-
-	if (last_input != input) {
-		last_input = input;
-		signal_with_node_id("ActiveInputNodeChanged", input);
-	}
-}
-
 /* Called by iodev_list when a node volume changes. */
-static void signal_node_volume_changed(cras_node_id_t id,
-				       int volume)
+static void signal_node_volume_changed(void *context,
+				       cras_node_id_t node_id,
+				       int32_t volume)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_uint64_t node_id;
-	dbus_int32_t node_volume;
 
 	msg = create_dbus_message("OutputNodeVolumeChanged");
 	if (!msg)
 		return;
 
-	node_id = id;
-	node_volume = volume;
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_UINT64, &node_id,
-				 DBUS_TYPE_INT32, &node_volume,
+				 DBUS_TYPE_INT32, &volume,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_node_capture_gain_changed(cras_node_id_t id,
+static void signal_node_capture_gain_changed(void *context,
+					     cras_node_id_t node_id,
 					     int capture_gain)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_uint64_t node_id;
-	dbus_int32_t node_capture_gain;
 
 	msg = create_dbus_message("InputNodeGainChanged");
 	if (!msg)
 		return;
 
-	node_id = id;
-	node_capture_gain = capture_gain;
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_UINT64, &node_id,
-				 DBUS_TYPE_INT32, &node_capture_gain,
+				 DBUS_TYPE_INT32, &capture_gain,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_node_left_right_swapped_changed(cras_node_id_t id,
-				       int swapped)
+static void signal_node_left_right_swapped_changed(void *context,
+						   cras_node_id_t node_id,
+						   int swapped)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
-	dbus_uint64_t node_id;
-	dbus_bool_t node_left_right_swapped;
 
 	msg = create_dbus_message("NodeLeftRightSwappedChanged");
 	if (!msg)
 		return;
 
-	node_id = id;
-	node_left_right_swapped = swapped;
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_UINT64, &node_id,
-				 DBUS_TYPE_BOOLEAN, &node_left_right_swapped,
+				 DBUS_TYPE_BOOLEAN, &swapped,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
-static void signal_num_active_streams_changed(void *arg)
+static void signal_num_active_streams_changed(void *context,
+					      enum CRAS_STREAM_DIRECTION dir,
+					      uint32_t num_active_streams)
 {
+	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
 	dbus_uint32_t serial = 0;
 	DBusMessage *msg;
 	dbus_int32_t num;
@@ -973,7 +1053,7 @@ static void signal_num_active_streams_changed(void *arg)
 	dbus_message_append_args(msg,
 				 DBUS_TYPE_INT32, &num,
 				 DBUS_TYPE_INVALID);
-	dbus_connection_send(dbus_control.conn, msg, &serial);
+	dbus_connection_send(control->conn, msg, &serial);
 	dbus_message_unref(msg);
 }
 
@@ -986,6 +1066,7 @@ void cras_dbus_control_start(DBusConnection *conn)
 	};
 
 	DBusError dbus_error;
+	struct cras_observer_ops observer_ops;
 
 	dbus_control.conn = conn;
 	dbus_connection_ref(dbus_control.conn);
@@ -1001,19 +1082,21 @@ void cras_dbus_control_start(DBusConnection *conn)
 		return;
 	}
 
-	cras_system_register_volume_changed_cb(signal_volume, 0);
-	cras_system_register_mute_changed_cb(signal_mute, 0);
-	cras_system_register_capture_gain_changed_cb(signal_capture_gain, 0);
-	cras_system_register_capture_mute_changed_cb(signal_capture_mute, 0);
-	cras_system_register_active_streams_changed_cb(
-		signal_num_active_streams_changed, 0);
-	cras_iodev_list_register_nodes_changed_cb(signal_nodes_changed, 0);
-	cras_iodev_list_register_active_node_changed_cb(
-		signal_active_node_changed, 0);
-	cras_iodev_list_set_node_volume_callbacks(
-		signal_node_volume_changed, signal_node_capture_gain_changed);
-	cras_iodev_list_set_node_left_right_swapped_callbacks(
-		signal_node_left_right_swapped_changed);
+	memset(&observer_ops, 0, sizeof(observer_ops));
+	observer_ops.output_volume_changed = signal_output_volume;
+	observer_ops.output_mute_changed = signal_output_mute;
+	observer_ops.capture_gain_changed = signal_capture_gain;
+	observer_ops.capture_mute_changed = signal_capture_mute;
+	observer_ops.num_active_streams_changed =
+			signal_num_active_streams_changed;
+	observer_ops.nodes_changed = signal_nodes_changed;
+	observer_ops.active_node_changed = signal_active_node_changed;
+	observer_ops.input_node_gain_changed = signal_node_capture_gain_changed;
+	observer_ops.output_node_volume_changed = signal_node_volume_changed;
+	observer_ops.node_left_right_swapped_changed =
+			signal_node_left_right_swapped_changed;
+
+	dbus_control.observer = cras_observer_add(&observer_ops, &dbus_control);
 }
 
 void cras_dbus_control_stop()
@@ -1021,19 +1104,11 @@ void cras_dbus_control_stop()
 	if (!dbus_control.conn)
 		return;
 
-	cras_system_remove_volume_changed_cb(signal_volume, 0);
-	cras_system_remove_mute_changed_cb(signal_mute, 0);
-	cras_system_remove_capture_gain_changed_cb(signal_capture_gain, 0);
-	cras_system_remove_capture_mute_changed_cb(signal_capture_mute, 0);
-	cras_system_remove_active_streams_changed_cb(
-		signal_num_active_streams_changed, 0);
-	cras_iodev_list_remove_nodes_changed_cb(signal_nodes_changed, 0);
-	cras_iodev_list_remove_active_node_changed_cb(
-		signal_active_node_changed, 0);
-
 	dbus_connection_unregister_object_path(dbus_control.conn,
 					       CRAS_ROOT_OBJECT_PATH);
 
 	dbus_connection_unref(dbus_control.conn);
 	dbus_control.conn = NULL;
+	cras_observer_remove(dbus_control.observer);
+	dbus_control.observer = NULL;
 }

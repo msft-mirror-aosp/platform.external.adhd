@@ -50,6 +50,7 @@ static int cras_bt_adapter_query_bus_type(struct cras_bt_adapter *adapter)
 	}
 
 	/* dev_id = 0 for hci0 */
+	dev_info.type = 0;
 	dev_info.dev_id = atoi(pos + 3);
 	err = ioctl(ctl, HCIGETDEVINFO, (void *)&dev_info);
 	if (err) {
@@ -110,6 +111,9 @@ void cras_bt_adapter_reset()
 struct cras_bt_adapter *cras_bt_adapter_get(const char *object_path)
 {
 	struct cras_bt_adapter *adapter;
+
+	if (object_path == NULL)
+		return NULL;
 
 	DL_FOREACH(adapters, adapter) {
 		if (strcmp(adapter->object_path, object_path) == 0)

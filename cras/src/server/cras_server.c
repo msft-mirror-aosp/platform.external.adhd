@@ -5,7 +5,9 @@
 
 #define _GNU_SOURCE /* Needed for Linux socket credential passing. */
 
+#ifdef CRAS_DBUS
 #include <dbus/dbus.h>
+#endif
 #include <errno.h>
 #include <poll.h>
 #include <stdint.h>
@@ -21,25 +23,32 @@
 #include <syslog.h>
 #include <unistd.h>
 
+#ifdef CRAS_DBUS
+#include "cras_a2dp_endpoint.h"
 #include "cras_bt_manager.h"
 #include "cras_bt_device.h"
-#include "cras_a2dp_endpoint.h"
-#include "cras_config.h"
+#include "cras_bt_player.h"
 #include "cras_dbus.h"
 #include "cras_dbus_control.h"
 #include "cras_hfp_ag_profile.h"
+#include "cras_telephony.h"
+#endif
+#include "cras_alert.h"
+#include "cras_config.h"
+#include "cras_device_monitor.h"
 #include "cras_iodev_list.h"
 #include "cras_main_message.h"
 #include "cras_messages.h"
 #include "cras_metrics.h"
+#include "cras_observer.h"
 #include "cras_rclient.h"
 #include "cras_server.h"
 #include "cras_server_metrics.h"
 #include "cras_system_state.h"
-#include "cras_telephony.h"
 #include "cras_tm.h"
 #include "cras_udev.h"
 #include "cras_util.h"
+#include "cras_mix.h"
 #include "utlist.h"
 
 /* Store a list of clients that are attached to the server.
@@ -108,9 +117,10 @@ static void handle_message_from_client(struct attached_client *client)
 	struct cras_server_message *msg;
 	int nread;
 	int fd;
+	unsigned int num_fds = 1;
 
 	msg = (struct cras_server_message *)buf;
-	nread = cras_recv_with_fd(client->fd, buf, sizeof(buf), &fd);
+	nread = cras_recv_with_fds(client->fd, buf, sizeof(buf), &fd, &num_fds);
 	if (nread < sizeof(msg->length))
 		goto read_error;
 	if (msg->length != nread)
@@ -121,7 +131,14 @@ static void handle_message_from_client(struct attached_client *client)
 read_error:
 	if (fd != -1)
 		close(fd);
-	syslog(LOG_DEBUG, "read err, removing client %zu", client->id);
+	switch (nread) {
+	case 0:
+		break;
+	default:
+		syslog(LOG_DEBUG, "read err [%d] '%s', removing client %zu",
+		       -nread, strerror(-nread), client->id);
+		break;
+	}
 	remove_client(client);
 }
 
@@ -301,6 +318,60 @@ void check_output_exists(struct cras_timer *t, void *data)
 		cras_metrics_log_event(kNoCodecsFoundMetric);
 }
 
+#if defined(__amd64__)
+/* CPU detection - probaby best to move this elsewhere */
+static void cpuid(unsigned int *eax, unsigned int *ebx, unsigned int *ecx,
+	          unsigned int *edx, unsigned int op)
+{
+	__asm__ __volatile__ (
+		"cpuid"
+		: "=a" (*eax),
+		  "=b" (*ebx),
+		  "=c" (*ecx),
+		  "=d" (*edx)
+		: "a" (op), "c" (0)
+    );
+}
+
+static unsigned int cpu_x86_flags(void)
+{
+	unsigned int eax, ebx, ecx, edx, id;
+	unsigned int cpu_flags = 0;
+
+	cpuid(&id, &ebx, &ecx, &edx, 0);
+
+	if (id >= 1) {
+		cpuid(&eax, &ebx, &ecx, &edx, 1);
+
+		if (ecx & (1 << 20))
+			cpu_flags |= CPU_X86_SSE4_2;
+
+		if (ecx & (1 << 28))
+			cpu_flags |= CPU_X86_AVX;
+
+		if (ecx & (1 << 12))
+			cpu_flags |= CPU_X86_FMA;
+	}
+
+	if (id >= 7) {
+		cpuid(&eax, &ebx, &ecx, &edx, 7);
+
+		if (ebx & (1 << 5))
+			cpu_flags |= CPU_X86_AVX2;
+	}
+
+	return cpu_flags;
+}
+#endif
+
+int cpu_get_flags(void)
+{
+#if defined(__amd64__)
+	return cpu_x86_flags();
+#endif
+	return 0;
+}
+
 /*
  * Exported Interface.
  */
@@ -309,6 +380,12 @@ int cras_server_init()
 {
 	/* Log to syslog. */
 	openlog("cras_server", LOG_PID, LOG_USER);
+
+	/* Initialize global observer. */
+	cras_observer_server_init();
+
+	/* init mixer with CPU capabilities */
+	cras_mix_init(cpu_get_flags());
 
 	/* Allow clients to register callbacks for file descriptors.
 	 * add_select_fd and rm_select_fd will add and remove file descriptors
@@ -320,11 +397,12 @@ int cras_server_init()
 	return 0;
 }
 
-int cras_server_run()
+int cras_server_run(unsigned int profile_disable_mask)
 {
 	static const unsigned int OUTPUT_CHECK_MS = 5 * 1000;
-
+#ifdef CRAS_DBUS
 	DBusConnection *dbus_conn;
+#endif
 	int socket_fd = -1;
 	int rc = 0;
 	const char *sockdir;
@@ -341,20 +419,30 @@ int cras_server_run()
 	pollfds = malloc(sizeof(*pollfds) * pollfds_size);
 
 	cras_udev_start_sound_subsystem_monitor();
+#ifdef CRAS_DBUS
 	cras_bt_device_start_monitor();
+#endif
 
 	cras_server_metrics_init();
 
+	cras_device_monitor_init();
+
+#ifdef CRAS_DBUS
 	dbus_threads_init_default();
 	dbus_conn = cras_dbus_connect_system_bus();
 	if (dbus_conn) {
 		cras_bt_start(dbus_conn);
-		cras_hfp_ag_profile_create(dbus_conn);
-		cras_hsp_ag_profile_create(dbus_conn);
+		if (!(profile_disable_mask & CRAS_SERVER_PROFILE_MASK_HFP))
+			cras_hfp_ag_profile_create(dbus_conn);
+		if (!(profile_disable_mask & CRAS_SERVER_PROFILE_MASK_HSP))
+			cras_hsp_ag_profile_create(dbus_conn);
 		cras_telephony_start(dbus_conn);
-		cras_a2dp_endpoint_create(dbus_conn);
+		if (!(profile_disable_mask & CRAS_SERVER_PROFILE_MASK_A2DP))
+			cras_a2dp_endpoint_create(dbus_conn);
+		cras_bt_player_create(dbus_conn);
 		cras_dbus_control_start(dbus_conn);
 	}
+#endif
 
 	socket_fd = socket(PF_UNIX, SOCK_SEQPACKET, 0);
 	if (socket_fd < 0) {
@@ -464,8 +552,10 @@ int cras_server_run()
 
 		cleanup_select_fds(&server_instance);
 
+#ifdef CRAS_DBUS
 		if (dbus_conn)
 			cras_dbus_dispatch(dbus_conn);
+#endif
 
 		cras_alert_process_all_pending_alerts();
 	}
@@ -476,6 +566,7 @@ bail:
 		unlink(addr.sun_path);
 	}
 	free(pollfds);
+	cras_observer_server_free();
 	return rc;
 }
 
@@ -484,5 +575,5 @@ void cras_server_send_to_all_clients(const struct cras_client_message *msg)
 	struct attached_client *client;
 
 	DL_FOREACH(server_instance.clients_head, client)
-		cras_rclient_send_message(client->client, msg);
+		cras_rclient_send_message(client->client, msg, NULL, 0);
 }

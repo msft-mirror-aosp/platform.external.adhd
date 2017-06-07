@@ -38,27 +38,13 @@ struct cras_bt_device *cras_bt_transport_device(
 	const struct cras_bt_transport *transport);
 enum cras_bt_device_profile cras_bt_transport_profile(
 	const struct cras_bt_transport *transport);
-int cras_bt_transport_codec(const struct cras_bt_transport *transport);
 int cras_bt_transport_configuration(const struct cras_bt_transport *transport,
 				    void *configuration, int len);
 enum cras_bt_transport_state cras_bt_transport_state(
 	const struct cras_bt_transport *transport);
-struct cras_bt_endpoint *cras_bt_transport_endpoint(
-	const struct cras_bt_transport *transport);
 
 int cras_bt_transport_fd(const struct cras_bt_transport *transport);
-uint16_t cras_bt_transport_read_mtu(const struct cras_bt_transport *transport);
 uint16_t cras_bt_transport_write_mtu(const struct cras_bt_transport *transport);
-
-/* Fills the necessary fields in cras_bt_tranport for cras_bt_profile
- * to create cras_iodev.
- * Args:
- *    transport - The transport object carries the fields
- *    fd - File descriptor of the rfcomm socket
- *    uuid - The UUID of the profile
- */
-void cras_bt_transport_fill_properties(struct cras_bt_transport *transport,
-		int fd, const char *uuid);
 
 void cras_bt_transport_update_properties(
 	struct cras_bt_transport *transport,
@@ -67,6 +53,23 @@ void cras_bt_transport_update_properties(
 
 int cras_bt_transport_try_acquire(struct cras_bt_transport *transport);
 int cras_bt_transport_acquire(struct cras_bt_transport *transport);
-int cras_bt_transport_release(struct cras_bt_transport *transport);
+
+/* Releases the cras_bt_transport.
+ * Args:
+ *    transport - The transport object to release
+ *    blocking - True to send release dbus message in blocking mode, otherwise
+ *        in non-block mode.
+ */
+int cras_bt_transport_release(struct cras_bt_transport *transport,
+			      unsigned int blocking);
+
+/* Sets the volume to cras_bt_transport. Note that the volume gets applied
+ * to BT headset only when the transport is in ACTIVE state.
+ * Args:
+ *    transport - The transport object to set volume to.
+ *    volume - The desired volume value, range in [0-127].
+ */
+int cras_bt_transport_set_volume(struct cras_bt_transport *transport,
+				 uint16_t volume);
 
 #endif /* CRAS_BT_TRANSPORT_H_ */

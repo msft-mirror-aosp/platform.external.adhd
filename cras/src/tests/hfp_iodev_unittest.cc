@@ -71,7 +71,8 @@ void ResetStubData() {
 
 namespace {
 
-TEST(HfpIodev, CreateHfpIodev) {
+TEST(HfpIodev, CreateHfpOutputIodev) {
+  ResetStubData();
   iodev = hfp_iodev_create(CRAS_STREAM_OUTPUT, fake_device, fake_slc,
                            CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY,
                 		  	   fake_info);
@@ -80,6 +81,24 @@ TEST(HfpIodev, CreateHfpIodev) {
   ASSERT_EQ(1, cras_bt_device_append_iodev_called);
   ASSERT_EQ(1, cras_iodev_add_node_called);
   ASSERT_EQ(1, cras_iodev_set_active_node_called);
+
+  hfp_iodev_destroy(iodev);
+
+  ASSERT_EQ(1, cras_bt_device_rm_iodev_called);
+  ASSERT_EQ(1, cras_iodev_rm_node_called);
+}
+
+TEST(HfpIodev, CreateHfpInputIodev) {
+  ResetStubData();
+  iodev = hfp_iodev_create(CRAS_STREAM_INPUT, fake_device, fake_slc,
+                           CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY, fake_info);
+
+  ASSERT_EQ(CRAS_STREAM_INPUT, iodev->direction);
+  ASSERT_EQ(1, cras_bt_device_append_iodev_called);
+  ASSERT_EQ(1, cras_iodev_add_node_called);
+  ASSERT_EQ(1, cras_iodev_set_active_node_called);
+  /* Input device does not use software gain. */
+  ASSERT_EQ(0, iodev->software_volume_needed);
 
   hfp_iodev_destroy(iodev);
 
@@ -105,7 +124,6 @@ TEST(HfpIodev, OpenHfpIodev) {
 
   /* hfp_info is running now */
   hfp_info_running_return_val = 1;
-  ASSERT_EQ(1, iodev->is_open(iodev));
 
   iodev->close_dev(iodev);
   ASSERT_EQ(1, hfp_info_rm_iodev_called);
@@ -129,8 +147,6 @@ TEST(HfpIodev, OpenIodevWithHfpInfoAlreadyRunning) {
   ASSERT_EQ(0, cras_bt_device_sco_connect_called);
   ASSERT_EQ(0, hfp_info_start_called);
   ASSERT_EQ(1, hfp_info_add_iodev_called);
-
-  ASSERT_EQ(1, iodev->is_open(iodev));
 
   hfp_info_has_iodev_return_val = 1;
   iodev->close_dev(iodev);
@@ -208,11 +224,6 @@ const char *cras_bt_device_name(const struct cras_bt_device *device)
 
 const char *cras_bt_device_address(const struct cras_bt_device *device) {
   return "1A:2B:3C:4D:5E:6F";
-}
-
-int cras_bt_device_set_speaker_gain(struct cras_bt_device *device, int gain)
-{
-  return 0;
 }
 
 void cras_bt_device_append_iodev(struct cras_bt_device *device,
@@ -329,6 +340,11 @@ void cras_audio_area_config_buf_pointers(struct cras_audio_area *area,
 }
 
 int hfp_set_call_status(struct hfp_slc_handle *handle, int call)
+{
+  return 0;
+}
+
+int hfp_event_speaker_gain(struct hfp_slc_handle *handle, int gain)
 {
   return 0;
 }

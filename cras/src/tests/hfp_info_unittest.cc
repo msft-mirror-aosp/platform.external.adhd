@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -310,6 +310,11 @@ TEST(HfpInfo, StartHfpInfoAndWrite) {
 
 extern "C" {
 
+struct audio_thread *cras_iodev_list_get_audio_thread()
+{
+  return NULL;
+}
+
 void audio_thread_add_callback(int fd, thread_callback cb,
                                void *data)
 {
@@ -318,11 +323,11 @@ void audio_thread_add_callback(int fd, thread_callback cb,
   return;
 }
 
-void audio_thread_rm_callback(int fd)
+int audio_thread_rm_callback_sync(struct audio_thread *thread, int fd)
 {
   thread_cb = NULL;
   cb_data = NULL;
-  return;
+  return 0;
 }
 }
 

@@ -16,12 +16,14 @@ struct cras_rclient;
 struct dev_mix;
 
 /* Holds identifiers for an shm segment.
- *  shm_key - Key shared with client to access shm.
- *  shm_id - Returned from shmget.
+ *  shm_fd - File descriptor shared with client to access shm.
+ *  shm_name - Name of the shm area.
+ *  length - Size of the shm region.
  */
 struct rstream_shm_info {
-	int shm_key;
-	int shm_id;
+	int shm_fd;
+	char shm_name[NAME_MAX];
+	size_t length;
 };
 
 /* Holds informations about the master active device.
@@ -200,15 +202,15 @@ static inline void cras_rstream_set_is_draining(struct cras_rstream *stream,
 }
 
 /* Gets the shm key used to find the outputshm region. */
-static inline int cras_rstream_output_shm_key(const struct cras_rstream *stream)
+static inline int cras_rstream_output_shm_fd(const struct cras_rstream *stream)
 {
-	return stream->shm_info.shm_key;
+	return stream->shm_info.shm_fd;
 }
 
 /* Gets the shm key used to find the input shm region. */
-static inline int cras_rstream_input_shm_key(const struct cras_rstream *stream)
+static inline int cras_rstream_input_shm_fd(const struct cras_rstream *stream)
 {
-	return stream->shm_info.shm_key;
+	return stream->shm_info.shm_fd;
 }
 
 /* Gets the total size of shm memory allocated. */
@@ -254,7 +256,8 @@ void cras_rstream_record_fetch_interval(struct cras_rstream *rstream,
 					const struct timespec *now);
 
 /* Requests min_req frames from the client. */
-int cras_rstream_request_audio(const struct cras_rstream *stream);
+int cras_rstream_request_audio(struct cras_rstream *stream,
+			       const struct timespec *now);
 
 /* Tells a capture client that count frames are ready. */
 int cras_rstream_audio_ready(struct cras_rstream *stream, size_t count);

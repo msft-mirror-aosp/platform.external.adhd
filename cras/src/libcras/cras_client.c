@@ -30,12 +30,15 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/eventfd.h>
 #include <sys/ipc.h>
+#include <sys/mman.h>
 #include <sys/param.h>
-#include <sys/shm.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <syslog.h>
@@ -43,27 +46,17 @@
 
 #include "cras_client.h"
 #include "cras_config.h"
+#include "cras_file_wait.h"
 #include "cras_messages.h"
+#include "cras_observer_ops.h"
 #include "cras_shm.h"
 #include "cras_types.h"
 #include "cras_util.h"
 #include "utlist.h"
 
-#ifdef __ANDROID__
-void *shmat(int shmid, const void *shmaddr, int shmflg);
-int shmdt(const void *shmaddr);
-int shmget(key_t key, size_t size, int shmflg);
-
-long __set_errno_internal(int n) {
-  errno = n;
-  return -1;
-}
-#endif
-
 static const size_t MAX_CMD_MSG_LEN = 256;
-static const size_t SERVER_CONNECT_TIMEOUT_NS = 500000000;
 static const size_t SERVER_SHUTDOWN_TIMEOUT_US = 500000;
-static const size_t SERVER_FIRST_MESSAGE_TIMEOUT_NS = 500000000;
+static const size_t SERVER_CONNECT_TIMEOUT_MS = 1000;
 
 /* Commands sent from the user to the running client. */
 enum {
@@ -72,6 +65,7 @@ enum {
 	CLIENT_REMOVE_STREAM,
 	CLIENT_SET_STREAM_VOLUME_SCALER,
 	CLIENT_SERVER_CONNECT,
+	CLIENT_SERVER_CONNECT_ASYNC,
 };
 
 struct command_msg {
@@ -108,10 +102,17 @@ struct stream_msg {
 	cras_stream_id_t stream_id;
 };
 
+enum CRAS_THREAD_STATE {
+	CRAS_THREAD_STOP,	/* Isn't (shouldn't be) running. */
+	CRAS_THREAD_WARMUP,	/* Is started, but not fully functional: waiting
+				 * for resources to be ready for example. */
+	CRAS_THREAD_RUNNING,	/* Is running and fully functional. */
+};
+
 /* Manage information for a thread. */
 struct thread_state {
 	pthread_t tid;
-	unsigned  running;
+	enum CRAS_THREAD_STATE state;
 };
 
 /* Parameters used when setting up a capture or playback stream. See comment
@@ -155,45 +156,180 @@ struct client_stream {
 	struct cras_client *client;
 	struct cras_stream_params *config;
 	struct cras_audio_shm capture_shm;
+	int capture_shm_size;
 	struct cras_audio_shm play_shm;
+	int play_shm_size;
 	struct client_stream *prev, *next;
 };
 
+/* State of the socket. */
+typedef enum cras_socket_state {
+	CRAS_SOCKET_STATE_DISCONNECTED,
+		/* Not connected. Also used to cleanup the current connection
+		 * before restarting the connection attempt. */
+	CRAS_SOCKET_STATE_WAIT_FOR_SOCKET,
+		/* Waiting for the socket file to exist. Socket file existence
+		 * is monitored using cras_file_wait. */
+	CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE,
+		/* Waiting for the socket to have something at the other end. */
+	CRAS_SOCKET_STATE_FIRST_MESSAGE,
+		/* Waiting for the first messages from the server and set our
+		 * client ID. */
+	CRAS_SOCKET_STATE_CONNECTED,
+		/* The socket is connected and working. */
+	CRAS_SOCKET_STATE_ERROR_DELAY,
+		/* There was an error during one of the above states. Sleep for
+		 * a bit before continuing. If this state could not be initiated
+		 * then we move to the DISCONNECTED state and notify via the
+		 * connection callback. */
+} cras_socket_state_t;
+
 /* Represents a client used to communicate with the audio server.
  * id - Unique identifier for this client, negative until connected.
- * server_fd Incoming messages from server.
+ * server_fd - Incoming messages from server.
+ * server_fd_state - State of the server's socket.
+ * server_event_fd - Eventfd to wait on until a connection is established.
  * stream_fds - Pipe for attached streams.
  * command_fds - Pipe for user commands to thread.
  * command_reply_fds - Pipe for acking/nacking command messages from thread.
- * sock_dir - Directory where the local audio socket can be found.
+ * sock_file - Server communication socket file.
+ * sock_file_wait - Structure used to monitor existence of the socket file.
+ * sock_file_exists - Set to true when the socket file exists.
  * running - The client thread will run while this is non zero.
  * next_stream_id - ID to give the next stream.
+ * stream_start_cond - Condition used during stream startup.
+ * stream_start_lock - Lock used during stream startup.
  * tid - Thread ID of the client thread started by "cras_client_run_thread".
  * last_command_result - Passes back the result of the last user command.
  * streams - Linked list of streams attached to this client.
  * server_state - RO shared memory region holding server state.
  * debug_info_callback - Function to call when debug info is received.
+ * get_hotword_models_cb_t - Function to call when hotword models info is ready.
+ * server_err_cb - Function to call when failed to read messages from server.
+ * server_err_user_arg - User argument for server_err_cb.
+ * server_connection_cb - Function to called when a connection state changes.
+ * server_connection_user_arg - User argument for server_connection_cb.
+ * thread_priority_cb - Function to call for setting audio thread priority.
+ * observer_ops - Functions to call when system state changes.
+ * observer_context - Context passed to client in state change callbacks.
  */
 struct cras_client {
 	int id;
 	int server_fd;
+	cras_socket_state_t server_fd_state;
+	int server_event_fd;
 	int stream_fds[2];
 	int command_fds[2];
 	int command_reply_fds[2];
-	const char *sock_dir;
+	const char *sock_file;
+	struct cras_file_wait *sock_file_wait;
+	bool sock_file_exists;
 	struct thread_state thread;
 	cras_stream_id_t next_stream_id;
+	pthread_cond_t stream_start_cond;
+	pthread_mutex_t stream_start_lock;
 	int last_command_result;
 	struct client_stream *streams;
 	const struct cras_server_state *server_state;
 	void (*debug_info_callback)(struct cras_client *);
+	get_hotword_models_cb_t get_hotword_models_cb;
+	cras_server_error_cb_t server_err_cb;
+	cras_connection_status_cb_t server_connection_cb;
+	void *server_connection_user_arg;
+	cras_thread_priority_cb_t thread_priority_cb;
+	struct cras_observer_ops observer_ops;
+	void *observer_context;
 };
+
+/*
+ * Holds the client pointer plus internal book keeping.
+ *
+ * client - The client
+ * server_state_rwlock - lock to make the client's server_state thread-safe.
+ */
+struct client_int {
+	struct cras_client client;
+	pthread_rwlock_t server_state_rwlock;
+};
+
+#define to_client_int(cptr) \
+((struct client_int *)((char *)cptr - offsetof(struct client_int, client)))
 
 /*
  * Local Helpers
  */
 
+static int client_thread_rm_stream(struct cras_client *client,
+				   cras_stream_id_t stream_id);
 static int handle_message_from_server(struct cras_client *client);
+static int reregister_notifications(struct cras_client *client);
+
+/*
+ * Unlock the server_state_rwlock if lock_rc is 0.
+ *
+ * Args:
+ *    client - The CRAS client pointer.
+ *    lock_rc - The result of server_state_rdlock or
+ *              server_state_wrlock.
+ */
+static void server_state_unlock(const struct cras_client *client,
+				int lock_rc)
+{
+	struct client_int *client_int;
+
+	if (!client)
+		return;
+	client_int = to_client_int(client);
+	if (lock_rc == 0)
+		pthread_rwlock_unlock(&client_int->server_state_rwlock);
+}
+
+/*
+ * Lock the server_state_rwlock for reading.
+ *
+ * Also checks that the server_state pointer is valid.
+ *
+ * Args:
+ *    client - The CRAS client pointer.
+ * Returns:
+ *    0 for success, positive error code on error.
+ *    Returns EINVAL if the server state pointer is NULL.
+ */
+static int server_state_rdlock(const struct cras_client *client)
+{
+	struct client_int *client_int;
+	int lock_rc;
+
+	if (!client)
+		return EINVAL;
+	client_int = to_client_int(client);
+	lock_rc = pthread_rwlock_rdlock(&client_int->server_state_rwlock);
+	if (lock_rc != 0)
+		return lock_rc;
+	if (!client->server_state) {
+		pthread_rwlock_unlock(&client_int->server_state_rwlock);
+		return EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * Lock the server_state_rwlock for writing.
+ *
+ * Args:
+ *    client - The CRAS client pointer.
+ * Returns:
+ *    0 for success, positive error code on error.
+ */
+static int server_state_wrlock(const struct cras_client *client)
+{
+	struct client_int *client_int;
+
+	if (!client)
+		return EINVAL;
+	client_int = to_client_int(client);
+	return pthread_rwlock_wrlock(&client_int->server_state_rwlock);
+}
 
 /* Get the stream pointer from a stream id. */
 static struct client_stream *stream_from_id(const struct cras_client *client,
@@ -205,129 +341,610 @@ static struct client_stream *stream_from_id(const struct cras_client *client,
 	return out;
 }
 
-/* Waits until we have heard back from the server so that we know we are
- * connected.  The connected success/failure message is always the first message
- * the server sends. Return non zero if client is connected to the server. A
- * return code of zero means that the client is not connected to the server. */
-static int check_server_connected_wait(struct cras_client *client)
+/*
+ * Fill a pollfd structure with the current server fd and events.
+ */
+void server_fill_pollfd(const struct cras_client *client,
+			struct pollfd *poll_fd)
 {
-	struct pollfd pollfd;
-	int rc;
-	struct timespec timeout, now;
+	int events = 0;
 
-	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-	timeout.tv_sec = 0;
-	timeout.tv_nsec = SERVER_FIRST_MESSAGE_TIMEOUT_NS;
-	add_timespecs(&timeout, &now);
-
-	pollfd.fd = client->server_fd;
-	pollfd.events = POLLIN;
-
-	while (timespec_after(&timeout, &now) > 0 && client->id < 0) {
-		rc = ppoll(&pollfd, 1, &timeout, NULL);
-		if (rc <= 0 && rc != -EAGAIN)
-			return 0; /* Timeout or error. */
-		if (pollfd.revents & POLLIN) {
-			rc = handle_message_from_server(client);
-			if (rc < 0)
-				return 0;
-		}
-		clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+	poll_fd->fd = client->server_fd;
+	switch (client->server_fd_state) {
+	case CRAS_SOCKET_STATE_DISCONNECTED:
+		break;
+	case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
+	case CRAS_SOCKET_STATE_FIRST_MESSAGE:
+	case CRAS_SOCKET_STATE_CONNECTED:
+	case CRAS_SOCKET_STATE_ERROR_DELAY:
+		events = POLLIN;
+		break;
+	case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
+		events = POLLOUT;
+		break;
 	}
-
-	return client->id >= 0;
+	poll_fd->events = events;
+	poll_fd->revents = 0;
 }
 
-/* Waits until the fd is writable or the specified time has passed. Returns 0 if
- * the fd is writable, -1 for timeout or other error. */
-static int wait_until_fd_writable(int fd, int timeout_ns)
+/*
+ * Change the server_fd_state.
+ */
+static void server_fd_move_to_state(struct cras_client *client,
+				    cras_socket_state_t state)
 {
-	struct pollfd pollfd;
-	struct timespec timeout;
+	if (state == client->server_fd_state)
+		return;
+
+	client->server_fd_state = state;
+}
+
+/*
+ * Action to take when in state ERROR_DELAY.
+ *
+ * In this state we want to sleep for a few seconds before retrying the
+ * connection to the audio server.
+ *
+ * If server_fd is negative: create a timer and setup server_fd with the
+ * timer's fd. If server_fd is not negative and there is input, then assume
+ * that the timer has expired, and restart the connection by moving to
+ * WAIT_FOR_SOCKET state.
+ */
+static int error_delay_next_action(struct cras_client *client,
+				   int poll_revents)
+{
 	int rc;
+	struct itimerspec timeout;
 
-	timeout.tv_sec = 0;
-	timeout.tv_nsec = timeout_ns;
+	if (client->server_fd == -1) {
+		client->server_fd = timerfd_create(
+					CLOCK_MONOTONIC,
+					TFD_NONBLOCK|TFD_CLOEXEC);
+		if (client->server_fd == -1) {
+			rc = -errno;
+			syslog(LOG_ERR,
+			       "cras_client: Could not create timerfd: %s",
+			       strerror(-rc));
+			return rc;
+		}
 
-	pollfd.fd = fd;
-	pollfd.events = POLLOUT;
+		/* Setup a relative timeout of 2 seconds. */
+		memset(&timeout, 0, sizeof(timeout));
+		timeout.it_value.tv_sec = 2;
+		rc = timerfd_settime(client->server_fd, 0, &timeout, NULL);
+		if (rc != 0) {
+			rc = -errno;
+			syslog(LOG_ERR,
+			       "cras_client: Could not set timeout: %s",
+			       strerror(-rc));
+			return rc;
+		}
+		return 0;
+	} else if ((poll_revents & POLLIN) == 0) {
+		return 0;
+	}
 
-	rc = ppoll(&pollfd, 1, &timeout, NULL);
-	if (rc <= 0)
-		return -1;
+	/* Move to the next state: close the timer fd first. */
+	close(client->server_fd);
+	client->server_fd = -1;
+	server_fd_move_to_state(client, CRAS_SOCKET_STATE_WAIT_FOR_SOCKET);
 	return 0;
 }
 
-/* Opens the server socket and connects to it. */
-static int connect_to_server(struct cras_client *client)
+/*
+ * Action to take when in WAIT_FOR_SOCKET state.
+ *
+ * In this state we are waiting for the socket file to exist. The existence of
+ * the socket file is continually monitored using the cras_file_wait structure
+ * and a separate fd. When the sock_file_exists boolean is modified, the state
+ * machine is invoked.
+ *
+ * If the socket file exists, then we move to the WAIT_FOR_WRITABLE state.
+ */
+static void wait_for_socket_next_action(struct cras_client *client)
+{
+	if (client->sock_file_exists)
+		server_fd_move_to_state(
+			client, CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE);
+}
+
+/*
+ * Action to take when in WAIT_FOR_WRITABLE state.
+ *
+ * In this state we are initiating a connection the server and waiting for the
+ * server to ready for incoming messages.
+ *
+ * Create the socket to the server, and wait while a connect request results in
+ * -EINPROGRESS. Otherwise, we assume that the socket file will be deleted by
+ * the server and the server_fd_state will be changed in
+ * sock_file_wait_dispatch().
+ */
+static int wait_for_writable_next_action(struct cras_client *client,
+					 int poll_revents)
 {
 	int rc;
 	struct sockaddr_un address;
 
-	if (client->server_fd >= 0)
-		close(client->server_fd);
-	client->server_fd = socket(PF_UNIX, SOCK_SEQPACKET, 0);
-	if (client->server_fd < 0) {
-		syslog(LOG_ERR, "cras_client: %s: Socket failed.", __func__);
-		return client->server_fd;
+	if (client->server_fd == -1) {
+		client->server_fd = socket(PF_UNIX, SOCK_SEQPACKET, 0);
+		if (client->server_fd < 0) {
+			rc = -errno;
+			syslog(LOG_ERR, "cras_client: server socket failed: %s",
+			       strerror(-rc));
+			return rc;
+		}
+	}
+	else if ((poll_revents & POLLOUT) == 0) {
+		return 0;
 	}
 
-	memset(&address, 0, sizeof(struct sockaddr_un));
-
-	address.sun_family = AF_UNIX;
-	client->sock_dir = cras_config_get_system_socket_file_dir();
-	assert(client->sock_dir);
-	snprintf(address.sun_path, sizeof(address.sun_path),
-		 "%s/%s", client->sock_dir, CRAS_SOCKET_FILE);
-
 	/* We make the file descriptor non-blocking when we do connect(), so we
-	 * don't block indifinitely. */
+	 * don't block indefinitely. */
 	cras_make_fd_nonblocking(client->server_fd);
+
+	memset(&address, 0, sizeof(struct sockaddr_un));
+	address.sun_family = AF_UNIX;
+	strcpy(address.sun_path, client->sock_file);
 	rc = connect(client->server_fd, (struct sockaddr *)&address,
 		     sizeof(struct sockaddr_un));
-
-	if (rc == -1 && errno == EINPROGRESS) {
-		rc = wait_until_fd_writable(client->server_fd,
-					    SERVER_CONNECT_TIMEOUT_NS);
+	if (rc != 0) {
+		rc = -errno;
+		/* For -EINPROGRESS, we wait for POLLOUT on the server_fd.
+		 * Otherwise CRAS is not running and we assume that the socket
+		 * file will be deleted and recreated. Notification of that will
+		 * happen via the sock_file_wait_dispatch(). */
+		if (rc == -ECONNREFUSED) {
+			/* CRAS is not running, don't log this error and just
+			 * stay in this state waiting sock_file_wait_dispatch()
+			 * to move the state machine. */
+			close(client->server_fd);
+			client->server_fd = -1;
+		}
+		else if (rc != -EINPROGRESS) {
+			syslog(LOG_ERR,
+			       "cras_client: server connect failed: %s",
+			       strerror(-rc));
+			return rc;
+		}
+		return 0;
 	}
 
 	cras_make_fd_blocking(client->server_fd);
+	server_fd_move_to_state(client, CRAS_SOCKET_STATE_FIRST_MESSAGE);
+	return 0;
+}
+
+/*
+ * Action to take when transitioning to the CONNECTED state.
+ */
+static int connect_transition_action(struct cras_client *client)
+{
+	eventfd_t event_value;
+	int rc;
+
+	rc = reregister_notifications(client);
+	if (rc < 0)
+		return rc;
+
+	server_fd_move_to_state(client, CRAS_SOCKET_STATE_CONNECTED);
+	/* Notify anyone waiting on this state change that we're
+	 * connected. */
+	eventfd_read(client->server_event_fd, &event_value);
+	eventfd_write(client->server_event_fd, 1);
+	if (client->server_connection_cb)
+		client->server_connection_cb(
+				client, CRAS_CONN_STATUS_CONNECTED,
+				client->server_connection_user_arg);
+	return 0;
+}
+
+/*
+ * Action to take when in the FIRST_MESSAGE state.
+ *
+ * We are waiting for the first message from the server. When our client ID has
+ * been set, then we can move to the CONNECTED state.
+ */
+static int first_message_next_action(struct cras_client *client,
+				     int poll_revents)
+{
+	int rc;
+
+	if (client->server_fd < 0)
+		return -EINVAL;
+
+	if ((poll_revents & POLLIN) == 0)
+		return 0;
+
+	rc = handle_message_from_server(client);
+	if (rc < 0) {
+		syslog(LOG_ERR, "handle first message: %s", strerror(-rc));
+	} else if (client->id >= 0) {
+		rc = connect_transition_action(client);
+	} else {
+		syslog(LOG_ERR, "did not get ID after first message!");
+		rc = -EINVAL;
+	}
+	return rc;
+}
+
+/*
+ * Play nice and shutdown the server socket.
+ */
+static inline int shutdown_and_close_socket(int sockfd)
+{
+	int rc;
+	uint8_t buffer[CRAS_CLIENT_MAX_MSG_SIZE];
+	struct timeval tv;
+
+	tv.tv_sec = 0;
+	tv.tv_usec = SERVER_SHUTDOWN_TIMEOUT_US;
+	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+
+	rc = shutdown(sockfd, SHUT_WR);
+	if (rc < 0)
+		return rc;
+	/* Wait until the socket is closed by the peer. */
+	for (;;) {
+		rc = recv(sockfd, buffer, sizeof(buffer), 0);
+		if (rc <= 0)
+			break;
+	}
+	return close(sockfd);
+}
+
+/*
+ * Action to take when disconnecting from the server.
+ *
+ * Clean up the server socket, and the server_state pointer. Move to the next
+ * logical state.
+ */
+static void disconnect_transition_action(struct cras_client *client, bool force)
+{
+	eventfd_t event_value;
+	cras_socket_state_t old_state = client->server_fd_state;
+	struct client_stream *s;
+	int lock_rc;
+
+	/* Stop all playing streams.
+	 * TODO(muirj): Pause and resume streams. */
+	DL_FOREACH(client->streams, s) {
+		s->config->err_cb(client, s->id, -ENOTCONN,
+				  s->config->user_data);
+		client_thread_rm_stream(client, s->id);
+	}
+
+	/* Clean up the server_state pointer. */
+	lock_rc = server_state_wrlock(client);
+	if (client->server_state) {
+		munmap((void *)client->server_state,
+		       sizeof(*client->server_state));
+		client->server_state = NULL;
+	}
+	server_state_unlock(client, lock_rc);
+
+	/* Our ID is unknown now. */
+	client->id = -1;
+
+	/* Clean up the server fd. */
+	if (client->server_fd >= 0) {
+		if (!force)
+			shutdown_and_close_socket(client->server_fd);
+		else
+			close(client->server_fd);
+		client->server_fd = -1;
+	}
+
+	/* Reset the server_event_fd value to 0 (and cause subsequent threads
+	 * waiting on the connection to wait). */
+	eventfd_read(client->server_event_fd, &event_value);
+
+	switch (old_state) {
+	case CRAS_SOCKET_STATE_DISCONNECTED:
+		/* Do nothing: already disconnected. */
+		break;
+	case CRAS_SOCKET_STATE_ERROR_DELAY:
+		/* We're disconnected and there was a failure to setup
+		 * automatic reconnection, so call the server error
+		 * callback now. */
+		server_fd_move_to_state(
+			client, CRAS_SOCKET_STATE_DISCONNECTED);
+		if (client->server_connection_cb)
+			client->server_connection_cb(
+					client, CRAS_CONN_STATUS_FAILED,
+					client->server_connection_user_arg);
+		else if (client->server_err_cb)
+			client->server_err_cb(
+				client, client->server_connection_user_arg);
+		break;
+	case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
+	case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
+	case CRAS_SOCKET_STATE_FIRST_MESSAGE:
+		/* We are running this state transition while a connection is
+		 * in progress for an error case. When there is no error, we
+		 * come into this function in the DISCONNECTED state. */
+		server_fd_move_to_state(
+			client, CRAS_SOCKET_STATE_ERROR_DELAY);
+		break;
+	case CRAS_SOCKET_STATE_CONNECTED:
+		/* Disconnected from CRAS (for an error), wait for the socket
+		 * file to be (re)created. */
+		server_fd_move_to_state(
+			client, CRAS_SOCKET_STATE_WAIT_FOR_SOCKET);
+		/* Notify the caller that we aren't connected anymore. */
+		if (client->server_connection_cb)
+			client->server_connection_cb(
+					client, CRAS_CONN_STATUS_DISCONNECTED,
+					client->server_connection_user_arg);
+		break;
+	}
+}
+
+static int server_fd_dispatch(struct cras_client *client, int poll_revents)
+{
+	int rc = 0;
+	cras_socket_state_t old_state;
+
+	if ((poll_revents & POLLHUP) != 0) {
+		/* Error or disconnect: cleanup and make a state change now. */
+		disconnect_transition_action(client, true);
+	}
+	old_state = client->server_fd_state;
+
+	switch (client->server_fd_state) {
+	case CRAS_SOCKET_STATE_DISCONNECTED:
+		/* Assume that we've taken the necessary actions. */
+		return -ENOTCONN;
+	case CRAS_SOCKET_STATE_ERROR_DELAY:
+		rc = error_delay_next_action(client, poll_revents);
+		break;
+	case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
+		wait_for_socket_next_action(client);
+		break;
+	case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
+		rc = wait_for_writable_next_action(client, poll_revents);
+		break;
+	case CRAS_SOCKET_STATE_FIRST_MESSAGE:
+		rc = first_message_next_action(client, poll_revents);
+		break;
+	case CRAS_SOCKET_STATE_CONNECTED:
+		if ((poll_revents & POLLIN) != 0)
+			rc = handle_message_from_server(client);
+		break;
+	}
 
 	if (rc != 0) {
-		close(client->server_fd);
-		client->server_fd = -1;
-		syslog(LOG_ERR, "cras_client: %s: Connect server failed.",
-		       __func__);
+		/* If there is an error, then start-over. */
+		rc = server_fd_dispatch(client, POLLHUP);
+	} else if (old_state != client->server_fd_state) {
+		/* There was a state change, process the new state now. */
+		rc = server_fd_dispatch(client, 0);
 	}
+	return rc;
+}
+
+/*
+ * Start connecting to the server if we aren't already.
+ */
+static int server_connect(struct cras_client *client)
+{
+	if (client->server_fd_state != CRAS_SOCKET_STATE_DISCONNECTED)
+		return 0;
+	/* Start waiting for the server socket to exist. */
+	server_fd_move_to_state(client, CRAS_SOCKET_STATE_WAIT_FOR_SOCKET);
+	return server_fd_dispatch(client, 0);
+}
+
+/*
+ * Disconnect from the server if we haven't already.
+ */
+static void server_disconnect(struct cras_client *client)
+{
+	if (client->server_fd_state == CRAS_SOCKET_STATE_DISCONNECTED)
+		return;
+	/* Set the disconnected state first so that the disconnect
+	 * transition doesn't move the server state to ERROR_DELAY. */
+	server_fd_move_to_state(client, CRAS_SOCKET_STATE_DISCONNECTED);
+	disconnect_transition_action(client, false);
+}
+
+/*
+ * Called when something happens to the socket file.
+ */
+static void sock_file_wait_callback(void *context, cras_file_wait_event_t event,
+				    const char *filename)
+{
+	struct cras_client *client = (struct cras_client *)context;
+	switch (event) {
+	case CRAS_FILE_WAIT_EVENT_CREATED:
+		client->sock_file_exists = 1;
+		switch (client->server_fd_state) {
+		case CRAS_SOCKET_STATE_DISCONNECTED:
+		case CRAS_SOCKET_STATE_ERROR_DELAY:
+		case CRAS_SOCKET_STATE_FIRST_MESSAGE:
+		case CRAS_SOCKET_STATE_CONNECTED:
+			break;
+		case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
+		case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
+			/* The socket file exists. Tell the server state
+			 * machine. */
+			server_fd_dispatch(client, 0);
+			break;
+		}
+		break;
+	case CRAS_FILE_WAIT_EVENT_DELETED:
+		client->sock_file_exists = 0;
+		switch (client->server_fd_state) {
+		case CRAS_SOCKET_STATE_DISCONNECTED:
+			break;
+		case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
+		case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
+		case CRAS_SOCKET_STATE_ERROR_DELAY:
+		case CRAS_SOCKET_STATE_FIRST_MESSAGE:
+		case CRAS_SOCKET_STATE_CONNECTED:
+			/* Restart the connection process. */
+			server_disconnect(client);
+			server_connect(client);
+			break;
+		}
+		break;
+	case CRAS_FILE_WAIT_EVENT_NONE:
+		break;
+	}
+}
+
+/*
+ * Service the sock_file_wait's fd.
+ *
+ * If the socket file is deleted, then cause a disconnect from the server.
+ * Otherwise, start a reconnect depending on the server_fd_state.
+ */
+static int sock_file_wait_dispatch(struct cras_client *client,
+				   int poll_revents)
+{
+	int rc;
+
+	if ((poll_revents & POLLIN) == 0)
+		return 0;
+
+	rc = cras_file_wait_dispatch(client->sock_file_wait);
+	if (rc == -EAGAIN || rc == -EWOULDBLOCK)
+		rc = 0;
+	else if (rc != 0)
+		syslog(LOG_ERR, "cras_file_wait_dispatch: %s", strerror(-rc));
+	return rc;
+}
+
+/*
+ * Waits until we have heard back from the server so that we know we are
+ * connected.
+ *
+ * The connected success/failure message is always the first message the server
+ * sends. Return non zero if client is connected to the server. A return code
+ * of zero means that the client is not connected to the server.
+ */
+static int check_server_connected_wait(struct cras_client *client,
+				       struct timespec *timeout)
+{
+	int rc = 0;
+	struct pollfd poll_fd;
+
+	poll_fd.fd = client->server_event_fd;
+	poll_fd.events = POLLIN;
+	poll_fd.revents = 0;
+
+	/* The server_event_fd is only read and written by the functions
+	 * that connect to the server. When a connection is established the
+	 * eventfd has a value of 1 and cras_poll will return immediately
+	 * with 1. When there is no connection to the server, then this
+	 * function waits until the timeout has expired or a non-zero value
+	 * is written to the server_event_fd. */
+	while (rc == 0)
+		rc = cras_poll(&poll_fd, 1, timeout, NULL);
+	return rc > 0;
+}
+
+/* Returns non-zero if the thread is running (not stopped). */
+static inline int thread_is_running(struct thread_state *thread)
+{
+	return thread->state != CRAS_THREAD_STOP;
+}
+
+/*
+ * Opens the server socket and connects to it.
+ * Args:
+ *    client - Client pointer created with cras_client_create().
+ *    timeout - Connection timeout.
+ * Returns:
+ *    0 for success, negative error code on failure.
+ */
+static int connect_to_server(struct cras_client *client,
+			     struct timespec *timeout,
+			     bool use_command_thread)
+{
+	int rc;
+	struct pollfd poll_fd[2];
+	struct timespec connected_timeout;
+
+	if (!client)
+		return -EINVAL;
+
+	if (thread_is_running(&client->thread) && use_command_thread) {
+		rc = cras_client_connect_async(client);
+		if (rc == 0) {
+			rc = check_server_connected_wait(client, timeout);
+			return rc ? 0 : -ESHUTDOWN;
+		}
+	}
+
+	connected_timeout.tv_sec = 0;
+	connected_timeout.tv_nsec = 0;
+	if (check_server_connected_wait(client, &connected_timeout))
+		return 0;
+
+	poll_fd[0].fd = cras_file_wait_get_fd(client->sock_file_wait);
+	poll_fd[0].events = POLLIN;
+
+	rc = server_connect(client);
+	while(rc == 0) {
+		// Wait until we've connected or until there is a timeout.
+		// Meanwhile handle incoming actions on our fds.
+
+		server_fill_pollfd(client, &(poll_fd[1]));
+		rc = cras_poll(poll_fd, 2, timeout, NULL);
+		if (rc <= 0)
+			continue;
+
+		if (poll_fd[0].revents) {
+			rc = sock_file_wait_dispatch(
+					client, poll_fd[0].revents);
+			continue;
+		}
+
+		if (poll_fd[1].revents) {
+			rc = server_fd_dispatch(client, poll_fd[1].revents);
+			if (rc == 0 &&
+			    client->server_fd_state ==
+					CRAS_SOCKET_STATE_CONNECTED)
+				break;
+		}
+	}
+
+	if (rc != 0)
+		syslog(LOG_ERR, "cras_client: Connect server failed: %s",
+		       strerror(-rc));
 
 	return rc;
 }
 
-/* Tries to connect to the server.  Waits for the initial message from the
- * server.  This will happen near instantaneously if the server is already
- * running.*/
-static int connect_to_server_wait(struct cras_client *client)
+static int connect_to_server_wait_retry(struct cras_client *client,
+					int timeout_ms,
+					bool use_command_thread)
 {
-	unsigned int retries = 4;
-	const unsigned int retry_delay_ms = 200;
+	struct timespec timeout_value;
+	struct timespec *timeout;
 
-	assert(client);
-
-	/* Ignore sig pipe as it will be handled when we write to the socket. */
-	signal(SIGPIPE, SIG_IGN);
-
-	while (--retries) {
-		/* If connected, wait for the first message from the server
-		 * indicating it's ready. */
-		if (connect_to_server(client) == 0 &&
-		    check_server_connected_wait(client))
-				return 0;
-
-		/* If we didn't succeed, wait and try again. */
-		usleep(retry_delay_ms * 1000);
+	if (timeout_ms < 0) {
+		timeout = NULL;
+	} else {
+		timeout = &timeout_value;
+		ms_to_timespec(timeout_ms, timeout);
 	}
 
-	return -EIO;
+	/* If connected, wait for the first message from the server
+	 * indicating it's ready. */
+	return connect_to_server(client, timeout, use_command_thread);
+}
+
+/*
+ * Tries to connect to the server.  Waits for the initial message from the
+ * server.  This will happen near instantaneously if the server is already
+ * running.
+ */
+static int connect_to_server_wait(struct cras_client *client,
+				  bool use_command_thread)
+{
+	return connect_to_server_wait_retry(
+			client, SERVER_CONNECT_TIMEOUT_MS, use_command_thread);
 }
 
 /*
@@ -359,23 +976,27 @@ static int read_with_wake_fd(int wake_fd, int read_fd, uint8_t *buf, size_t len)
 {
 	struct pollfd pollfds[2];
 	int nread = 0;
+	int nfds = 1;
 	int rc;
 	char tmp;
 
-	pollfds[0].fd = read_fd;
+	pollfds[0].fd = wake_fd;
 	pollfds[0].events = POLLIN;
-	pollfds[1].fd = wake_fd;
-	pollfds[1].events = POLLIN;
+	if (read_fd >= 0) {
+		nfds++;
+		pollfds[1].fd = read_fd;
+		pollfds[1].events = POLLIN;
+	}
 
-	rc = poll(pollfds, 2, -1);
+	rc = poll(pollfds, nfds, -1);
 	if (rc < 0)
 		return rc;
-	if (pollfds[0].revents & POLLIN) {
+	if (read_fd >= 0 && pollfds[1].revents & POLLIN) {
 		nread = read(read_fd, buf, len);
 		if (nread != (int)len)
 			return -EIO;
 	}
-	if (pollfds[1].revents & POLLIN) {
+	if (pollfds[0].revents & POLLIN) {
 		rc = read(wake_fd, &tmp, 1);
 		if (rc < 0)
 			return rc;
@@ -383,20 +1004,34 @@ static int read_with_wake_fd(int wake_fd, int read_fd, uint8_t *buf, size_t len)
 
 	return nread;
 }
-
-/* Check if doing format conversion and configure a capture buffer appropriately
- * before passing to the client. */
+/* Check the availability and configures a capture buffer.
+ * Args:
+ *     stream - The input stream to configure buffer for.
+ *     captured_frames - To be filled with the pointer to the beginning of
+ *         captured buffer.
+ *     num_frames - Number of captured frames.
+ * Returns:
+ *     Number of frames available in captured_frames.
+ */
 static unsigned int config_capture_buf(struct client_stream *stream,
 				       uint8_t **captured_frames,
 				       unsigned int num_frames)
 {
-	*captured_frames = cras_shm_get_curr_read_buffer(&stream->capture_shm);
+	/* Always return the beginning of the read buffer because Chrome expects
+	 * so. */
+	*captured_frames = cras_shm_get_read_buffer_base(&stream->capture_shm);
 
 	/* Don't ask for more frames than the client desires. */
 	if (stream->flags & BULK_AUDIO_OK)
 		num_frames = MIN(num_frames, stream->config->buffer_frames);
 	else
 		num_frames = MIN(num_frames, stream->config->cb_threshold);
+
+	/* If shm readable frames is less than client requests, that means
+	 * overrun has happened in server side. Don't send partial corrupted
+	 * buffer to client. */
+	if (cras_shm_get_curr_read_frames(&stream->capture_shm) < num_frames)
+		return 0;
 
 	return num_frames;
 }
@@ -432,6 +1067,9 @@ static int handle_capture_data_ready(struct client_stream *stream,
 	}
 
 	num_frames = config_capture_buf(stream, &captured_frames, num_frames);
+	if (num_frames == 0)
+		return 0;
+
 	cras_timespec_to_timespec(&ts, &stream->capture_shm.area->ts);
 
 	if (config->unified_cb)
@@ -542,6 +1180,20 @@ reply_written:
 	return rc;
 }
 
+static void audio_thread_set_priority(struct client_stream *stream)
+{
+	/* Use provided callback to set priority if available. */
+	if (stream->client->thread_priority_cb) {
+		stream->client->thread_priority_cb(stream->client);
+		return;
+	}
+
+	/* Try to get RT scheduling, if that fails try to set the nice value. */
+	if (cras_set_rt_scheduling(CRAS_CLIENT_RT_THREAD_PRIORITY) ||
+	    cras_set_thread_priority(CRAS_CLIENT_RT_THREAD_PRIORITY))
+		cras_set_nice_level(CRAS_CLIENT_NICENESS_LEVEL);
+}
+
 /* Listens to the audio socket for messages from the server indicating that
  * the stream needs to be serviced.  One of these runs per stream. */
 static void *audio_thread(void *arg)
@@ -549,19 +1201,26 @@ static void *audio_thread(void *arg)
 	struct client_stream *stream = (struct client_stream *)arg;
 	int thread_terminated = 0;
 	struct audio_message aud_msg;
+	int aud_fd;
 	int num_read;
 
 	if (arg == NULL)
 		return (void *)-EIO;
 
-	/* Try to get RT scheduling, if that fails try to set the nice value. */
-	if (cras_set_rt_scheduling(CRAS_CLIENT_RT_THREAD_PRIORITY) ||
-	    cras_set_thread_priority(CRAS_CLIENT_RT_THREAD_PRIORITY))
-		cras_set_nice_level(CRAS_CLIENT_NICENESS_LEVEL);
+	audio_thread_set_priority(stream);
 
-	while (stream->thread.running && !thread_terminated) {
+	/* Notify the control thread that we've started. */
+	pthread_mutex_lock(&stream->client->stream_start_lock);
+	pthread_cond_broadcast(&stream->client->stream_start_cond);
+	pthread_mutex_unlock(&stream->client->stream_start_lock);
+
+	while (thread_is_running(&stream->thread) && !thread_terminated) {
+		/* While we are warming up, aud_fd may not be valid and some
+		 * shared memory resources may not yet be available. */
+		aud_fd = (stream->thread.state == CRAS_THREAD_WARMUP) ?
+			 -1 : stream->aud_fd;
 		num_read = read_with_wake_fd(stream->wake_fds[0],
-					     stream->aud_fd,
+					     aud_fd,
 					     (uint8_t *)&aud_msg,
 					     sizeof(aud_msg));
 		if (num_read < 0)
@@ -599,6 +1258,77 @@ static int wake_aud_thread(struct client_stream *stream)
 	return 0;
 }
 
+/* Stop the audio thread for the given stream.
+ * Args:
+ *    stream - Stream for which to stop the audio thread.
+ *    join - When non-zero, attempt to join the audio thread (wait for it to
+ *           complete).
+ */
+static void stop_aud_thread(struct client_stream *stream, int join)
+{
+	if (thread_is_running(&stream->thread)) {
+		stream->thread.state = CRAS_THREAD_STOP;
+		wake_aud_thread(stream);
+		if (join)
+			pthread_join(stream->thread.tid, NULL);
+	}
+
+	if (stream->wake_fds[0] >= 0) {
+		close(stream->wake_fds[0]);
+		close(stream->wake_fds[1]);
+		stream->wake_fds[0] = -1;
+	}
+}
+
+/* Start the audio thread for this stream.
+ * Returns when the thread has started and is waiting.
+ * Args:
+ *    stream - The stream that needs an audio thread.
+ * Returns:
+ *    0 for success, or a negative error code.
+ */
+static int start_aud_thread(struct client_stream *stream)
+{
+	int rc;
+	struct timespec future;
+
+	rc = pipe(stream->wake_fds);
+	if (rc < 0) {
+		rc = -errno;
+		syslog(LOG_ERR, "cras_client: pipe: %s", strerror(-rc));
+		return rc;
+	}
+
+	stream->thread.state = CRAS_THREAD_WARMUP;
+
+	pthread_mutex_lock(&stream->client->stream_start_lock);
+	rc = pthread_create(&stream->thread.tid, NULL, audio_thread, stream);
+	if (rc) {
+		pthread_mutex_unlock(&stream->client->stream_start_lock);
+		syslog(LOG_ERR,
+		       "cras_client: Couldn't create audio stream: %s",
+		       strerror(rc));
+		stream->thread.state = CRAS_THREAD_STOP;
+		stop_aud_thread(stream, 0);
+		return -rc;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &future);
+	future.tv_sec += 2; /* Wait up to two seconds. */
+	rc = pthread_cond_timedwait(&stream->client->stream_start_cond,
+				    &stream->client->stream_start_lock, &future);
+	pthread_mutex_unlock(&stream->client->stream_start_lock);
+	if (rc != 0) {
+		/* Something is very wrong: try to cancel the thread and don't
+		 * wait for it. */
+		syslog(LOG_ERR, "cras_client: Client thread not responding: %s",
+		       strerror(rc));
+		stop_aud_thread(stream, 0);
+		return -rc;
+	}
+	return 0;
+}
+
 /*
  * Client thread.
  */
@@ -630,20 +1360,14 @@ int end_server_state_read(const struct cras_server_state *state, unsigned count)
 }
 
 /* Gets the shared memory region used to share audio data with the server. */
-static int config_shm(struct cras_audio_shm *shm, int key, size_t size)
+static int config_shm(struct cras_audio_shm *shm, int shm_fd, size_t size)
 {
-	int shmid;
-
-	shmid = shmget(key, size, 0600);
-	if (shmid < 0) {
-		syslog(LOG_ERR,
-		       "cras_client: shmget failed to get shm for stream.");
-		return shmid;
-	}
-	shm->area = (struct cras_audio_shm_area *)shmat(shmid, NULL, 0);
+	shm->area = (struct cras_audio_shm_area *)mmap(
+			NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			shm_fd, 0);
 	if (shm->area == (struct cras_audio_shm_area *)-1) {
 		syslog(LOG_ERR,
-		       "cras_client: shmat failed to attach shm for stream.");
+		       "cras_client: mmap failed to map shm for stream.");
 		return errno;
 	}
 	/* Copy server shm config locally. */
@@ -655,10 +1379,12 @@ static int config_shm(struct cras_audio_shm *shm, int key, size_t size)
 /* Release shm areas if references to them are held. */
 static void free_shm(struct client_stream *stream)
 {
-	if (stream->capture_shm.area)
-		shmdt(stream->capture_shm.area);
-	if (stream->play_shm.area)
-		shmdt(stream->play_shm.area);
+	if (stream->capture_shm.area) {
+		munmap(stream->capture_shm.area, stream->capture_shm_size);
+	}
+	if (stream->play_shm.area) {
+		munmap(stream->play_shm.area, stream->play_shm_size);
+	}
 	stream->capture_shm.area = NULL;
 	stream->play_shm.area = NULL;
 }
@@ -667,65 +1393,58 @@ static void free_shm(struct client_stream *stream)
  * format converter, configure the shared memory region, and start the audio
  * thread that will handle requests from the server. */
 static int stream_connected(struct client_stream *stream,
-			    const struct cras_client_stream_connected *msg)
+			    const struct cras_client_stream_connected *msg,
+			    const int stream_fds[2], const unsigned int num_fds)
 {
 	int rc;
 	struct cras_audio_format mfmt;
 
-	if (msg->err) {
+	if (msg->err || num_fds != 2) {
 		syslog(LOG_ERR, "cras_client: Error Setting up stream %d\n",
 		       msg->err);
-		return msg->err;
+		rc = msg->err;
+		goto err_ret;
 	}
 
 	unpack_cras_audio_format(&mfmt, &msg->format);
 
 	if (cras_stream_has_input(stream->direction)) {
 		rc = config_shm(&stream->capture_shm,
-				msg->input_shm_key,
+				stream_fds[0],
 				msg->shm_max_size);
 		if (rc < 0) {
 			syslog(LOG_ERR,
 			       "cras_client: Error configuring capture shm");
 			goto err_ret;
 		}
+		stream->capture_shm_size = msg->shm_max_size;
 	}
 
 	if (cras_stream_uses_output_hw(stream->direction)) {
 		rc = config_shm(&stream->play_shm,
-				msg->output_shm_key,
+				stream_fds[1],
 				msg->shm_max_size);
 		if (rc < 0) {
 			syslog(LOG_ERR,
 			       "cras_client: Error configuring playback shm");
 			goto err_ret;
 		}
+		stream->play_shm_size = msg->shm_max_size;
 
 		cras_shm_set_volume_scaler(&stream->play_shm,
 					   stream->volume_scaler);
 	}
 
-	rc = pipe(stream->wake_fds);
-	if (rc < 0) {
-		goto err_ret;
-	}
+	stream->thread.state = CRAS_THREAD_RUNNING;
+	wake_aud_thread(stream);
 
-	stream->thread.running = 1;
-
-	rc = pthread_create(&stream->thread.tid, NULL, audio_thread, stream);
-	if (rc) {
-		syslog(LOG_ERR,
-		       "cras_client: Couldn't create audio stream.");
-		stream->thread.running = 0;
-		goto err_ret;
-	}
-
+	close(stream_fds[0]);
+	close(stream_fds[1]);
 	return 0;
 err_ret:
-	if (stream->wake_fds[0] >= 0) {
-		close(stream->wake_fds[0]);
-		close(stream->wake_fds[1]);
-	}
+	stop_aud_thread(stream, 1);
+	close(stream_fds[0]);
+	close(stream_fds[1]);
 	free_shm(stream);
 	return rc;
 }
@@ -741,7 +1460,8 @@ static int send_connect_message(struct cras_client *client,
 	/* Create a socket pair for the server to notify of audio events. */
 	rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sock);
 	if (rc != 0) {
-		syslog(LOG_ERR, "cras_client: socketpair fails.");
+		rc = -errno;
+		syslog(LOG_ERR, "cras_client: socketpair: %s", strerror(-rc));
 		goto fail;
 	}
 
@@ -754,8 +1474,8 @@ static int send_connect_message(struct cras_client *client,
 				  stream->flags,
 				  stream->config->format,
 				  dev_idx);
-	rc = cras_send_with_fd(client->server_fd, &serv_msg, sizeof(serv_msg),
-			       sock[1]);
+	rc = cras_send_with_fds(client->server_fd, &serv_msg, sizeof(serv_msg),
+			       &sock[1], 1);
 	if (rc != sizeof(serv_msg)) {
 		rc = EIO;
 		syslog(LOG_ERR,
@@ -790,15 +1510,15 @@ static int client_thread_add_stream(struct cras_client *client,
 	/* Find the hotword device index. */
 	if ((stream->flags & HOTWORD_STREAM) == HOTWORD_STREAM &&
 			dev_idx == NO_DEVICE) {
-		int aokr_idx;
-		aokr_idx = cras_client_get_first_dev_type_idx(client,
-				CRAS_NODE_TYPE_AOKR, CRAS_STREAM_INPUT);
-		if (aokr_idx < 0) {
+		int hotword_idx;
+		hotword_idx = cras_client_get_first_dev_type_idx(client,
+				CRAS_NODE_TYPE_HOTWORD, CRAS_STREAM_INPUT);
+		if (hotword_idx < 0) {
 			syslog(LOG_ERR,
 			       "cras_client: add_stream: Finding hotword dev");
-			return aokr_idx;
+			return hotword_idx;
 		}
-		dev_idx = aokr_idx;
+		dev_idx = hotword_idx;
 	}
 
 	/* Find an available stream id. */
@@ -812,10 +1532,18 @@ static int client_thread_add_stream(struct cras_client *client,
 	*stream_id_out = new_id;
 	stream->client = client;
 
-	/* send a message to the server asking that the stream be started. */
-	rc = send_connect_message(client, stream, dev_idx);
+	/* Start the audio thread. */
+	rc = start_aud_thread(stream);
 	if (rc != 0)
 		return rc;
+
+	/* Start the thread associated with this stream. */
+	/* send a message to the server asking that the stream be started. */
+	rc = send_connect_message(client, stream, dev_idx);
+	if (rc != 0) {
+		stop_aud_thread(stream, 1);
+		return rc;
+	}
 
 	/* Add the stream to the linked list */
 	DL_APPEND(client->streams, stream);
@@ -837,19 +1565,16 @@ static int client_thread_rm_stream(struct cras_client *client,
 		return 0;
 
 	/* Tell server to remove. */
-	cras_fill_disconnect_stream_message(&msg, stream_id);
-	rc = write(client->server_fd, &msg, sizeof(msg));
-	if (rc < 0)
-		syslog(LOG_ERR,
-		       "cras_client: error removing stream from server\n");
-
-	/* And shut down locally. */
-	if (stream->thread.running) {
-		stream->thread.running = 0;
-		wake_aud_thread(stream);
-		pthread_join(stream->thread.tid, NULL);
+	if (client->server_fd_state == CRAS_SOCKET_STATE_CONNECTED) {
+		cras_fill_disconnect_stream_message(&msg, stream_id);
+		rc = write(client->server_fd, &msg, sizeof(msg));
+		if (rc < 0)
+			syslog(LOG_ERR,
+			       "cras_client: error removing stream from server\n");
 	}
 
+	/* And shut down locally. */
+	stop_aud_thread(stream, 1);
 
 	free_shm(stream);
 
@@ -857,10 +1582,6 @@ static int client_thread_rm_stream(struct cras_client *client,
 	if (stream->aud_fd >= 0)
 		close(stream->aud_fd);
 
-	if (stream->wake_fds[0] >= 0) {
-		close(stream->wake_fds[0]);
-		close(stream->wake_fds[1]);
-	}
 	free(stream->config);
 	free(stream);
 
@@ -886,38 +1607,52 @@ static int client_thread_set_stream_volume(struct cras_client *client,
 }
 
 /* Attach to the shm region containing the server state. */
-static int client_attach_shm(struct cras_client *client, key_t shm_key)
+static int client_attach_shm(struct cras_client *client, int shm_fd)
 {
-	int shmid;
+	int lock_rc;
+	int rc;
 
-	/* Should only happen once per client lifetime. */
-	if (client->server_state)
-		return -EBUSY;
-
-	shmid = shmget(shm_key, sizeof(*(client->server_state)), 0400);
-	if (shmid < 0) {
-		syslog(LOG_ERR,
-		       "cras_client: shmget failed to get shm for client.");
-		return shmid;
+	lock_rc = server_state_wrlock(client);
+	if (client->server_state) {
+		rc = -EBUSY;
+		goto error;
 	}
-	client->server_state = (struct cras_server_state *)
-			shmat(shmid, NULL, SHM_RDONLY);
-	if (client->server_state == (void *)-1) {
-		client->server_state = NULL;
+
+	client->server_state = (struct cras_server_state *)mmap(
+			NULL, sizeof(*client->server_state),
+			PROT_READ, MAP_SHARED, shm_fd, 0);
+	rc = -errno;
+	close(shm_fd);
+	if (client->server_state == (struct cras_server_state *)-1) {
 		syslog(LOG_ERR,
-		       "cras_client: shmat failed to attach shm for client.");
-		return errno;
+		       "cras_client: mmap failed to map shm for client: %s",
+		       strerror(-rc));
+		goto error;
 	}
 
 	if (client->server_state->state_version != CRAS_SERVER_STATE_VERSION) {
-		shmdt(client->server_state);
+		munmap((void *)client->server_state,
+		       sizeof(*client->server_state));
 		client->server_state = NULL;
-		syslog(LOG_ERR,
-		       "cras_client: Unknown server_state version.");
-		return -EINVAL;
+		rc = -EINVAL;
+		syslog(LOG_ERR, "cras_client: Unknown server_state version.");
+	} else {
+		rc = 0;
 	}
 
-	return 0;
+error:
+	server_state_unlock(client, lock_rc);
+	return rc;
+}
+
+static void cras_client_get_hotword_models_ready(
+		struct cras_client *client,
+		const char *hotword_models)
+{
+	if (!client->get_hotword_models_cb)
+		return;
+	client->get_hotword_models_cb(client, hotword_models);
+	client->get_hotword_models_cb = NULL;
 }
 
 /* Handles messages from the cras server. */
@@ -927,19 +1662,22 @@ static int handle_message_from_server(struct cras_client *client)
 	struct cras_client_message *msg;
 	int rc = 0;
 	int nread;
+	int server_fds[2];
+	unsigned int num_fds = 2;
 
 	msg = (struct cras_client_message *)buf;
-	nread = recv(client->server_fd, buf, sizeof(buf), 0);
-	if (nread < (int)sizeof(msg->length))
-		goto read_error;
-	if ((int)msg->length != nread)
-		goto read_error;
+	nread = cras_recv_with_fds(client->server_fd, buf, sizeof(buf),
+				   server_fds, &num_fds);
+	if (nread < (int)sizeof(msg->length) || (int)msg->length != nread)
+		return -EIO;
 
 	switch (msg->id) {
 	case CRAS_CLIENT_CONNECTED: {
 		struct cras_client_connected *cmsg =
 			(struct cras_client_connected *)msg;
-		rc = client_attach_shm(client, cmsg->shm_key);
+		if (num_fds != 1)
+			return -EINVAL;
+		rc = client_attach_shm(client, server_fds[0]);
 		if (rc)
 			return rc;
 		client->id = cmsg->client_id;
@@ -953,7 +1691,7 @@ static int handle_message_from_server(struct cras_client *client)
 			stream_from_id(client, cmsg->stream_id);
 		if (stream == NULL)
 			break;
-		rc = stream_connected(stream, cmsg);
+		rc = stream_connected(stream, cmsg, server_fds, num_fds);
 		if (rc < 0)
 			stream->config->err_cb(stream->client,
 					       stream->id,
@@ -965,25 +1703,126 @@ static int handle_message_from_server(struct cras_client *client)
 		if (client->debug_info_callback)
 			client->debug_info_callback(client);
 		break;
+	case CRAS_CLIENT_GET_HOTWORD_MODELS_READY: {
+		struct cras_client_get_hotword_models_ready *cmsg =
+			(struct cras_client_get_hotword_models_ready *)msg;
+		cras_client_get_hotword_models_ready(client,
+				(const char *)cmsg->hotword_models);
+		break;
+	}
+	case CRAS_CLIENT_OUTPUT_VOLUME_CHANGED: {
+		struct cras_client_volume_changed *cmsg =
+			(struct cras_client_volume_changed *)msg;
+		if (client->observer_ops.output_volume_changed)
+			client->observer_ops.output_volume_changed(
+					client->observer_context,
+					cmsg->volume);
+		break;
+	}
+	case CRAS_CLIENT_OUTPUT_MUTE_CHANGED: {
+		struct cras_client_mute_changed *cmsg =
+			(struct cras_client_mute_changed *)msg;
+		if (client->observer_ops.output_mute_changed)
+			client->observer_ops.output_mute_changed(
+					client->observer_context,
+					cmsg->muted,
+					cmsg->user_muted,
+					cmsg->mute_locked);
+		break;
+	}
+	case CRAS_CLIENT_CAPTURE_GAIN_CHANGED: {
+		struct cras_client_volume_changed *cmsg =
+			(struct cras_client_volume_changed *)msg;
+		if (client->observer_ops.capture_gain_changed)
+			client->observer_ops.capture_gain_changed(
+					client->observer_context,
+					cmsg->volume);
+		break;
+	}
+	case CRAS_CLIENT_CAPTURE_MUTE_CHANGED: {
+		struct cras_client_mute_changed *cmsg =
+			(struct cras_client_mute_changed *)msg;
+		if (client->observer_ops.capture_mute_changed)
+			client->observer_ops.capture_mute_changed(
+					client->observer_context,
+					cmsg->muted,
+					cmsg->mute_locked);
+		break;
+	}
+	case CRAS_CLIENT_NODES_CHANGED: {
+		if (client->observer_ops.nodes_changed)
+			client->observer_ops.nodes_changed(
+					client->observer_context);
+		break;
+	}
+	case CRAS_CLIENT_ACTIVE_NODE_CHANGED: {
+		struct cras_client_active_node_changed *cmsg =
+			(struct cras_client_active_node_changed *)msg;
+		enum CRAS_STREAM_DIRECTION direction =
+			(enum CRAS_STREAM_DIRECTION)cmsg->direction;
+		if (client->observer_ops.active_node_changed)
+			client->observer_ops.active_node_changed(
+					client->observer_context,
+					direction, cmsg->node_id);
+		break;
+	}
+	case CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED: {
+		struct cras_client_node_value_changed *cmsg =
+			(struct cras_client_node_value_changed *)msg;
+		if (client->observer_ops.output_node_volume_changed)
+			client->observer_ops.output_node_volume_changed(
+					client->observer_context,
+					cmsg->node_id,
+					cmsg->value);
+		break;
+	}
+	case CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED: {
+		struct cras_client_node_value_changed *cmsg =
+			(struct cras_client_node_value_changed *)msg;
+		if (client->observer_ops.node_left_right_swapped_changed)
+			client->observer_ops.node_left_right_swapped_changed(
+					client->observer_context,
+					cmsg->node_id,
+					cmsg->value);
+		break;
+	}
+	case CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED: {
+		struct cras_client_node_value_changed *cmsg =
+			(struct cras_client_node_value_changed *)msg;
+		if (client->observer_ops.input_node_gain_changed)
+			client->observer_ops.input_node_gain_changed(
+					client->observer_context,
+					cmsg->node_id,
+					cmsg->value);
+		break;
+	}
+	case CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED: {
+		struct cras_client_num_active_streams_changed *cmsg =
+		    (struct cras_client_num_active_streams_changed *)msg;
+		enum CRAS_STREAM_DIRECTION direction =
+			(enum CRAS_STREAM_DIRECTION)cmsg->direction;
+		if (client->observer_ops.num_active_streams_changed)
+			client->observer_ops.num_active_streams_changed(
+					client->observer_context,
+					direction, cmsg->num_active_streams);
+		break;
+	}
 	default:
 		break;
 	}
 
 	return 0;
-read_error:
-	rc = connect_to_server_wait(client);
-	if (rc < 0) {
-		client->thread.running = 0;
-		return -EIO;
-	}
-	return 0;
 }
 
 /* Handles messages from streams to this client. */
-static int handle_stream_message(struct cras_client *client)
+static int handle_stream_message(struct cras_client *client,
+				 int poll_revents)
 {
 	struct stream_msg msg;
 	int rc;
+
+	if ((poll_revents & POLLIN) == 0)
+		return 0;
 
 	rc = read(client->stream_fds[0], &msg, sizeof(msg));
 	if (rc < 0)
@@ -996,11 +1835,15 @@ static int handle_stream_message(struct cras_client *client)
 }
 
 /* Handles messages from users to this client. */
-static int handle_command_message(struct cras_client *client)
+static int handle_command_message(struct cras_client *client,
+				  int poll_revents)
 {
 	uint8_t buf[MAX_CMD_MSG_LEN];
 	struct command_msg *msg = (struct command_msg *)buf;
 	int rc, to_read;
+
+	if ((poll_revents & POLLIN) == 0)
+		return 0;
 
 	rc = read(client->command_fds[0], buf, sizeof(msg->len));
 	if (rc != sizeof(msg->len) || msg->len > MAX_CMD_MSG_LEN) {
@@ -1014,13 +1857,6 @@ static int handle_command_message(struct cras_client *client)
 		goto cmd_msg_complete;
 	}
 
-	if (!check_server_connected_wait(client))
-		if (connect_to_server_wait(client) < 0) {
-			syslog(LOG_ERR, "cras_client: Lost server connection.");
-			rc = -EIO;
-			goto cmd_msg_complete;
-		}
-
 	switch (msg->msg_id) {
 	case CLIENT_STOP: {
 		struct client_stream *s;
@@ -1030,7 +1866,7 @@ static int handle_command_message(struct cras_client *client)
 			client_thread_rm_stream(client, s->id);
 
 		/* And stop this client */
-		client->thread.running = 0;
+		client->thread.state = CRAS_THREAD_STOP;
 		rc = 0;
 		break;
 	}
@@ -1055,7 +1891,10 @@ static int handle_command_message(struct cras_client *client)
 		break;
 	}
 	case CLIENT_SERVER_CONNECT:
-		rc = connect_to_server_wait(client);
+		rc = connect_to_server_wait(client, false);
+		break;
+	case CLIENT_SERVER_CONNECT_ASYNC:
+		rc = server_connect(client);
 		break;
 	default:
 		assert(0);
@@ -1076,43 +1915,58 @@ cmd_msg_complete:
 static void *client_thread(void *arg)
 {
 	struct cras_client *client = (struct cras_client *)arg;
+	struct pollfd pollfds[4];
+	int (*cbs[4])(struct cras_client *client, int poll_revents);
+	unsigned int num_pollfds, i;
+	int rc;
 
 	if (arg == NULL)
 		return (void *)-EINVAL;
 
-	while (client->thread.running) {
-		struct pollfd pollfds[3];
-		int (*cbs[3])(struct cras_client *client);
-		unsigned int num_pollfds, i;
-		int rc;
-
+	while (thread_is_running(&client->thread)) {
 		num_pollfds = 0;
-		if (client->server_fd >= 0) {
-			cbs[num_pollfds] = handle_message_from_server;
-			pollfds[num_pollfds].fd = client->server_fd;
+
+		rc = cras_file_wait_get_fd(client->sock_file_wait);
+		if (rc >= 0) {
+			cbs[num_pollfds] = sock_file_wait_dispatch;
+			pollfds[num_pollfds].fd = rc;
 			pollfds[num_pollfds].events = POLLIN;
+			pollfds[num_pollfds].revents = 0;
+			num_pollfds++;
+		}
+		else
+			syslog(LOG_ERR, "file wait fd: %d", rc);
+		if (client->server_fd >= 0) {
+			cbs[num_pollfds] = server_fd_dispatch;
+			server_fill_pollfd(client, &(pollfds[num_pollfds]));
 			num_pollfds++;
 		}
 		if (client->command_fds[0] >= 0) {
 			cbs[num_pollfds] = handle_command_message;
 			pollfds[num_pollfds].fd = client->command_fds[0];
 			pollfds[num_pollfds].events = POLLIN;
+			pollfds[num_pollfds].revents = 0;
 			num_pollfds++;
 		}
 		if (client->stream_fds[0] >= 0) {
 			cbs[num_pollfds] = handle_stream_message;
 			pollfds[num_pollfds].fd = client->stream_fds[0];
 			pollfds[num_pollfds].events = POLLIN;
+			pollfds[num_pollfds].revents = 0;
 			num_pollfds++;
 		}
 
 		rc = poll(pollfds, num_pollfds, -1);
-		if (rc < 0)
+		if (rc <= 0)
 			continue;
 
 		for (i = 0; i < num_pollfds; i++) {
-			if (pollfds[i].revents & POLLIN)
-				cbs[i](client);
+			/* Only do one at a time, since some messages may
+			 * result in change to other fds. */
+			if (pollfds[i].revents) {
+				cbs[i](client, pollfds[i].revents);
+				break;
+			}
 		}
 	}
 
@@ -1129,7 +1983,7 @@ static int send_command_message(struct cras_client *client,
 				struct command_msg *msg)
 {
 	int rc, cmd_res;
-	if (client == NULL || !client->thread.running)
+	if (client == NULL || !thread_is_running(&client->thread))
 		return -EINVAL;
 
 	rc = write(client->command_fds[1], msg, msg->len);
@@ -1176,23 +2030,25 @@ static int send_stream_volume_command_msg(struct cras_client *client,
 static int write_message_to_server(struct cras_client *client,
 				   const struct cras_server_message *msg)
 {
-	if (write(client->server_fd, msg, msg->length) !=
-			(ssize_t)msg->length) {
-		int rc = 0;
+	ssize_t write_rc = -EPIPE;
 
-		/* Write to server failed, try to re-connect. */
-		if (client->thread.running)
-			rc = send_simple_cmd_msg(client, 0,
-						 CLIENT_SERVER_CONNECT);
-		else
-			rc = connect_to_server_wait(client);
-		if (rc < 0)
-			return rc;
-		if (write(client->server_fd, msg, msg->length) !=
-				(ssize_t)msg->length)
-			return -EINVAL;
+	if (client->server_fd_state == CRAS_SOCKET_STATE_CONNECTED ||
+	    client->server_fd_state == CRAS_SOCKET_STATE_FIRST_MESSAGE) {
+		write_rc = write(client->server_fd, msg, msg->length);
+		if (write_rc < 0)
+			write_rc = -errno;
 	}
-	return 0;
+
+	if (write_rc != (ssize_t)msg->length &&
+	    client->server_fd_state != CRAS_SOCKET_STATE_FIRST_MESSAGE)
+		return -EPIPE;
+
+	if (write_rc < 0)
+		return write_rc;
+	else if (write_rc != (ssize_t)msg->length)
+		return -EIO;
+	else
+		return 0;
 }
 
 /*
@@ -1201,13 +2057,76 @@ static int write_message_to_server(struct cras_client *client,
 
 int cras_client_create(struct cras_client **client)
 {
+	const char *sock_dir;
+	size_t sock_file_size;
 	int rc;
+	struct client_int *client_int;
+	pthread_condattr_t cond_attr;
 
-	*client = (struct cras_client *)calloc(1, sizeof(struct cras_client));
-	if (*client == NULL)
+	/* Ignore SIGPIPE while using this API. */
+	signal(SIGPIPE, SIG_IGN);
+
+	sock_dir = cras_config_get_system_socket_file_dir();
+	if (!sock_dir)
 		return -ENOMEM;
+
+	client_int = (struct client_int *)calloc(1, sizeof(*client_int));
+	if (!client_int)
+		return -ENOMEM;
+	*client = &client_int->client;
 	(*client)->server_fd = -1;
 	(*client)->id = -1;
+
+	rc = pthread_rwlock_init(&client_int->server_state_rwlock, NULL);
+	if (rc != 0) {
+		syslog(LOG_ERR, "cras_client: Could not init state rwlock.");
+		rc = -rc;
+		goto free_client;
+	}
+
+	rc = pthread_mutex_init(&(*client)->stream_start_lock, NULL);
+	if (rc != 0) {
+		syslog(LOG_ERR, "cras_client: Could not init start lock.");
+		rc = -rc;
+		goto free_rwlock;
+	}
+
+	pthread_condattr_init(&cond_attr);
+	pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+	rc = pthread_cond_init(&(*client)->stream_start_cond, &cond_attr);
+	pthread_condattr_destroy(&cond_attr);
+	if (rc != 0) {
+		syslog(LOG_ERR, "cras_client: Could not init start cond.");
+		rc = -rc;
+		goto free_lock;
+	}
+
+	(*client)->server_event_fd = eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK);
+	if ((*client)->server_event_fd < 0) {
+		syslog(LOG_ERR, "cras_client: Could not setup server eventfd.");
+		rc = -errno;
+		goto free_cond;
+	}
+
+	sock_file_size = strlen(sock_dir) + strlen(CRAS_SOCKET_FILE) + 2;
+	(*client)->sock_file = (const char *)malloc(sock_file_size);
+	if (!(*client)->sock_file) {
+		rc = -ENOMEM;
+		goto free_error;
+	}
+	snprintf((char *)(*client)->sock_file, sock_file_size, "%s/%s", sock_dir,
+		 CRAS_SOCKET_FILE);
+
+	rc = cras_file_wait_create((*client)->sock_file,
+				   CRAS_FILE_WAIT_FLAG_NONE,
+				   sock_file_wait_callback, *client,
+				   &(*client)->sock_file_wait);
+	if (rc != 0 && rc != -ENOENT) {
+		syslog(LOG_ERR, "cras_client: Could not setup watch for '%s'.",
+		       (*client)->sock_file);
+		goto free_error;
+	}
+	(*client)->sock_file_exists = (rc == 0);
 
 	/* Pipes used by the main thread and the client thread to send commands
 	 * and replies. */
@@ -1227,58 +2146,61 @@ int cras_client_create(struct cras_client **client)
 
 	return 0;
 free_error:
-	free(*client);
+	if ((*client)->server_event_fd >= 0)
+		close((*client)->server_event_fd);
+	cras_file_wait_destroy((*client)->sock_file_wait);
+	free((void *)(*client)->sock_file);
+free_cond:
+	pthread_cond_destroy(&(*client)->stream_start_cond);
+free_lock:
+	pthread_mutex_destroy(&(*client)->stream_start_lock);
+free_rwlock:
+	pthread_rwlock_destroy(&client_int->server_state_rwlock);
+free_client:
 	*client = NULL;
+	free(client_int);
 	return rc;
-}
-
-static inline
-int shutdown_and_close_socket(int sockfd)
-{
-	int rc;
-	uint8_t buffer[CRAS_CLIENT_MAX_MSG_SIZE];
-	struct timeval tv;
-
-	tv.tv_sec = 0;
-	tv.tv_usec = SERVER_SHUTDOWN_TIMEOUT_US;
-	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
-
-	rc = shutdown(sockfd, SHUT_WR);
-	if (rc < 0)
-		return rc;
-	/* Wait until the socket is closed by the peer. */
-	for (;;) {
-		rc = recv(sockfd, buffer, sizeof(buffer), 0);
-		if (rc <= 0)
-			break;
-	}
-	return close(sockfd);
 }
 
 void cras_client_destroy(struct cras_client *client)
 {
+	struct client_int *client_int;
 	if (client == NULL)
 		return;
+	client_int = to_client_int(client);
+	client->server_connection_cb = NULL;
+	client->server_err_cb = NULL;
 	cras_client_stop(client);
-	if (client->server_state)
-		shmdt(client->server_state);
-	if (client->server_fd >= 0)
-		shutdown_and_close_socket(client->server_fd);
+	server_disconnect(client);
 	close(client->command_fds[0]);
 	close(client->command_fds[1]);
 	close(client->stream_fds[0]);
 	close(client->stream_fds[1]);
-	free(client);
+	cras_file_wait_destroy(client->sock_file_wait);
+	pthread_rwlock_destroy(&client_int->server_state_rwlock);
+	free((void *)client->sock_file);
+	free(client_int);
 }
 
 int cras_client_connect(struct cras_client *client)
 {
-	return connect_to_server(client);
+	return connect_to_server(client, NULL, true);
+}
+
+int cras_client_connect_timeout(struct cras_client *client,
+				unsigned int timeout_ms)
+{
+	return connect_to_server_wait_retry(client, timeout_ms, true);
 }
 
 int cras_client_connected_wait(struct cras_client *client)
 {
 	return send_simple_cmd_msg(client, 0, CLIENT_SERVER_CONNECT);
+}
+
+int cras_client_connect_async(struct cras_client *client)
+{
+	return send_simple_cmd_msg(client, 0, CLIENT_SERVER_CONNECT_ASYNC);
 }
 
 struct cras_stream_params *cras_client_stream_params_create(
@@ -1530,84 +2452,155 @@ int cras_client_set_system_capture_mute_locked(struct cras_client *client,
 	return write_message_to_server(client, &msg.header);
 }
 
-size_t cras_client_get_system_volume(struct cras_client *client)
+size_t cras_client_get_system_volume(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	size_t volume;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->volume;
+
+	volume = client->server_state->volume;
+	server_state_unlock(client, lock_rc);
+	return volume;
 }
 
-long cras_client_get_system_capture_gain(struct cras_client *client)
+long cras_client_get_system_capture_gain(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	long gain;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->capture_gain;
+
+	gain = client->server_state->capture_gain;
+	server_state_unlock(client, lock_rc);
+	return gain;
 }
 
-int cras_client_get_system_muted(struct cras_client *client)
+int cras_client_get_system_muted(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	int muted;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->mute;
+
+	muted = client->server_state->mute;
+	server_state_unlock(client, lock_rc);
+	return muted;
 }
 
-int cras_client_get_user_muted(struct cras_client *client)
+int cras_client_get_user_muted(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	int muted;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->user_mute;
+
+	muted = client->server_state->user_mute;
+	server_state_unlock(client, lock_rc);
+	return muted;
 }
 
-int cras_client_get_system_capture_muted(struct cras_client *client)
+int cras_client_get_system_capture_muted(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	int muted;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->capture_mute;
+
+	muted = client->server_state->capture_mute;
+	server_state_unlock(client, lock_rc);
+	return muted;
 }
 
-long cras_client_get_system_min_volume(struct cras_client *client)
+long cras_client_get_system_min_volume(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	long min_volume;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->min_volume_dBFS;
+
+	min_volume = client->server_state->min_volume_dBFS;
+	server_state_unlock(client, lock_rc);
+	return min_volume;
 }
 
-long cras_client_get_system_max_volume(struct cras_client *client)
+long cras_client_get_system_max_volume(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	long max_volume;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->max_volume_dBFS;
+
+	max_volume = client->server_state->max_volume_dBFS;
+	server_state_unlock(client, lock_rc);
+	return max_volume;
 }
 
-long cras_client_get_system_min_capture_gain(struct cras_client *client)
+long cras_client_get_system_min_capture_gain(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	long min_gain;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->min_capture_gain;
+
+	min_gain = client->server_state->min_capture_gain;
+	server_state_unlock(client, lock_rc);
+	return min_gain;
 }
 
-long cras_client_get_system_max_capture_gain(struct cras_client *client)
+long cras_client_get_system_max_capture_gain(const struct cras_client *client)
 {
-	if (!client || !client->server_state)
+	long max_gain;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
-	return client->server_state->max_capture_gain;
+
+	max_gain = client->server_state->max_capture_gain;
+	server_state_unlock(client, lock_rc);
+	return max_gain;
 }
 
 const struct audio_debug_info *cras_client_get_audio_debug_info(
-		struct cras_client *client)
+		const struct cras_client *client)
 {
-	if (!client || !client->server_state)
-		return NULL;
+	const struct audio_debug_info *debug_info;
+	int lock_rc;
 
-	return &client->server_state->audio_debug_info;
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return 0;
+
+	debug_info = &client->server_state->audio_debug_info;
+	server_state_unlock(client, lock_rc);
+	return debug_info;
 }
 
-unsigned cras_client_get_num_active_streams(struct cras_client *client,
+unsigned cras_client_get_num_active_streams(const struct cras_client *client,
 					    struct timespec *ts)
 {
 	unsigned num_streams, version, i;
+	int lock_rc;
 
-	if (!client || !client->server_state)
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return 0;
 
 read_active_streams_again:
@@ -1625,30 +2618,40 @@ read_active_streams_again:
 	if (end_server_state_read(client->server_state, version))
 		goto read_active_streams_again;
 
+	server_state_unlock(client, lock_rc);
 	return num_streams;
 }
 
 int cras_client_run_thread(struct cras_client *client)
 {
-	if (client == NULL || client->thread.running)
+	int rc;
+
+	if (client == NULL)
 		return -EINVAL;
+	if (thread_is_running(&client->thread))
+		return 0;
 
 	assert(client->command_reply_fds[0] == -1 &&
 	       client->command_reply_fds[1] == -1);
 
-	client->thread.running = 1;
 	if (pipe(client->command_reply_fds) < 0)
 		return -EIO;
-	if (pthread_create(&client->thread.tid, NULL, client_thread, client))
-		return -ENOMEM;
+	client->thread.state = CRAS_THREAD_RUNNING;
+	rc = pthread_create(&client->thread.tid, NULL, client_thread, client);
+	if (rc) {
+		client->thread.state = CRAS_THREAD_STOP;
+		return -rc;
+	}
 
 	return 0;
 }
 
 int cras_client_stop(struct cras_client *client)
 {
-	if (client == NULL || !client->thread.running)
+	if (client == NULL)
 		return -EINVAL;
+	if (!thread_is_running(&client->thread))
+		return 0;
 
 	send_simple_cmd_msg(client, 0, CLIENT_STOP);
 	pthread_join(client->thread.tid, NULL);
@@ -1661,6 +2664,29 @@ int cras_client_stop(struct cras_client *client)
 	return 0;
 }
 
+void cras_client_set_server_error_cb(struct cras_client *client,
+				     cras_server_error_cb_t err_cb,
+				     void *user_arg)
+{
+	client->server_err_cb = err_cb;
+	client->server_connection_user_arg = user_arg;
+}
+
+void cras_client_set_connection_status_cb(
+		struct cras_client *client,
+		cras_connection_status_cb_t connection_cb,
+		void *user_arg)
+{
+	client->server_connection_cb = connection_cb;
+	client->server_connection_user_arg = user_arg;
+}
+
+void cras_client_set_thread_priority_cb(struct cras_client *client,
+					cras_thread_priority_cb_t cb)
+{
+	client->thread_priority_cb = cb;
+}
+
 int cras_client_get_output_devices(const struct cras_client *client,
 				   struct cras_iodev_info *devs,
 				   struct cras_ionode_info *nodes,
@@ -1668,12 +2694,12 @@ int cras_client_get_output_devices(const struct cras_client *client,
 {
 	const struct cras_server_state *state;
 	unsigned avail_devs, avail_nodes, version;
+	int lock_rc;
 
-	if (!client)
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return -EINVAL;
 	state = client->server_state;
-	if (!state)
-		return -EINVAL;
 
 read_outputs_again:
 	version = begin_server_state_read(state);
@@ -1683,6 +2709,7 @@ read_outputs_again:
 	memcpy(nodes, state->output_nodes, avail_nodes * sizeof(*nodes));
 	if (end_server_state_read(state, version))
 		goto read_outputs_again;
+	server_state_unlock(client, lock_rc);
 
 	*num_devs = avail_devs;
 	*num_nodes = avail_nodes;
@@ -1697,12 +2724,12 @@ int cras_client_get_input_devices(const struct cras_client *client,
 {
 	const struct cras_server_state *state;
 	unsigned avail_devs, avail_nodes, version;
+	int lock_rc;
 
+	lock_rc = server_state_rdlock(client);
 	if (!client)
 		return -EINVAL;
 	state = client->server_state;
-	if (!state)
-		return -EINVAL;
 
 read_inputs_again:
 	version = begin_server_state_read(state);
@@ -1712,6 +2739,7 @@ read_inputs_again:
 	memcpy(nodes, state->input_nodes, avail_nodes * sizeof(*nodes));
 	if (end_server_state_read(state, version))
 		goto read_inputs_again;
+	server_state_unlock(client, lock_rc);
 
 	*num_devs = avail_devs;
 	*num_nodes = avail_nodes;
@@ -1725,12 +2753,12 @@ int cras_client_get_attached_clients(const struct cras_client *client,
 {
 	const struct cras_server_state *state;
 	unsigned num, version;
+	int lock_rc;
 
-	if (!client)
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return -EINVAL;
 	state = client->server_state;
-	if (!state)
-		return 0;
 
 read_clients_again:
 	version = begin_server_state_read(state);
@@ -1738,6 +2766,7 @@ read_clients_again:
 	memcpy(clients, state->client_info, num * sizeof(*clients));
 	if (end_server_state_read(state, version))
 		goto read_clients_again;
+	server_state_unlock(client, lock_rc);
 
 	return num;
 }
@@ -2072,6 +3101,23 @@ int cras_client_test_iodev_command(struct cras_client *client,
 	return rc;
 }
 
+int cras_client_config_global_remix(struct cras_client *client,
+				    unsigned num_channels,
+				    float *coefficient)
+{
+	struct cras_config_global_remix *msg;
+	int rc;
+
+	msg = (struct cras_config_global_remix *)malloc(sizeof(*msg) +
+			num_channels * num_channels * sizeof(*coefficient));
+	cras_fill_config_global_remix_command(msg, num_channels,
+					      coefficient,
+					      num_channels * num_channels);
+	rc = write_message_to_server(client, &msg->header);
+	free(msg);
+	return rc;
+}
+
 /* Return the index of the device used for listening to hotwords. */
 int cras_client_get_first_dev_type_idx(const struct cras_client *client,
 				       enum CRAS_NODE_TYPE type,
@@ -2082,12 +3128,12 @@ int cras_client_get_first_dev_type_idx(const struct cras_client *client,
 	unsigned int i;
 	const struct cras_ionode_info *node_list;
 	unsigned int num_nodes;
+	int lock_rc;
 
-	if (!client)
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
 		return -EINVAL;
 	state = client->server_state;
-	if (!state)
-		return -EINVAL;
 
 read_nodes_again:
 	version = begin_server_state_read(state);
@@ -2099,11 +3145,15 @@ read_nodes_again:
 		num_nodes = state->num_input_nodes;
 	}
 	for (i = 0; i < num_nodes; i++) {
-		if ((enum CRAS_NODE_TYPE)node_list[i].type_enum == type)
-			return node_list[i].iodev_idx;
+		if ((enum CRAS_NODE_TYPE)node_list[i].type_enum == type) {
+			int ret_idx = node_list[i].iodev_idx;
+			server_state_unlock(client, lock_rc);
+			return ret_idx;
+		}
 	}
 	if (end_server_state_read(state, version))
 		goto read_nodes_again;
+	server_state_unlock(client, lock_rc);
 
 	return -ENODEV;
 }
@@ -2114,4 +3164,239 @@ int cras_client_set_suspend(struct cras_client *client, int suspend)
 
 	cras_fill_suspend_message(&msg, suspend);
 	return write_message_to_server(client, &msg);
+}
+
+int cras_client_get_hotword_models(struct cras_client *client,
+				     cras_node_id_t node_id,
+				     get_hotword_models_cb_t cb)
+{
+	struct cras_get_hotword_models msg;
+
+	if (!client)
+		return -EINVAL;
+	client->get_hotword_models_cb = cb;
+
+	cras_fill_get_hotword_models_message(&msg, node_id);
+	return write_message_to_server(client, &msg.header);
+}
+
+int cras_client_set_hotword_model(struct cras_client *client,
+				  cras_node_id_t node_id,
+				  const char *model_name)
+{
+	struct cras_set_hotword_model msg;
+
+	cras_fill_set_hotword_model_message(&msg, node_id, model_name);
+	return write_message_to_server(client, &msg.header);
+}
+
+void cras_client_set_state_change_callback_context(
+		struct cras_client *client, void *context)
+{
+	if (!client)
+		return;
+	client->observer_context = context;
+}
+
+static int cras_send_register_notification(struct cras_client *client,
+					   enum CRAS_CLIENT_MESSAGE_ID msg_id,
+					   int do_register)
+{
+	struct cras_register_notification msg;
+	int rc;
+
+	/* This library automatically re-registers notifications when
+	 * reconnecting, so we can ignore message send failure due to no
+	 * connection. */
+	cras_fill_register_notification_message(&msg, msg_id, do_register);
+	rc = write_message_to_server(client, &msg.header);
+	if (rc == -EPIPE)
+		rc = 0;
+	return rc;
+}
+
+int cras_client_set_output_volume_changed_callback(
+		struct cras_client *client,
+		cras_client_output_volume_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.output_volume_changed = cb;
+	return cras_send_register_notification(
+			client, CRAS_CLIENT_OUTPUT_VOLUME_CHANGED, cb != NULL);
+}
+
+int cras_client_set_output_mute_changed_callback(
+		struct cras_client *client,
+		cras_client_output_mute_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.output_mute_changed = cb;
+	return cras_send_register_notification(
+			client, CRAS_CLIENT_OUTPUT_MUTE_CHANGED, cb != NULL);
+}
+
+int cras_client_set_capture_gain_changed_callback(
+		struct cras_client *client,
+		cras_client_capture_gain_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.capture_gain_changed = cb;
+	return cras_send_register_notification(
+			client, CRAS_CLIENT_CAPTURE_GAIN_CHANGED, cb != NULL);
+}
+
+int cras_client_set_capture_mute_changed_callback(
+		struct cras_client *client,
+		cras_client_capture_mute_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.capture_mute_changed = cb;
+	return cras_send_register_notification(
+			client, CRAS_CLIENT_CAPTURE_MUTE_CHANGED, cb != NULL);
+}
+
+int cras_client_set_nodes_changed_callback(
+		struct cras_client *client,
+		cras_client_nodes_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.nodes_changed = cb;
+	return cras_send_register_notification(
+			client, CRAS_CLIENT_NODES_CHANGED, cb != NULL);
+}
+
+int cras_client_set_active_node_changed_callback(
+		struct cras_client *client,
+		cras_client_active_node_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.active_node_changed = cb;
+	return cras_send_register_notification(
+		   client, CRAS_CLIENT_ACTIVE_NODE_CHANGED, cb != NULL);
+}
+
+int cras_client_set_output_node_volume_changed_callback(
+		struct cras_client *client,
+		cras_client_output_node_volume_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.output_node_volume_changed = cb;
+	return cras_send_register_notification(
+		    client, CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED, cb != NULL);
+}
+
+int cras_client_set_node_left_right_swapped_changed_callback(
+		struct cras_client *client,
+		cras_client_node_left_right_swapped_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.node_left_right_swapped_changed = cb;
+	return cras_send_register_notification(
+	       client, CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED, cb != NULL);
+}
+
+int cras_client_set_input_node_gain_changed_callback(
+		struct cras_client *client,
+		cras_client_input_node_gain_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.input_node_gain_changed = cb;
+	return cras_send_register_notification(
+		       client, CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED, cb != NULL);
+}
+
+int cras_client_set_num_active_streams_changed_callback(
+		struct cras_client *client,
+		cras_client_num_active_streams_changed_callback cb)
+{
+	if (!client)
+		return -EINVAL;
+	client->observer_ops.num_active_streams_changed = cb;
+	return cras_send_register_notification(
+	      client, CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED, cb != NULL);
+}
+
+static int reregister_notifications(struct cras_client *client)
+{
+	int rc;
+
+	if (client->observer_ops.output_volume_changed) {
+		rc = cras_client_set_output_volume_changed_callback(
+				client,
+				client->observer_ops.output_volume_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.output_mute_changed) {
+		rc = cras_client_set_output_mute_changed_callback(
+				client,
+				client->observer_ops.output_mute_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.capture_gain_changed) {
+		rc = cras_client_set_capture_gain_changed_callback(
+				client,
+				client->observer_ops.capture_gain_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.capture_mute_changed) {
+		rc = cras_client_set_capture_mute_changed_callback(
+				client,
+				client->observer_ops.capture_mute_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.nodes_changed) {
+		rc = cras_client_set_nodes_changed_callback(
+				client, client->observer_ops.nodes_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.active_node_changed) {
+		rc = cras_client_set_active_node_changed_callback(
+				client,
+				client->observer_ops.active_node_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.output_node_volume_changed) {
+		rc = cras_client_set_output_node_volume_changed_callback(
+			    client,
+			    client->observer_ops.output_node_volume_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.node_left_right_swapped_changed) {
+		rc = cras_client_set_node_left_right_swapped_changed_callback(
+			  client,
+			  client->observer_ops.node_left_right_swapped_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.input_node_gain_changed) {
+		rc = cras_client_set_input_node_gain_changed_callback(
+				client,
+				client->observer_ops.input_node_gain_changed);
+		if (rc != 0)
+			return rc;
+	}
+	if (client->observer_ops.num_active_streams_changed) {
+		rc = cras_client_set_num_active_streams_changed_callback(
+			       client,
+			       client->observer_ops.num_active_streams_changed);
+		if (rc != 0)
+			return rc;
+	}
+	return 0;
 }

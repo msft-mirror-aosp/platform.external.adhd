@@ -36,7 +36,6 @@ static snd_pcm_format_t test_supported_formats[] = {
 
 struct test_iodev {
 	struct cras_iodev base;
-	int open;
 	int fd;
 	struct byte_buffer *audbuff;
 	unsigned int fmt_bytes;
@@ -46,19 +45,8 @@ struct test_iodev {
  * iodev callbacks.
  */
 
-static int is_open(const struct cras_iodev *iodev)
-{
-	struct test_iodev *testio = (struct test_iodev *)iodev;
-
-	return testio->open;
-}
-
-static int dev_running(const struct cras_iodev *iodev)
-{
-	return 1;
-}
-
-static int frames_queued(const struct cras_iodev *iodev)
+static int frames_queued(const struct cras_iodev *iodev,
+			 struct timespec *tstamp)
 {
 	struct test_iodev *testio = (struct test_iodev *)iodev;
 	int available;
@@ -66,6 +54,7 @@ static int frames_queued(const struct cras_iodev *iodev)
 	if (testio->fd < 0)
 		return 0;
 	ioctl(testio->fd, FIONREAD, &available);
+	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
 	return available / testio->fmt_bytes;
 }
 
@@ -78,7 +67,6 @@ static int close_dev(struct cras_iodev *iodev)
 {
 	struct test_iodev *testio = (struct test_iodev *)iodev;
 
-	testio->open = 0;
 	byte_buffer_destroy(testio->audbuff);
 	testio->audbuff = NULL;
 	cras_iodev_free_audio_area(iodev);
@@ -93,7 +81,6 @@ static int open_dev(struct cras_iodev *iodev)
 		return -EINVAL;
 
 	cras_iodev_init_audio_area(iodev, iodev->format->num_channels);
-	testio->open = 1;
 	testio->fmt_bytes = cras_get_format_bytes(iodev->format);
 	testio->audbuff = byte_buffer_create(TEST_BUFFER_SIZE *
 						testio->fmt_bytes);
@@ -161,14 +148,18 @@ static int get_buffer_fd_read(struct cras_iodev *iodev,
 	return nread;
 }
 
-static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
+static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
+			       unsigned dev_enabled)
 {
 }
 
 static void play_file_as_hotword(struct test_iodev *testio, const char *path)
 {
 	if (testio->fd >= 0) {
-		audio_thread_rm_callback(testio->fd);
+		/* Remove audio thread callback from main thread. */
+		audio_thread_rm_callback_sync(
+				cras_iodev_list_get_audio_thread(),
+				testio->fd);
 		close(testio->fd);
 	}
 
@@ -204,7 +195,6 @@ struct cras_iodev *test_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 
 	iodev->open_dev = open_dev;
 	iodev->close_dev = close_dev;
-	iodev->is_open = is_open;
 	iodev->frames_queued = frames_queued;
 	iodev->delay_frames = delay_frames;
 	if (type == TEST_IODEV_HOTWORD)
@@ -212,7 +202,6 @@ struct cras_iodev *test_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 	else
 		iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
-	iodev->dev_running = dev_running;
 	iodev->update_active_node = update_active_node;
 
 	/* Create a dummy ionode */
@@ -220,10 +209,12 @@ struct cras_iodev *test_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 	node->dev = iodev;
 	node->plugged = 1;
 	if (type == TEST_IODEV_HOTWORD)
-		node->type = CRAS_NODE_TYPE_AOKR;
+		node->type = CRAS_NODE_TYPE_HOTWORD;
 	else
 		node->type = CRAS_NODE_TYPE_UNKNOWN;
 	node->volume = 100;
+	node->software_volume_needed = 0;
+	node->max_software_gain = 0;
 	strcpy(node->name, "(default)");
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
@@ -267,7 +258,7 @@ void test_iodev_command(struct cras_iodev *iodev,
 {
 	struct test_iodev *testio = (struct test_iodev *)iodev;
 
-	if (!is_open(iodev))
+	if (!cras_iodev_is_open(iodev))
 		return;
 
 	switch (command) {

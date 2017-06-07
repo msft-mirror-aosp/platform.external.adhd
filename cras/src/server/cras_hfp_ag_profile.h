@@ -45,9 +45,15 @@ int cras_hfp_ag_profile_create(DBusConnection *conn);
 /* Adds a profile instance for HSP AG (Headset Profile Audio Gateway). */
 int cras_hsp_ag_profile_create(DBusConnection *conn);
 
+/* Starts the HFP audio gateway for audio input/output. */
+int cras_hfp_ag_start(struct cras_bt_device *device);
+
 /* Suspends all connected audio gateways, used to stop HFP/HSP audio when
  * an A2DP only device is connected. */
 void cras_hfp_ag_suspend();
+
+/* Suspends audio gateway associated with given bt device. */
+void cras_hfp_ag_suspend_connected_device(struct cras_bt_device *device);
 
 /* Gets the active SLC handle. Used for HFP qualification. */
 struct hfp_slc_handle *cras_hfp_ag_get_active_handle();

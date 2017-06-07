@@ -17,7 +17,6 @@
 #include "cras_hfp_iodev.h"
 #include "cras_hfp_slc.h"
 #include "cras_system_state.h"
-#include "cras_tm.h"
 #include "utlist.h"
 
 #define STR(s) #s
@@ -71,8 +70,6 @@
 	"  </attribute>"						\
 	"</record>"
 
-static const unsigned int A2DP_RETRY_DELAY_MS = 500;
-static const unsigned int A2DP_MAX_RETRIES = 10;
 
 /* Object representing the audio gateway role for HFP/HSP.
  * Members:
@@ -116,8 +113,6 @@ static void destroy_audio_gateway(struct audio_gateway *ag)
 	if (ag->slc_handle)
 		hfp_slc_destroy(ag->slc_handle);
 
-	cras_bt_device_cancel_a2dp_delay_timer(ag->device);
-
 	/* If the bt device is not using a2dp, do a deeper clean up
 	 * to force disconnect it. */
 	if (!cras_bt_device_has_a2dp(ag->device))
@@ -137,82 +132,22 @@ static int has_audio_gateway(struct cras_bt_device *device)
 	return 0;
 }
 
-/* Creates the iodevs to start the audio gateway. */
-static int start_audio_gateway(struct audio_gateway *ag)
-{
-	ag->info = hfp_info_create();
-	ag->idev = hfp_iodev_create(CRAS_STREAM_INPUT, ag->device,
-				    ag->slc_handle,
-				    ag->profile, ag->info);
-	ag->odev = hfp_iodev_create(CRAS_STREAM_OUTPUT, ag->device,
-				    ag->slc_handle,
-				    ag->profile, ag->info);
-
-	if (!ag->idev && !ag->odev) {
-		destroy_audio_gateway(ag);
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
 static void cras_hfp_ag_release(struct cras_bt_profile *profile)
 {
 	cras_hfp_ag_suspend();
 }
 
-/* Checks if a2dp connection is present. If not then delay the
- * start of audio gateway until the max number of retry is reached.
- */
-static void a2dp_delay_cb(struct cras_timer *timer, void *arg)
-{
-	struct audio_gateway *ag = (struct audio_gateway *)arg;
-	struct cras_tm *tm = cras_system_state_get_tm();
-
-	cras_bt_device_rm_a2dp_delay_timer(ag->device);
-
-	if (cras_bt_device_has_a2dp(ag->device))
-		goto start_ag;
-
-	if (--ag->a2dp_delay_retries == 0)
-		goto start_ag;
-
-	cras_bt_device_add_a2dp_delay_timer(
-			ag->device,
-			cras_tm_create_timer(tm, A2DP_RETRY_DELAY_MS,
-					     a2dp_delay_cb, ag));
-	return;
-
-start_ag:
-	if (start_audio_gateway(ag))
-		syslog(LOG_ERR, "Start audio gateway failed");
-}
-
+/* Callback triggered when SLC is initialized.  */
 static int cras_hfp_ag_slc_initialized(struct hfp_slc_handle *handle)
 {
 	struct audio_gateway *ag;
-	struct cras_tm *tm = cras_system_state_get_tm();
-	int rc;
 
 	DL_SEARCH_SCALAR(connected_ags, ag, slc_handle, handle);
 	if (!ag)
 		return -EINVAL;
 
-	/* This is a HFP/HSP only headset. */
-	if (!cras_bt_device_supports_profile(
-			ag->device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK)) {
-		rc = start_audio_gateway(ag);
-		if (rc)
-			syslog(LOG_ERR, "Start audio gateway failed");
-		return rc;
-	}
-
-	ag->a2dp_delay_retries = A2DP_MAX_RETRIES;
-	cras_bt_device_add_a2dp_delay_timer(
-			ag->device,
-			cras_tm_create_timer(tm, A2DP_RETRY_DELAY_MS,
-					     a2dp_delay_cb, ag));
-	return 0;
+	/* Defer the starting of audio gateway to bt_device. */
+	return cras_bt_device_audio_gateway_initialized(ag->device);
 }
 
 static int cras_hfp_ag_slc_disconnected(struct hfp_slc_handle *handle)
@@ -270,7 +205,7 @@ static void possibly_remove_conflict_dev(void *data)
 	/* Kick out any previously connected a2dp iodev. */
 	a2dp_device = cras_a2dp_connected_device();
 	if (a2dp_device && a2dp_device != device) {
-		cras_a2dp_suspend_connected_device();
+		cras_a2dp_suspend_connected_device(a2dp_device);
 		cras_bt_device_disconnect(new_ag->conn, a2dp_device);
 	}
 }
@@ -299,6 +234,7 @@ static int cras_hfp_ag_new_connection(DBusConnection *conn,
 	ag->profile = cras_bt_device_profile_from_uuid(profile->uuid);
 	ag->slc_handle = hfp_slc_create(rfcomm_fd,
 					0,
+					device,
 					cras_hfp_ag_slc_initialized,
 					cras_hfp_ag_slc_disconnected);
 	DL_APPEND(connected_ags, ag);
@@ -360,7 +296,7 @@ static int cras_hsp_ag_new_connection(DBusConnection *conn,
 	ag->device = device;
 	ag->conn = conn;
 	ag->profile = cras_bt_device_profile_from_uuid(profile->uuid);
-	ag->slc_handle = hfp_slc_create(rfcomm_fd, 1, NULL,
+	ag->slc_handle = hfp_slc_create(rfcomm_fd, 1, device, NULL,
 					cras_hfp_ag_slc_disconnected);
 	DL_APPEND(connected_ags, ag);
 	cras_hfp_ag_slc_initialized(ag->slc_handle);
@@ -380,10 +316,43 @@ static struct cras_bt_profile cras_hsp_ag_profile = {
 	.cancel = cras_hfp_ag_cancel
 };
 
+int cras_hfp_ag_start(struct cras_bt_device *device)
+{
+	struct audio_gateway *ag;
+
+	DL_SEARCH_SCALAR(connected_ags, ag, device, device);
+	if (ag == NULL)
+		return -EEXIST;
+
+	ag->info = hfp_info_create();
+	ag->idev = hfp_iodev_create(CRAS_STREAM_INPUT, ag->device,
+				    ag->slc_handle,
+				    ag->profile, ag->info);
+	ag->odev = hfp_iodev_create(CRAS_STREAM_OUTPUT, ag->device,
+				    ag->slc_handle,
+				    ag->profile, ag->info);
+
+	if (!ag->idev && !ag->odev) {
+		destroy_audio_gateway(ag);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
 void cras_hfp_ag_suspend()
 {
 	struct audio_gateway *ag;
 	DL_FOREACH(connected_ags, ag)
+		destroy_audio_gateway(ag);
+}
+
+void cras_hfp_ag_suspend_connected_device(struct cras_bt_device *device)
+{
+	struct audio_gateway *ag;
+
+	DL_SEARCH_SCALAR(connected_ags, ag, device, device);
+	if (ag)
 		destroy_audio_gateway(ag);
 }
 

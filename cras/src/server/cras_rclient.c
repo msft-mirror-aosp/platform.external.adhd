@@ -13,6 +13,7 @@
 #include "cras_iodev.h"
 #include "cras_iodev_list.h"
 #include "cras_messages.h"
+#include "cras_observer.h"
 #include "cras_rclient.h"
 #include "cras_rstream.h"
 #include "cras_system_state.h"
@@ -26,6 +27,7 @@
  *  fd - Connection for client communication.
  */
 struct cras_rclient {
+	struct cras_observer_client *observer;
 	size_t id;
 	int fd;
 };
@@ -40,6 +42,7 @@ static int handle_client_stream_connect(struct cras_rclient *client,
 	struct cras_audio_format remote_fmt;
 	struct cras_rstream_config stream_config;
 	int rc;
+	int stream_fds[2];
 
 	unpack_cras_audio_format(&remote_fmt, &msg->format);
 
@@ -77,10 +80,10 @@ static int handle_client_stream_connect(struct cras_rclient *client,
 			0, /* No error. */
 			msg->stream_id,
 			&remote_fmt,
-			cras_rstream_input_shm_key(stream),
-			cras_rstream_output_shm_key(stream),
 			cras_rstream_get_total_shm_size(stream));
-	rc = cras_rclient_send_message(client, &reply.header);
+	stream_fds[0] = cras_rstream_input_shm_fd(stream);
+	stream_fds[1] = cras_rstream_output_shm_fd(stream);
+	rc = cras_rclient_send_message(client, &reply.header, stream_fds, 2);
 	if (rc < 0) {
 		syslog(LOG_ERR, "Failed to send connected messaged\n");
 		stream_list_rm(cras_iodev_list_get_stream_list(),
@@ -93,8 +96,8 @@ static int handle_client_stream_connect(struct cras_rclient *client,
 reply_err:
 	/* Send the error code to the client. */
 	cras_fill_client_stream_connected(&reply, rc, msg->stream_id,
-					  &remote_fmt, 0, 0, 0);
-	cras_rclient_send_message(client, &reply.header);
+					  &remote_fmt, 0);
+	cras_rclient_send_message(client, &reply.header, NULL, 0);
 
 	if (aud_fd >= 0)
 		close(aud_fd);
@@ -122,7 +125,211 @@ static void dump_audio_thread_info(struct cras_rclient *client)
 	state = cras_system_state_get_no_lock();
 	audio_thread_dump_thread_info(cras_iodev_list_get_audio_thread(),
 				      &state->audio_debug_info);
-	cras_rclient_send_message(client, &msg.header);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void handle_get_hotword_models(struct cras_rclient *client,
+				      cras_node_id_t node_id)
+{
+	struct cras_client_get_hotword_models_ready *msg;
+	char *hotword_models;
+	unsigned hotword_models_size;
+	uint8_t buf[CRAS_CLIENT_MAX_MSG_SIZE];
+
+	msg = (struct cras_client_get_hotword_models_ready *)buf;
+	hotword_models = cras_iodev_list_get_hotword_models(node_id);
+	if (!hotword_models)
+		goto empty_reply;
+	hotword_models_size = strlen(hotword_models);
+	if (hotword_models_size + sizeof(*msg) > CRAS_CLIENT_MAX_MSG_SIZE) {
+		free(hotword_models);
+		goto empty_reply;
+	}
+
+	cras_fill_client_get_hotword_models_ready(msg, hotword_models,
+						  hotword_models_size);
+	cras_rclient_send_message(client, &msg->header, NULL, 0);
+	free(hotword_models);
+	return;
+
+empty_reply:
+	cras_fill_client_get_hotword_models_ready(msg, NULL, 0);
+	cras_rclient_send_message(client, &msg->header, NULL, 0);
+}
+
+/* Client notification callback functions. */
+
+static void send_output_volume_changed(void *context, int32_t volume)
+{
+	struct cras_client_volume_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_output_volume_changed(&msg, volume);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_output_mute_changed(void *context, int muted,
+				     int user_muted, int mute_locked)
+{
+	struct cras_client_mute_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_output_mute_changed(&msg, muted,
+					     user_muted, mute_locked);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_capture_gain_changed(void *context, int32_t gain)
+{
+	struct cras_client_volume_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_capture_gain_changed(&msg, gain);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_capture_mute_changed(void *context, int muted, int mute_locked)
+{
+	struct cras_client_mute_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_capture_mute_changed(&msg, muted, mute_locked);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_nodes_changed(void *context)
+{
+	struct cras_client_nodes_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_nodes_changed(&msg);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_active_node_changed(void *context,
+				     enum CRAS_STREAM_DIRECTION dir,
+				     cras_node_id_t node_id)
+{
+	struct cras_client_active_node_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_active_node_changed(&msg, dir, node_id);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_output_node_volume_changed(void *context,
+					    cras_node_id_t node_id,
+					    int32_t volume)
+{
+	struct cras_client_node_value_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_output_node_volume_changed(&msg, node_id, volume);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_node_left_right_swapped_changed(void *context,
+						 cras_node_id_t node_id,
+						 int swapped)
+{
+	struct cras_client_node_value_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_node_left_right_swapped_changed(
+						&msg, node_id, swapped);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_input_node_gain_changed(void *context,
+					 cras_node_id_t node_id,
+					 int32_t gain)
+{
+	struct cras_client_node_value_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_input_node_gain_changed(&msg, node_id, gain);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void send_num_active_streams_changed(void *context,
+					    enum CRAS_STREAM_DIRECTION dir,
+					    uint32_t num_active_streams)
+{
+	struct cras_client_num_active_streams_changed msg;
+	struct cras_rclient *client = (struct cras_rclient *)context;
+
+	cras_fill_client_num_active_streams_changed(
+					&msg, dir, num_active_streams);
+	cras_rclient_send_message(client, &msg.header, NULL, 0);
+}
+
+static void register_for_notification(struct cras_rclient *client,
+				      enum CRAS_CLIENT_MESSAGE_ID msg_id,
+				      int do_register)
+{
+	struct cras_observer_ops observer_ops;
+	int empty;
+
+	cras_observer_get_ops(client->observer, &observer_ops);
+
+	switch (msg_id) {
+	case CRAS_CLIENT_OUTPUT_VOLUME_CHANGED:
+		observer_ops.output_volume_changed =
+			do_register ? send_output_volume_changed : NULL;
+		break;
+	case CRAS_CLIENT_OUTPUT_MUTE_CHANGED:
+		observer_ops.output_mute_changed =
+			do_register ? send_output_mute_changed : NULL;
+		break;
+	case CRAS_CLIENT_CAPTURE_GAIN_CHANGED:
+		observer_ops.capture_gain_changed =
+			do_register ? send_capture_gain_changed : NULL;
+		break;
+	case CRAS_CLIENT_CAPTURE_MUTE_CHANGED:
+		observer_ops.capture_mute_changed =
+			do_register ? send_capture_mute_changed : NULL;
+		break;
+	case CRAS_CLIENT_NODES_CHANGED:
+		observer_ops.nodes_changed =
+			do_register ? send_nodes_changed : NULL;
+		break;
+	case CRAS_CLIENT_ACTIVE_NODE_CHANGED:
+		observer_ops.active_node_changed =
+			do_register ? send_active_node_changed : NULL;
+		break;
+	case CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED:
+		observer_ops.output_node_volume_changed =
+			do_register ? send_output_node_volume_changed : NULL;
+		break;
+	case CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED:
+		observer_ops.node_left_right_swapped_changed =
+		    do_register ? send_node_left_right_swapped_changed : NULL;
+		break;
+	case CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED:
+		observer_ops.input_node_gain_changed =
+			do_register ? send_input_node_gain_changed : NULL;
+		break;
+	case CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED:
+		observer_ops.num_active_streams_changed =
+			do_register ? send_num_active_streams_changed : NULL;
+		break;
+	default:
+		syslog(LOG_ERR,
+		       "Invalid client notification message ID: %u", msg_id);
+		break;
+	}
+
+	empty = cras_observer_ops_are_empty(&observer_ops);
+	if (client->observer) {
+		if (empty) {
+			cras_observer_remove(client->observer);
+			client->observer = NULL;
+		} else {
+			cras_observer_set_ops(client->observer, &observer_ops);
+		}
+	} else if (!empty) {
+		client->observer = cras_observer_add(&observer_ops, client);
+	}
 }
 
 /*
@@ -135,16 +342,18 @@ struct cras_rclient *cras_rclient_create(int fd, size_t id)
 {
 	struct cras_rclient *client;
 	struct cras_client_connected msg;
+	int state_fd;
 
-	client = calloc(1, sizeof(struct cras_rclient));
+	client = (struct cras_rclient *)calloc(1, sizeof(struct cras_rclient));
 	if (!client)
 		return NULL;
 
 	client->fd = fd;
 	client->id = id;
 
-	cras_fill_client_connected(&msg, client->id, cras_sys_state_shm_key());
-	cras_rclient_send_message(client, &msg.header);
+	cras_fill_client_connected(&msg, client->id);
+	state_fd = cras_sys_state_shm_fd();
+	cras_rclient_send_message(client, &msg.header, &state_fd, 1);
 
 	return client;
 }
@@ -152,6 +361,7 @@ struct cras_rclient *cras_rclient_create(int fd, size_t id)
 /* Removes all streams that the client owns and destroys it. */
 void cras_rclient_destroy(struct cras_rclient *client)
 {
+	cras_observer_remove(client->observer);
 	stream_list_rm_all_client_streams(
 			cras_iodev_list_get_stream_list(), client);
 	free(client);
@@ -260,8 +470,9 @@ int cras_rclient_message_from_client(struct cras_rclient *client,
 	case CRAS_SERVER_TEST_DEV_COMMAND: {
 		const struct cras_test_dev_command *m =
 			(const struct cras_test_dev_command *)msg;
-		cras_iodev_list_test_dev_command(m->iodev_idx, m->command,
-						 m->data_len, m->data);
+		cras_iodev_list_test_dev_command(
+			m->iodev_idx, (enum CRAS_TEST_IODEV_CMD)m->command,
+			m->data_len, m->data);
 		break;
 	}
 	case CRAS_SERVER_SUSPEND:
@@ -270,6 +481,35 @@ int cras_rclient_message_from_client(struct cras_rclient *client,
 	case CRAS_SERVER_RESUME:
 		cras_system_set_suspended(0);
 		break;
+	case CRAS_CONFIG_GLOBAL_REMIX: {
+		const struct cras_config_global_remix *m =
+			(const struct cras_config_global_remix *)msg;
+		audio_thread_config_global_remix(
+				cras_iodev_list_get_audio_thread(),
+				m->num_channels,
+				m->coefficient);
+		break;
+	}
+	case CRAS_SERVER_GET_HOTWORD_MODELS: {
+		handle_get_hotword_models(client,
+			((const struct cras_get_hotword_models *)msg)->node_id);
+		break;
+	}
+	case CRAS_SERVER_SET_HOTWORD_MODEL: {
+		const struct cras_set_hotword_model *m =
+			(const struct cras_set_hotword_model *)msg;
+		cras_iodev_list_set_hotword_model(m->node_id,
+						  m->model_name);
+		break;
+	}
+	case CRAS_SERVER_REGISTER_NOTIFICATION: {
+		const struct cras_register_notification *m =
+			(struct cras_register_notification *)msg;
+		register_for_notification(
+			client, (enum CRAS_CLIENT_MESSAGE_ID)m->msg_id,
+			m->do_register);
+		break;
+	}
 	default:
 		break;
 	}
@@ -279,8 +519,11 @@ int cras_rclient_message_from_client(struct cras_rclient *client,
 
 /* Sends a message to the client. */
 int cras_rclient_send_message(const struct cras_rclient *client,
-			      const struct cras_client_message *msg)
+			      const struct cras_client_message *msg,
+			      int *fds,
+			      unsigned int num_fds)
 {
-	return write(client->fd, msg, msg->length);
+	return cras_send_with_fds(client->fd, (const void *)msg, msg->length,
+				  fds, num_fds);
 }
 

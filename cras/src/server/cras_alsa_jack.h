@@ -27,8 +27,8 @@ typedef void (jack_state_change_callback)(const struct cras_alsa_jack *jack,
 					  int plugged,
 					  void *data);
 
-/* Creates a jack list.  The list holds all the interesting ALSA jacks for this
- * device.  These jacks will be for headphones, speakers, HDMI, etc.
+/* Creates a jack list. The jacks can be added later by name matching or
+ * fully specified UCM.
  * Args:
  *    card_index - Index ALSA uses to refer to the card.  The X in "hw:X".
  *    card_name - The name of the card (used to find gpio jacks).
@@ -37,7 +37,8 @@ typedef void (jack_state_change_callback)(const struct cras_alsa_jack *jack,
  *    mixer - The mixer associated with this card, used to find controls that
  *      correspond to jacks.  For instance "Headphone switch" for "Headphone
  *      Jack".
- *    ucm - ALSA use case manager if available.
+ *    ucm - CRAS use case manager if available.
+ *    hctl - ALSA high-level control interface if available.
  *    direction - Input or output, look for mic or headphone jacks.
  *    cb - Function to call when a jack state changes.
  *    cb_data - Passed to the callback when called.
@@ -50,16 +51,47 @@ struct cras_alsa_jack_list *cras_alsa_jack_list_create(
 		unsigned int device_index,
 		int is_first_device,
 		struct cras_alsa_mixer *mixer,
-		snd_use_case_mgr_t *ucm,
+		struct cras_use_case_mgr *ucm,
+		snd_hctl_t *hctl,
 		enum CRAS_STREAM_DIRECTION direction,
 		jack_state_change_callback *cb,
 		void *cb_data);
+
+/* Finds jacks by name matching.
+ * The list holds all the interesting ALSA jacks for this
+ * device. These jacks will be for headphones, speakers, HDMI, etc.
+ * Args:
+ *   jack_list - A pointer to a jack list.
+ * Returns:
+ *   0 on success. Error code if there is a failure.
+ */
+int cras_alsa_jack_list_find_jacks_by_name_matching(
+	struct cras_alsa_jack_list *jack_list);
+
+/* Add the jack defined by the UCM section information.
+ * Args:
+ *   jack_list - A pointer to a jack list.
+ *   ucm_section - UCM section data.
+ *   result_jack - Resulting jack that was added.
+ * Returns:
+ *   0 on success. Error code if there is a failure.
+ */
+int cras_alsa_jack_list_add_jack_for_section(
+	struct cras_alsa_jack_list *jack_list,
+	struct ucm_section *ucm_section,
+	struct cras_alsa_jack **result_jack);
 
 /* Destroys a jack list created with cras_alsa_jack_list_create.
  * Args:
  *    jack_list - The list to destroy.
  */
 void cras_alsa_jack_list_destroy(struct cras_alsa_jack_list *jack_list);
+
+/* Returns non-zero if the jack list has hctl jacks.
+ * Args:
+ *    jack_list - The list check.
+ */
+int cras_alsa_jack_list_has_hctl_jacks(struct cras_alsa_jack_list *jack_list);
 
 /* Gets the mixer output associated with the given jack.
  * Args:
@@ -90,6 +122,12 @@ void cras_alsa_jack_list_report(const struct cras_alsa_jack_list *jack_list);
  *    jack_list - The jack list to query.
  */
 const char *cras_alsa_jack_get_name(const struct cras_alsa_jack *jack);
+
+/* Gets the ucm device of a jack.
+ * Args:
+ *    jack - The alsa jack.
+ */
+const char *cras_alsa_jack_get_ucm_device(const struct cras_alsa_jack *jack);
 
 
 void cras_alsa_jack_update_monitor_name(const struct cras_alsa_jack *jack,

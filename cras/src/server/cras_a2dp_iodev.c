@@ -14,6 +14,8 @@
 #include "audio_thread.h"
 #include "audio_thread_log.h"
 #include "byte_buffer.h"
+#include "cras_iodev_list.h"
+#include "cras_a2dp_endpoint.h"
 #include "cras_a2dp_info.h"
 #include "cras_a2dp_iodev.h"
 #include "cras_audio_area.h"
@@ -27,23 +29,28 @@
 #define PCM_BUF_MAX_SIZE_FRAMES (4096*4)
 #define PCM_BUF_MAX_SIZE_BYTES (PCM_BUF_MAX_SIZE_FRAMES * 4)
 
+/* Child of cras_iodev to handle bluetooth A2DP streaming.
+ * Members:
+ *    base - The cras_iodev structure "base class"
+ *    a2dp - The codec and encoded state of a2dp_io.
+ *    transport - The transport object for bluez media API.
+ *    sock_depth_frames - Socket depth in frames of the a2dp socket.
+ *    pcm_buf - Buffer to hold pcm samples before encode.
+ *    destroyed - Flag to note if this a2dp_io is about to destroy.
+ *    pre_fill_complete - Flag to note if socket pre-fill is completed.
+ *    bt_written_frames - Accumulated frames written to a2dp socket. Used
+ *        together with the device open timestamp to estimate how many virtual
+ *        buffer is queued there.
+ *    dev_open_time - The last time a2dp_ios is opened.
+ */
 struct a2dp_io {
 	struct cras_iodev base;
 	struct a2dp_info a2dp;
 	struct cras_bt_transport *transport;
-	a2dp_force_suspend_cb force_suspend_cb;
 	unsigned sock_depth_frames;
-
-	/* To hold the pcm samples. */
 	struct byte_buffer *pcm_buf;
-
-	/* Has the socket been filled once. */
+	int destroyed;
 	int pre_fill_complete;
-
-	/* Accumulated frames written to a2dp socket. Will need this info
-	 * together with the device open time stamp to get how many virtual
-	 * buffer is queued there.
-	 */
 	uint64_t bt_written_frames;
 	struct timespec dev_open_time;
 };
@@ -114,7 +121,8 @@ static int bt_queued_frames(const struct cras_iodev *iodev, int fr)
 }
 
 
-static int frames_queued(const struct cras_iodev *iodev)
+static int frames_queued(const struct cras_iodev *iodev,
+			 struct timespec *tstamp)
 {
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
 	int estimate_queued_frames = bt_queued_frames(iodev, 0);
@@ -122,7 +130,7 @@ static int frames_queued(const struct cras_iodev *iodev)
 			a2dp_queued_frames(&a2dpio->a2dp) +
 			buf_queued_bytes(a2dpio->pcm_buf) /
 				cras_get_format_bytes(iodev->format);
-
+	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
 	return MIN(iodev->buffer_size,
 		   MAX(estimate_queued_frames, local_queued_frames));
 }
@@ -138,6 +146,11 @@ static int open_dev(struct cras_iodev *iodev)
 		syslog(LOG_ERR, "transport_acquire failed");
 		return err;
 	}
+
+	/* Apply the node's volume after transport is acquired. Doing this
+	 * is necessary because the volume can not sync to hardware until
+	 * it is opened. */
+	iodev->set_volume(iodev);
 
 	/* Assert format is set before opening device. */
 	if (iodev->format == NULL)
@@ -181,27 +194,30 @@ static int close_dev(struct cras_iodev *iodev)
 {
 	int err;
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
+	struct cras_bt_device *device;
 
 	if (!a2dpio->transport)
 		return 0;
 
-	audio_thread_rm_callback(cras_bt_transport_fd(a2dpio->transport));
+	/* Remove audio thread callback and sync before releasing
+	 * the transport. */
+	audio_thread_rm_callback_sync(
+			cras_iodev_list_get_audio_thread(),
+			cras_bt_transport_fd(a2dpio->transport));
 
-	err = cras_bt_transport_release(a2dpio->transport);
+	err = cras_bt_transport_release(a2dpio->transport,
+					!a2dpio->destroyed);
 	if (err < 0)
 		syslog(LOG_ERR, "transport_release failed");
 
+	device = cras_bt_transport_device(a2dpio->transport);
+	if (device)
+		cras_bt_device_cancel_suspend(device);
 	a2dp_drain(&a2dpio->a2dp);
 	byte_buffer_destroy(a2dpio->pcm_buf);
 	cras_iodev_free_format(iodev);
 	cras_iodev_free_audio_area(iodev);
 	return 0;
-}
-
-static int is_open(const struct cras_iodev *iodev)
-{
-	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
-	return cras_bt_transport_fd(a2dpio->transport) > 0;
 }
 
 static int pre_fill_socket(struct a2dp_io *a2dpio)
@@ -245,15 +261,22 @@ static int pre_fill_socket(struct a2dp_io *a2dpio)
  */
 static int flush_data(void *arg)
 {
-	const struct cras_iodev *iodev = (const struct cras_iodev *)arg;
+	struct cras_iodev *iodev = (struct cras_iodev *)arg;
 	int processed;
 	size_t format_bytes;
-	int err = 0;
 	int written = 0;
+	int queued_frames;
 	struct a2dp_io *a2dpio;
+	struct cras_bt_device *device;
 
 	a2dpio = (struct a2dp_io *)iodev;
 	format_bytes = cras_get_format_bytes(iodev->format);
+	device = cras_bt_transport_device(a2dpio->transport);
+
+	/* If bt device has been destroyed, this a2dp iodev will soon be
+	 * destroyed as well. */
+	if (device == NULL)
+		return -EINVAL;
 
 encode_more:
 	while (buf_queued_bytes(a2dpio->pcm_buf)) {
@@ -283,40 +306,46 @@ encode_more:
 				    written,
 				    a2dp_queued_frames(&a2dpio->a2dp), 0);
 	if (written == -EAGAIN) {
+		/* If EAGAIN error lasts longer than 5 seconds, suspend the
+		 * a2dp connection. */
+		cras_bt_device_schedule_suspend(device, 5000);
 		audio_thread_enable_callback(
 				cras_bt_transport_fd(a2dpio->transport), 1);
 		return 0;
 	} else if (written < 0) {
-		if (a2dpio->force_suspend_cb)
-			a2dpio->force_suspend_cb(&a2dpio->base);
-		err = written;
-		goto write_done;
-	} else if (written == 0) {
-		goto write_done;
+		/* Suspend a2dp immediately when receives error other than
+		 * EAGAIN. */
+		cras_bt_device_cancel_suspend(device);
+		cras_bt_device_schedule_suspend(device, 0);
+		return written;
 	}
 
-	if (buf_queued_bytes(a2dpio->pcm_buf))
+	/* Data succcessfully written to a2dp socket, cancel any scheduled
+	 * suspend timer. */
+	cras_bt_device_cancel_suspend(device);
+
+	/* If it looks okay to write more and we do have queued data, try
+	 * encode more. But avoid the case when PCM buffer level is too close
+	 * to min_buffer_level so that another A2DP write could causes underrun.
+	 */
+	queued_frames = buf_queued_bytes(a2dpio->pcm_buf) / format_bytes;
+	if (written && (iodev->min_buffer_level + written < queued_frames))
 		goto encode_more;
 
-write_done:
 	/* everything written. */
 	audio_thread_enable_callback(
 			cras_bt_transport_fd(a2dpio->transport), 0);
 
-	return err;
-}
-
-static int dev_running(const struct cras_iodev *iodev)
-{
-	return is_open(iodev);
+	return 0;
 }
 
 static int delay_frames(const struct cras_iodev *iodev)
 {
 	const struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
+	struct timespec tstamp;
 
 	/* The number of frames in the pcm buffer plus two mtu packets */
-	return frames_queued(iodev) + a2dpio->sock_depth_frames;
+	return frames_queued(iodev, &tstamp) + a2dpio->sock_depth_frames;
 }
 
 static int get_buffer(struct cras_iodev *iodev,
@@ -376,7 +405,24 @@ static int flush_buffer(struct cras_iodev *iodev)
 	return 0;
 }
 
-static void update_active_node(struct cras_iodev *iodev, unsigned node_idx)
+static void set_volume(struct cras_iodev *iodev)
+{
+	size_t volume;
+	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
+	struct cras_bt_device *device =
+			cras_bt_transport_device(a2dpio->transport);
+
+	if (!cras_bt_device_get_use_hardware_volume(device))
+		return;
+
+	volume = iodev->active_node->volume * 127 / 100;
+
+	if (a2dpio->transport)
+		cras_bt_transport_set_volume(a2dpio->transport, volume);
+}
+
+static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
+			       unsigned dev_enabled)
 {
 }
 
@@ -394,8 +440,7 @@ void free_resources(struct a2dp_io *a2dpio)
 	destroy_a2dp(&a2dpio->a2dp);
 }
 
-struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport,
-				     a2dp_force_suspend_cb force_suspend_cb)
+struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport)
 {
 	int err;
 	struct a2dp_io *a2dpio;
@@ -417,7 +462,6 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport,
 		syslog(LOG_ERR, "Fail to init a2dp");
 		goto error;
 	}
-	a2dpio->force_suspend_cb = force_suspend_cb;
 
 	iodev = &a2dpio->base;
 
@@ -438,11 +482,10 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport,
 			cras_bt_device_object_path(device),
 			strlen(cras_bt_device_object_path(device)),
 			strlen(cras_bt_device_object_path(device)));
+	iodev->info.stable_id_new = iodev->info.stable_id;
 
 	iodev->open_dev = open_dev;
-	iodev->is_open = is_open; /* Needed by thread_add_stream */
 	iodev->frames_queued = frames_queued;
-	iodev->dev_running = dev_running;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
@@ -450,7 +493,7 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport,
 	iodev->close_dev = close_dev;
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
-	iodev->software_volume_needed = 1;
+	iodev->set_volume = set_volume;
 
 	/* Create a dummy ionode */
 	node = (struct cras_ionode *)calloc(1, sizeof(*node));
@@ -481,6 +524,7 @@ void a2dp_iodev_destroy(struct cras_iodev *iodev)
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
 	struct cras_bt_device *device;
 
+	a2dpio->destroyed = 1;
 	device = cras_bt_transport_device(a2dpio->transport);
 
 	/* A2DP does output only */

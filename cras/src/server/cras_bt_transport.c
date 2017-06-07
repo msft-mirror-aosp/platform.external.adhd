@@ -31,6 +31,7 @@ struct cras_bt_transport {
 	int fd;
 	uint16_t read_mtu;
 	uint16_t write_mtu;
+	int volume;
 
 	struct cras_bt_endpoint *endpoint;
 	struct cras_bt_transport *prev, *next;
@@ -57,6 +58,7 @@ struct cras_bt_transport *cras_bt_transport_create(DBusConnection *conn,
 	dbus_connection_ref(transport->conn);
 
 	transport->fd = -1;
+	transport->volume = -1;
 
 	DL_APPEND(transports, transport);
 
@@ -147,11 +149,6 @@ enum cras_bt_device_profile cras_bt_transport_profile(
 	return transport->profile;
 }
 
-int cras_bt_transport_codec(const struct cras_bt_transport *transport)
-{
-	return transport->codec;
-}
-
 int cras_bt_transport_configuration(const struct cras_bt_transport *transport,
 				    void *configuration, int len)
 {
@@ -170,20 +167,9 @@ enum cras_bt_transport_state cras_bt_transport_state(
 	return transport->state;
 }
 
-struct cras_bt_endpoint *cras_bt_transport_endpoint(
-	const struct cras_bt_transport *transport)
-{
-	return transport->endpoint;
-}
-
 int cras_bt_transport_fd(const struct cras_bt_transport *transport)
 {
 	return transport->fd;
-}
-
-uint16_t cras_bt_transport_read_mtu(const struct cras_bt_transport *transport)
-{
-	return transport->read_mtu;
 }
 
 uint16_t cras_bt_transport_write_mtu(const struct cras_bt_transport *transport)
@@ -213,18 +199,23 @@ static void cras_bt_transport_state_changed(struct cras_bt_transport *transport)
 				transport);
 }
 
-void cras_bt_transport_fill_properties(struct cras_bt_transport *transport,
-				       int fd, const char *uuid)
+/* Updates bt_device when certain transport property has changed. */
+static void cras_bt_transport_update_device(struct cras_bt_transport *transport)
 {
-	transport->device = cras_bt_device_get(transport->object_path);
-	transport->profile = cras_bt_device_profile_from_uuid(uuid);
-	free(transport->configuration);
+	if (!transport->device)
+		return;
 
-	/* For HFP, the configuration is just the file descriptor of
-	 * the rfcomm socket */
-	transport->configuration = (int *)malloc(sizeof(fd));
-	memcpy(transport->configuration, &fd, sizeof(fd));
-	transport->configuration_len = sizeof(fd);
+	/* When the transport has non-negaive volume, it means the remote
+	 * BT audio devices supports AVRCP absolute volume. Set the flag in bt
+	 * device to use hardware volume. Also map the volume value from 0-127
+	 * to 0-100.
+	 */
+	if (transport->volume != -1) {
+		cras_bt_device_set_use_hardware_volume(transport->device, 1);
+		cras_bt_device_update_hardware_volume(
+				transport->device,
+				transport->volume * 100 / 127);
+	}
 }
 
 void cras_bt_transport_update_properties(
@@ -285,7 +276,9 @@ void cras_bt_transport_update_properties(
 				       "transport properties",
 				       obj_path);
 				transport->device =
-					cras_bt_device_create(obj_path);
+					cras_bt_device_create(transport->conn,
+							      obj_path);
+				cras_bt_transport_update_device(transport);
 			}
 		} else if (strcmp(
 				dbus_message_iter_get_signature(&variant_iter),
@@ -308,6 +301,12 @@ void cras_bt_transport_update_properties(
 				transport->configuration_len = len;
 			}
 
+		} else if (strcmp(key, "Volume") == 0) {
+			uint16_t volume;
+
+			dbus_message_iter_get_basic(&variant_iter, &volume);
+			transport->volume = volume;
+			cras_bt_transport_update_device(transport);
 		}
 
 		dbus_message_iter_next(properties_array_iter);
@@ -336,6 +335,69 @@ void cras_bt_transport_update_properties(
 
 		dbus_message_iter_next(invalidated_array_iter);
 	}
+}
+
+static void on_transport_volume_set(DBusPendingCall *pending_call, void *data)
+{
+	DBusMessage *reply;
+
+	reply = dbus_pending_call_steal_reply(pending_call);
+	dbus_pending_call_unref(pending_call);
+
+	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR)
+		syslog(LOG_ERR, "Set absolute volume returned error: %s",
+		       dbus_message_get_error_name(reply));
+	dbus_message_unref(reply);
+}
+
+int cras_bt_transport_set_volume(struct cras_bt_transport *transport,
+				 uint16_t volume)
+{
+	const char *key = "Volume";
+	const char *interface = BLUEZ_INTERFACE_MEDIA_TRANSPORT;
+	DBusMessage *method_call;
+	DBusMessageIter message_iter, variant;
+	DBusPendingCall *pending_call;
+
+	method_call = dbus_message_new_method_call(
+		BLUEZ_SERVICE,
+		transport->object_path,
+		DBUS_INTERFACE_PROPERTIES,
+		"Set");
+	if (!method_call)
+		return -ENOMEM;
+
+	dbus_message_iter_init_append(method_call, &message_iter);
+
+	dbus_message_iter_append_basic(&message_iter, DBUS_TYPE_STRING,
+				       &interface);
+	dbus_message_iter_append_basic(&message_iter, DBUS_TYPE_STRING, &key);
+
+	dbus_message_iter_open_container(&message_iter, DBUS_TYPE_VARIANT,
+					 DBUS_TYPE_UINT16_AS_STRING, &variant);
+	dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT16, &volume);
+	dbus_message_iter_close_container(&message_iter, &variant);
+
+	if (!dbus_connection_send_with_reply(transport->conn, method_call,
+					     &pending_call,
+					     DBUS_TIMEOUT_USE_DEFAULT)) {
+		dbus_message_unref(method_call);
+		return -ENOMEM;
+	}
+
+	dbus_message_unref(method_call);
+	if (!pending_call)
+		return -EIO;
+
+	if (!dbus_pending_call_set_notify(pending_call,
+					  on_transport_volume_set,
+					  NULL, NULL)) {
+		dbus_pending_call_cancel(pending_call);
+		dbus_pending_call_unref(pending_call);
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 int cras_bt_transport_acquire(struct cras_bt_transport *transport)
@@ -453,9 +515,30 @@ int cras_bt_transport_try_acquire(struct cras_bt_transport *transport)
 	return 0;
 }
 
-int cras_bt_transport_release(struct cras_bt_transport *transport)
+/* Callback to trigger when transport release completed. */
+static void cras_bt_on_transport_release(DBusPendingCall *pending_call,
+					 void *data)
+{
+	DBusMessage *reply;
+
+	reply = dbus_pending_call_steal_reply(pending_call);
+	dbus_pending_call_unref(pending_call);
+
+	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+		syslog(LOG_WARNING, "Release transport returned error: %s",
+		       dbus_message_get_error_name(reply));
+		dbus_message_unref(reply);
+		return;
+	}
+
+	dbus_message_unref(reply);
+}
+
+int cras_bt_transport_release(struct cras_bt_transport *transport,
+			      unsigned int blocking)
 {
 	DBusMessage *method_call, *reply;
+	DBusPendingCall *pending_call;
 	DBusError dbus_error;
 
 	if (transport->fd < 0)
@@ -475,30 +558,53 @@ int cras_bt_transport_release(struct cras_bt_transport *transport)
 	if (!method_call)
 		return -ENOMEM;
 
-	dbus_error_init(&dbus_error);
+	if (blocking) {
+		dbus_error_init(&dbus_error);
 
-	reply = dbus_connection_send_with_reply_and_block(
-		transport->conn,
-		method_call,
-		DBUS_TIMEOUT_USE_DEFAULT,
-		&dbus_error);
-	if (!reply) {
-		syslog(LOG_ERR, "Failed to release transport %s: %s",
-		       transport->object_path, dbus_error.message);
-		dbus_error_free(&dbus_error);
+		reply = dbus_connection_send_with_reply_and_block(
+			transport->conn,
+			method_call,
+			DBUS_TIMEOUT_USE_DEFAULT,
+			&dbus_error);
+		if (!reply) {
+			syslog(LOG_ERR, "Failed to release transport %s: %s",
+			       transport->object_path, dbus_error.message);
+			dbus_error_free(&dbus_error);
+			dbus_message_unref(method_call);
+			return -EIO;
+		}
+
 		dbus_message_unref(method_call);
-		return -EIO;
-	}
 
-	dbus_message_unref(method_call);
+		if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+			syslog(LOG_ERR, "Release returned error: %s",
+			       dbus_message_get_error_name(reply));
+			dbus_message_unref(reply);
+			return -EIO;
+		}
 
-	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
-		syslog(LOG_ERR, "Release returned error: %s",
-		       dbus_message_get_error_name(reply));
 		dbus_message_unref(reply);
-		return -EIO;
-	}
+	} else {
+		if (!dbus_connection_send_with_reply(
+				transport->conn,
+				method_call,
+				&pending_call,
+				DBUS_TIMEOUT_USE_DEFAULT)) {
+			dbus_message_unref(method_call);
+			return -ENOMEM;
+		}
 
-	dbus_message_unref(reply);
+		dbus_message_unref(method_call);
+		if (!pending_call)
+			return -EIO;
+
+		if (!dbus_pending_call_set_notify(pending_call,
+						  cras_bt_on_transport_release,
+						  transport, NULL)) {
+			dbus_pending_call_cancel(pending_call);
+			dbus_pending_call_unref(pending_call);
+			return -ENOMEM;
+		}
+	}
 	return 0;
 }

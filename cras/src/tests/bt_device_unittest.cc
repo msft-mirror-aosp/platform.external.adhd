@@ -44,26 +44,20 @@ class BtDeviceTestSuite : public testing::Test {
     virtual void SetUp() {
       ResetStubData();
       bt_iodev1.direction = CRAS_STREAM_OUTPUT;
-      bt_iodev1.is_open = is_open;
       bt_iodev1.update_active_node = update_active_node;
       bt_iodev2.direction = CRAS_STREAM_INPUT;
-      bt_iodev2.is_open = is_open;
       bt_iodev2.update_active_node = update_active_node;
       d1_.direction = CRAS_STREAM_OUTPUT;
-      d1_.is_open = is_open;
       d1_.update_active_node = update_active_node;
       d2_.direction = CRAS_STREAM_OUTPUT;
-      d2_.is_open = is_open;
       d2_.update_active_node = update_active_node;
       d3_.direction = CRAS_STREAM_INPUT;
-      d3_.is_open = is_open;
       d3_.update_active_node = update_active_node;
     }
-    static int is_open(const cras_iodev* iodev) {
-      return is_open_;
-    }
+
     static void update_active_node(struct cras_iodev *iodev,
-                                   unsigned node_idx) {
+                                   unsigned node_idx,
+                                   unsigned dev_enabled) {
     }
 
     struct cras_iodev bt_iodev1;
@@ -71,15 +65,12 @@ class BtDeviceTestSuite : public testing::Test {
     struct cras_iodev d3_;
     struct cras_iodev d2_;
     struct cras_iodev d1_;
-    static int is_open_;
 };
-
-int BtDeviceTestSuite::is_open_;
 
 TEST(BtDeviceSuite, CreateBtDevice) {
   struct cras_bt_device *device;
 
-  device = cras_bt_device_create(FAKE_OBJ_PATH);
+  device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void *)NULL, device);
 
   device = cras_bt_device_get(FAKE_OBJ_PATH);
@@ -92,7 +83,7 @@ TEST(BtDeviceSuite, CreateBtDevice) {
 
 TEST_F(BtDeviceTestSuite, AppendRmIodev) {
   struct cras_bt_device *device;
-  device = cras_bt_device_create(FAKE_OBJ_PATH);
+  device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   bt_iodev1.nodes = reinterpret_cast<struct cras_ionode*>(0x123);
   cras_bt_io_create_profile_ret = &bt_iodev1;
   cras_bt_device_append_iodev(device, &d1_,
@@ -132,7 +123,7 @@ TEST_F(BtDeviceTestSuite, SwitchProfile) {
   struct cras_bt_device *device;
 
   ResetStubData();
-  device = cras_bt_device_create(FAKE_OBJ_PATH);
+  device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   cras_bt_io_create_profile_ret = &bt_iodev1;
   cras_bt_device_append_iodev(device, &d1_,
       CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
@@ -141,7 +132,7 @@ TEST_F(BtDeviceTestSuite, SwitchProfile) {
       CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY);
 
   cras_bt_device_start_monitor();
-  cras_bt_device_switch_profile_on_open(device, &bt_iodev1);
+  cras_bt_device_switch_profile_enable_dev(device, &bt_iodev1);
 
   /* Two bt iodevs were all active. */
   cras_main_message_add_handler_callback(
@@ -149,13 +140,13 @@ TEST_F(BtDeviceTestSuite, SwitchProfile) {
       cras_main_message_add_handler_callback_data);
 
   /* One bt iodev was active, the other was not. */
-  cras_bt_device_switch_profile_on_open(device, &bt_iodev2);
+  cras_bt_device_switch_profile_enable_dev(device, &bt_iodev2);
   cras_main_message_add_handler_callback(
       cras_main_message_send_msg,
       cras_main_message_add_handler_callback_data);
 
   /* Output bt iodev wasn't active, close the active input iodev. */
-  cras_bt_device_switch_profile_on_close(device, &bt_iodev2);
+  cras_bt_device_switch_profile(device, &bt_iodev2);
   cras_main_message_add_handler_callback(
       cras_main_message_send_msg,
       cras_main_message_add_handler_callback_data);
@@ -240,6 +231,27 @@ struct hfp_slc_handle *cras_hfp_ag_get_slc(struct cras_bt_device *device)
   return NULL;
 }
 
+void cras_hfp_ag_suspend_connected_device(struct cras_bt_device *device)
+{
+}
+
+void cras_a2dp_suspend_connected_device(struct cras_bt_device *device)
+{
+}
+
+void cras_a2dp_start(struct cras_bt_device *device)
+{
+}
+
+int cras_hfp_ag_start(struct cras_bt_device *device)
+{
+  return 0;
+}
+
+void cras_hfp_ag_suspend()
+{
+}
+
 /* From hfp_slc */
 int hfp_event_speaker_gain(struct hfp_slc_handle *handle, int gain)
 {
@@ -256,7 +268,7 @@ int cras_iodev_close(struct cras_iodev *dev) {
   return 0;
 }
 
-int cras_iodev_list_dev_is_enabled(struct cras_iodev *dev)
+int cras_iodev_list_dev_is_enabled(const struct cras_iodev *dev)
 {
   return 0;
 }
@@ -266,6 +278,10 @@ void cras_iodev_list_disable_dev(struct cras_iodev *dev)
 }
 
 void cras_iodev_list_enable_dev(struct cras_iodev *dev)
+{
+}
+
+void cras_iodev_list_notify_node_volume(struct cras_ionode *node)
 {
 }
 
@@ -291,6 +307,15 @@ struct cras_tm *cras_system_state_get_tm()
 }
 
 /* From cras_tm */
+struct cras_timer *cras_tm_create_timer(
+    struct cras_tm *tm,
+    unsigned int ms,
+    void (*cb)(struct cras_timer *t, void *data),
+    void *cb_data)
+{
+  return NULL;
+}
+
 void cras_tm_cancel_timer(struct cras_tm *tm, struct cras_timer *t)
 {
 }

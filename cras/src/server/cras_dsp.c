@@ -45,6 +45,7 @@ static void initialize_environment(struct cras_expr_env *env)
 	cras_expr_env_set_variable_boolean(env, "disable_eq", 0);
 	cras_expr_env_set_variable_boolean(env, "disable_drc", 0);
 	cras_expr_env_set_variable_string(env, "dsp_name", "");
+	cras_expr_env_set_variable_boolean(env, "swap_lr_disabled", 1);
 }
 
 static struct pipeline *prepare_pipeline(struct cras_dsp_context *ctx)
@@ -58,9 +59,9 @@ static struct pipeline *prepare_pipeline(struct cras_dsp_context *ctx)
 	pipeline = cras_dsp_pipeline_create(ini, &ctx->env, purpose);
 
 	if (pipeline) {
-		syslog(LOG_ERR, "pipeline created");
+		syslog(LOG_DEBUG, "pipeline created");
 	} else {
-		syslog(LOG_ERR, "cannot create pipeline");
+		syslog(LOG_DEBUG, "cannot create pipeline");
 		goto bail;
 	}
 
@@ -170,10 +171,17 @@ void cras_dsp_context_free(struct cras_dsp_context *ctx)
 	free(ctx);
 }
 
-void cras_dsp_set_variable(struct cras_dsp_context *ctx, const char *key,
+void cras_dsp_set_variable_string(struct cras_dsp_context *ctx, const char *key,
 			   const char *value)
 {
 	cras_expr_env_set_variable_string(&ctx->env, key, value);
+}
+
+void cras_dsp_set_variable_boolean(struct cras_dsp_context *ctx,
+				   const char *key,
+				   char value)
+{
+	cras_expr_env_set_variable_boolean(&ctx->env, key, value);
 }
 
 void cras_dsp_load_pipeline(struct cras_dsp_context *ctx)

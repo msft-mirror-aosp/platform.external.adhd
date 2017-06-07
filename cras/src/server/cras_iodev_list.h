@@ -11,7 +11,6 @@
 
 #include <stdint.h>
 
-#include "cras_alert.h"
 #include "cras_types.h"
 
 struct cras_iodev;
@@ -21,9 +20,6 @@ struct cras_rclient;
 struct cras_rstream;
 struct cras_audio_format;
 struct stream_list;
-
-typedef void (*node_volume_callback_t)(cras_node_id_t, int);
-typedef void (*node_left_right_swapped_callback_t)(cras_node_id_t, int);
 
 /* Device enabled/disabled callback.
  * enabled=1 when a device is enabled, enabled=0 when a device is disabled.
@@ -117,41 +113,23 @@ void cras_iodev_list_update_device_list();
 /* Stores the node list in the shared memory server state region. */
 void cras_iodev_list_update_node_list();
 
-/* Adds a callback to call when the nodes are added/removed.
- * Args:
- *    cb - Function to call when there is a change.
- *    arg - Value to pass back to callback.
- */
-int cras_iodev_list_register_nodes_changed_cb(cras_alert_cb cb, void *arg);
+/* Gets the supported hotword models of an ionode. Caller should free
+ * the returned string after use. */
+char *cras_iodev_list_get_hotword_models(cras_node_id_t node_id);
 
-/* Removes a callback to call when the nodes are added/removed.
- * Args:
- *    cb - Function to call when there is a change.
- *    arg - Value to pass back to callback.
- */
-int cras_iodev_list_remove_nodes_changed_cb(cras_alert_cb cb, void *arg);
+/* Sets the desired hotword model to an ionode. */
+int cras_iodev_list_set_hotword_model(cras_node_id_t id,
+				      const char *model_name);
 
 /* Notify that nodes are added/removed. */
 void cras_iodev_list_notify_nodes_changed();
 
-/* Adds a callback to call when the active output/input node changes.
+/* Notify that active node is changed for the given direction.
  * Args:
- *    cb - Function to call when there is a change.
- *    arg - Value to pass back to callback.
+ *    direction - Direction of the node.
  */
-int cras_iodev_list_register_active_node_changed_cb(cras_alert_cb cb,
-						    void *arg);
-
-/* Removes a callback to call when the active output/input node changes.
- * Args:
- *    cb - Function to call when there is a change.
- *    arg - Value to pass back to callback.
- */
-int cras_iodev_list_remove_active_node_changed_cb(cras_alert_cb cb,
-						  void *arg);
-
-/* Notify that active output/input node is changed. */
-void cras_iodev_list_notify_active_node_changed();
+void cras_iodev_list_notify_active_node_changed(
+		enum CRAS_STREAM_DIRECTION direction);
 
 /* Sets an attribute of an ionode on a device.
  * Args:
@@ -173,7 +151,7 @@ void cras_iodev_list_select_node(enum CRAS_STREAM_DIRECTION direction,
 				 cras_node_id_t node_id);
 
 /* Checks if an iodev is enabled. */
-int cras_iodev_list_dev_is_enabled(struct cras_iodev *dev);
+int cras_iodev_list_dev_is_enabled(const struct cras_iodev *dev);
 
 /* Enables an iodev. If the fallback device was already enabled, this
  * call will disable it. */
@@ -202,20 +180,11 @@ void cras_iodev_list_rm_active_node(enum CRAS_STREAM_DIRECTION direction,
 /* Returns 1 if the node is selected, 0 otherwise. */
 int cras_iodev_list_node_selected(struct cras_ionode *node);
 
-/* Sets the function to call when a node volume changes. */
-void cras_iodev_list_set_node_volume_callbacks(node_volume_callback_t volume_cb,
-					       node_volume_callback_t gain_cb);
-
 /* Notify the current volume of the given node. */
 void cras_iodev_list_notify_node_volume(struct cras_ionode *node);
 
 /* Notify the current capture gain of the given node. */
 void cras_iodev_list_notify_node_capture_gain(struct cras_ionode *node);
-
-/* Sets the function to call when a node's left right channel swapping state
- * is changes. */
-void cras_iodev_list_set_node_left_right_swapped_callbacks(
-				node_left_right_swapped_callback_t swapped_cb);
 
 /* Notify the current left right channel swapping state of the given node. */
 void cras_iodev_list_notify_node_left_right_swapped(struct cras_ionode *node);

@@ -9,6 +9,8 @@
 #include <alsa/asoundlib.h>
 #include <iniparser.h>
 
+#include "cras_types.h"
+
 /* cras_alsa_mixer represents the alsa mixer interface for an alsa card.  It
  * houses the volume and mute controls as well as playback switches for
  * headphones and mic.
@@ -18,26 +20,43 @@ struct mixer_control;
 struct cras_alsa_mixer;
 struct cras_volume_curve;
 struct cras_card_config;
+struct mixer_name;
+struct ucm_section;
 
 /* Creates a cras_alsa_mixer instance for the given alsa device.
  * Args:
  *    card_name - Name of the card to open a mixer for.  This is an alsa name of
  *      the form "hw:X" where X ranges from 0 to 31 inclusive.
- *    config - Config info for this card, can be NULL if none found.
- *    output_names_extra - An array of extra output mixer control names. The
- *      array may contain NULL entries which should be ignored.
- *    output_names_extra_size - The length of the output_names_extra array.
- *    extra_main_volume - Name of extra main volume if any.
  * Returns:
  *    A pointer to the newly created cras_alsa_mixer which must later be freed
- *    by calling cras_alsa_mixer_destroy.
+ *    by calling cras_alsa_mixer_destroy. The control in the mixer is not added
+ *    yet.
  */
-struct cras_alsa_mixer *cras_alsa_mixer_create(
-		const char *card_name,
-		const struct cras_card_config *config,
-		const char *output_names_extra[],
-		size_t output_names_extra_size,
-		const char *extra_main_volume);
+struct cras_alsa_mixer *cras_alsa_mixer_create(const char *card_name);
+
+/* Adds controls to a cras_alsa_mixer from the given UCM section.
+ * Args:
+ *    cmix - A pointer to cras_alsa_mixer.
+ *    section - A UCM section.
+ * Returns:
+ *    0 on success. Negative error code otherwise.
+ */
+int cras_alsa_mixer_add_controls_in_section(
+		struct cras_alsa_mixer *cmix,
+		struct ucm_section *section);
+
+/* Adds controls to a cras_alsa_mixer instance by name matching.
+ * Args:
+ *    cmix - A pointer to cras_alsa_mixer.
+ *    extra_controls - A list array of extra mixer control names, always added.
+ *    coupled_controls - A list of coupled mixer control names.
+ * Returns:
+ *    0 on success. Other error code if error happens.
+ */
+int cras_alsa_mixer_add_controls_by_name_matching(
+		struct cras_alsa_mixer *cmix,
+		struct mixer_name *extra_controls,
+		struct mixer_name *coupled_controls);
 
 /* Destroys a cras_alsa_mixer that was returned from cras_alsa_mixer_create.
  * Args:
@@ -46,11 +65,11 @@ struct cras_alsa_mixer *cras_alsa_mixer_create(
  */
 void cras_alsa_mixer_destroy(struct cras_alsa_mixer *cras_mixer);
 
-/* Gets the default volume curve for this mixer.  This curve will be used if
- * there is not output-node specific curve to use.
- */
-const struct cras_volume_curve *cras_alsa_mixer_default_volume_curve(
-		const struct cras_alsa_mixer *mixer);
+/* Returns if the mixer has any main volume control. */
+int cras_alsa_mixer_has_main_volume(const struct cras_alsa_mixer *cras_mixer);
+
+/* Returns if the mixer control supports volume adjust. */
+int cras_alsa_mixer_has_volume(const struct mixer_control *mixer_control);
 
 /* Sets the output volume for the device associated with this mixer.
  * Args:
@@ -114,9 +133,10 @@ long cras_alsa_mixer_get_maximum_capture_gain(
 
 /* Sets the playback switch for the device.
  * Args:
- *    cras_mixer - Mixer to set the volume in.
+ *    cras_mixer - Mixer to set the playback switch.
  *    muted - 1 if muted, 0 if not.
- *    mixer_output - The mixer output to mute if no master mute.
+ *    mixer_output - The output specific mixer control to mute/unmute. Pass NULL
+ *                   to skip it.
  */
 void cras_alsa_mixer_set_mute(struct cras_alsa_mixer *cras_mixer,
 			      int muted,
@@ -154,6 +174,35 @@ void cras_alsa_mixer_list_inputs(struct cras_alsa_mixer *cras_mixer,
 const char *cras_alsa_mixer_get_control_name(
 		const struct mixer_control *control);
 
+/* Returns the mixer control matching the given direction and name.
+ * Args:
+ *    cras_mixer - Mixer to search for a control.
+ *    dir - Control's direction (OUTPUT or INPUT).
+ *    name - Name to search for.
+ *    create_missing - When non-zero, attempt to create a new control with
+ *		       the given name.
+ * Returns:
+ *    A pointer to the matching mixer control, or NULL if none found.
+ */
+struct mixer_control *cras_alsa_mixer_get_control_matching_name(
+		struct cras_alsa_mixer *cras_mixer,
+		enum CRAS_STREAM_DIRECTION dir, const char *name,
+		int create_missing);
+
+/* Returns the mixer control associated with the given section.
+ * The control is the one that matches 'mixer_name', or if that is not defined
+ * then it will be the control matching 'section->name', based on the
+ * coupled mixer controls.
+ * Args:
+ *    cras_mixer - Mixer to search for a control.
+ *    section - Associated UCM section.
+ * Returns:
+ *    A pointer to the associated mixer control, or NULL if none found.
+ */
+struct mixer_control *cras_alsa_mixer_get_control_for_section(
+		struct cras_alsa_mixer *cras_mixer,
+		const struct ucm_section *section);
+
 /* Finds the output that matches the given string.  Used to match Jacks to Mixer
  * elements.
  * Args:
@@ -163,7 +212,7 @@ const char *cras_alsa_mixer_get_control_name(
  *    A pointer to the output with a mixer control that matches "name".
  */
 struct mixer_control *cras_alsa_mixer_get_output_matching_name(
-		const struct cras_alsa_mixer *cras_mixer,
+		struct cras_alsa_mixer *cras_mixer,
 		const char *name);
 
 /* Finds the mixer control for that matches the control name of input control
@@ -182,17 +231,5 @@ struct mixer_control *cras_alsa_mixer_get_input_matching_name(
 int cras_alsa_mixer_set_output_active_state(
 		struct mixer_control *output,
 		int active);
-
-/* Returns a volume curve for the given output node name.  The name can be that
- * of a control or of a Jack.  Looks for an entry in the ini file (See README
- * for format), or falls back to the default volume curve if the ini file
- * doesn't specify a curve for this output. */
-struct cras_volume_curve *cras_alsa_mixer_create_volume_curve_for_name(
-		const struct cras_alsa_mixer *cmix,
-		const char *name);
-
-/* Returns a volume curve stored in the output control element, can be null. */
-struct cras_volume_curve *cras_alsa_mixer_get_output_volume_curve(
-		const struct mixer_control *control);
 
 #endif /* _CRAS_ALSA_MIXER_H */

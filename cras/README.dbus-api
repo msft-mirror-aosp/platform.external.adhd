@@ -96,6 +96,10 @@ Methods		void SetOutputVolume(int32 volume)
 				uint64 StableDeviceId
 					The stable ID does not change due to
 					device plug/unplug or reboot.
+				uint64 StableDeviceIdNew
+					The new stable ID. Keeping both stable
+					ID and stable ID new is for backward
+					compatibility.
 				boolean Active
 					Whether this node is currently used
 					for output/input. There is one active
@@ -107,6 +111,12 @@ Methods		void SetOutputVolume(int32 volume)
 				string MicPositions
 					The string formed by floating numbers
 					describing the position of mic array.
+				string HotwordModels
+					A string of comma-separated hotword
+					language model locales supported by this
+					node. e.g. "en_au,en_gb,en_us"
+					The string is empty if the node type is
+					not HOTWORD.
 
 		void SetActiveOutputNode(uint64 node_id);
 
@@ -134,6 +144,28 @@ Methods		void SetOutputVolume(int32 volume)
 		int32 GetNumberOfActiveOutputStreams()
 
 			Returns the number of streams currently using output hardware.
+
+		void SetGlobalOutputChannelRemix(int32 num_channels,
+						 array:double coefficient)
+
+			Sets the conversion matrix for global output channel
+			remixing. The coefficient array represents an N * N
+			conversion matrix M, where N is num_channels, with
+			M[i][j] = coefficient[i * N + j].
+			The remix is done by multiplying the conversion matrix
+			to each N-channel PCM data, i.e M * [L, R] = [L', R']
+			For example, coefficient [0.1, 0.9, 0.4, 0.6] will
+			result in:
+			L' = 0.1 * L + 0.9 * R
+			R' = 0.4 * L + 0.6 * R
+
+		int32 SetHotwordModel(uint64_t node_id, string model_name)
+
+			Set the hotword language model on the specified node.
+			The node must have type HOTWORD and the model_name must
+			be one of the supported locales returned by
+			GetNodes() HotwordModels string.
+			Returns 0 on success, or a negative errno on failure.
 
 Signals		OutputVolumeChanged(int32 volume)
 

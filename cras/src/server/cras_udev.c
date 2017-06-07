@@ -252,24 +252,33 @@ static void fill_usb_card_info(struct cras_alsa_card_info *card_info,
 			       struct udev_device *dev)
 {
 	const char *sysattr;
-	dev = udev_device_get_parent_with_subsystem_devtype(dev,
-							    "usb",
-							    "usb_device");
-	if (!dev)
+	struct udev_device *parent_dev =
+		udev_device_get_parent_with_subsystem_devtype(dev,
+							      "usb",
+							      "usb_device");
+	if (!parent_dev)
 		return;
 
-	sysattr = udev_device_get_sysattr_value(dev, "idVendor");
+	sysattr = udev_device_get_sysattr_value(parent_dev, "idVendor");
 	if (sysattr)
 		card_info->usb_vendor_id = strtol(sysattr, NULL, 16);
-	sysattr = udev_device_get_sysattr_value(dev, "idProduct");
+	sysattr = udev_device_get_sysattr_value(parent_dev, "idProduct");
 	if (sysattr)
 		card_info->usb_product_id = strtol(sysattr, NULL, 16);
+	sysattr = udev_device_get_sysattr_value(parent_dev, "serial");
+	if (sysattr) {
+		strncpy(card_info->usb_serial_number, sysattr,
+			USB_SERIAL_NUMBER_BUFFER_SIZE - 1);
+		card_info->usb_serial_number[USB_SERIAL_NUMBER_BUFFER_SIZE - 1]
+			= '\0';
+	}
 
-	card_info->usb_desc_checksum = calculate_desc_checksum(dev);
+	card_info->usb_desc_checksum = calculate_desc_checksum(parent_dev);
 
-	syslog(LOG_ERR, "USB card: vendor:%04x, product:%04x, checksum:%08x",
+	syslog(LOG_ERR, "USB card: vendor:%04x, product:%04x, serial num:%s, "
+	       "checksum:%08x",
 		card_info->usb_vendor_id, card_info->usb_product_id,
-		card_info->usb_desc_checksum);
+		card_info->usb_serial_number, card_info->usb_desc_checksum);
 }
 
 static void device_add_alsa(struct udev_device *dev,
@@ -278,6 +287,7 @@ static void device_add_alsa(struct udev_device *dev,
 			    unsigned internal)
 {
 	struct cras_alsa_card_info card_info;
+	memset(&card_info, 0, sizeof(card_info));
 
 	udev_delay_for_alsa();
 	card_info.card_index = card;
