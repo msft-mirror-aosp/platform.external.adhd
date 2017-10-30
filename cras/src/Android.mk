@@ -20,7 +20,12 @@ LOCAL_C_INCLUDES += \
 	external/tinyalsa/include
 
 LOCAL_CFLAGS += \
-	-DCRAS_SOCKET_FILE_DIR=\"/var/run/cras\"
+	-DCRAS_SOCKET_FILE_DIR=\"/var/run/cras\" \
+	-Wall \
+	-Werror \
+	-Wno-error=missing-field-initializers \
+	-Wno-sign-compare \
+	-Wno-unused-parameter \
 
 LOCAL_MODULE := libcras
 
