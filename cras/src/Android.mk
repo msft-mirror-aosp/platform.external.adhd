@@ -14,9 +14,6 @@ LOCAL_SRC_FILES := \
 LOCAL_SHARED_LIBRARIES := \
 	libtinyalsa
 
-LOCAL_HEADER_LIBRARIES := \
-     android.hardware.audio.common.legacy@2.0 \
-
 LOCAL_C_INCLUDES += \
 	$(LOCAL_PATH)/common \
 	$(LOCAL_PATH)/libcras \
