@@ -34,12 +34,15 @@
 #include "cras_telephony.h"
 #endif
 #include "cras_alert.h"
+#include "cras_audio_thread_monitor.h"
 #include "cras_config.h"
 #include "cras_device_monitor.h"
+#include "cras_hotword_handler.h"
 #include "cras_iodev_list.h"
 #include "cras_main_message.h"
 #include "cras_messages.h"
 #include "cras_metrics.h"
+#include "cras_non_empty_audio_handler.h"
 #include "cras_observer.h"
 #include "cras_rclient.h"
 #include "cras_server.h"
@@ -114,18 +117,15 @@ static void remove_client(struct attached_client *client)
 static void handle_message_from_client(struct attached_client *client)
 {
 	uint8_t buf[CRAS_SERV_MAX_MSG_SIZE];
-	struct cras_server_message *msg;
 	int nread;
 	int fd;
 	unsigned int num_fds = 1;
 
-	msg = (struct cras_server_message *)buf;
 	nread = cras_recv_with_fds(client->fd, buf, sizeof(buf), &fd, &num_fds);
-	if (nread < sizeof(msg->length))
+        if (nread < 0)
+                goto read_error;
+        if (cras_rclient_buffer_from_client(client->client, buf, nread, fd) < 0)
 		goto read_error;
-	if (msg->length != nread)
-		goto read_error;
-	cras_rclient_message_from_client(client->client, msg, fd);
 	return;
 
 read_error:
@@ -426,6 +426,12 @@ int cras_server_run(unsigned int profile_disable_mask)
 	cras_server_metrics_init();
 
 	cras_device_monitor_init();
+
+	cras_hotword_handler_init();
+
+	cras_non_empty_audio_handler_init();
+
+	cras_audio_thread_monitor_init();
 
 #ifdef CRAS_DBUS
 	dbus_threads_init_default();

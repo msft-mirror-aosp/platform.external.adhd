@@ -31,8 +31,18 @@ struct cras_tm;
  *
  * Args:
  *    device_config_dir - Directory for device configs where volume curves live.
+ *    shm_name - Name of the shared memory region used to store the state.
+ *    rw_shm_fd - FD of the shm region.
+ *    ro_shm_fd - FD of the shm region opened RO for sharing with clients.
+ *    exp_state - Shared memory region for storing state.
+ *    exp_state_size - Size of |exp_state|.
  */
-void cras_system_state_init(const char *device_config_dir);
+void cras_system_state_init(const char *device_config_dir,
+                            const char *shm_name,
+                            int rw_shm_fd,
+                            int ro_shm_fd,
+                            struct cras_server_state *exp_state,
+                            size_t exp_state_size);
 void cras_system_state_deinit();
 
 /* Sets the suffix string to control which UCM config fo load. */
@@ -106,6 +116,12 @@ void cras_system_set_capture_gain_limits(long min, long max);
 long cras_system_get_min_capture_gain();
 /* Returns the min value allowed for capture gain in dB * 100. */
 long cras_system_get_max_capture_gain();
+
+/* Returns the default value of output buffer size in frames. */
+int cras_system_get_default_output_buffer_size();
+
+/* Returns if system aec is supported. */
+int cras_system_get_aec_supported();
 
 /* Adds a card at the given index to the system.  When a new card is found
  * (through a udev event notification) this will add the card to the system,
@@ -238,6 +254,16 @@ int cras_system_state_get_output_nodes(const struct cras_ionode_info **nodes);
  */
 int cras_system_state_get_input_nodes(const struct cras_ionode_info **nodes);
 
+/*
+ * Sets the non-empty audio status.
+ */
+void cras_system_state_set_non_empty_status(int non_empty);
+
+/*
+ * Returns the non-empty audio status.
+ */
+int cras_system_state_get_non_empty_status();
+
 /* Returns a pointer to the current system state that is shared with clients.
  * This also 'locks' the structure by incrementing the update count to an odd
  * value.
@@ -258,5 +284,15 @@ key_t cras_sys_state_shm_fd();
 
 /* Returns the timer manager. */
 struct cras_tm *cras_system_state_get_tm();
+
+/*
+ * Add snapshot to snapshot buffer in system state
+ */
+void cras_system_state_add_snapshot(struct cras_audio_thread_snapshot *);
+
+/*
+ * Dump snapshots from system state to shared memory with client
+ */
+void cras_system_state_dump_snapshots();
 
 #endif /* CRAS_SYSTEM_STATE_H_ */

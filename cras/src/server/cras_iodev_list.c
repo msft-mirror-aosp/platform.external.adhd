@@ -42,6 +42,13 @@ struct enabled_dev {
 	struct enabled_dev *prev, *next;
 };
 
+struct device_enabled_cb {
+	device_enabled_callback_t enabled_cb;
+	device_disabled_callback_t disabled_cb;
+	void *cb_data;
+	struct device_enabled_cb *next, *prev;
+};
+
 /* Lists for devs[CRAS_STREAM_INPUT] and devs[CRAS_STREAM_OUTPUT]. */
 static struct iodev_list devs[CRAS_NUM_DIRECTIONS];
 /* The observer client iodev_list used to listen on various events. */
@@ -50,13 +57,18 @@ static struct cras_observer_client *list_observer;
 static struct enabled_dev *enabled_devs[CRAS_NUM_DIRECTIONS];
 /* Keep an empty device per direction. */
 static struct cras_iodev *fallback_devs[CRAS_NUM_DIRECTIONS];
+/* Special empty device for hotword streams. */
+static struct cras_iodev *empty_hotword_dev;
+/* Loopback devices. */
+static struct cras_iodev *loopdev_post_mix;
+static struct cras_iodev *loopdev_post_dsp;
 /* Keep a constantly increasing index for iodevs. Index 0 is reserved
  * to mean "no device". */
 static uint32_t next_iodev_idx = MAX_SPECIAL_DEVICE_IDX;
 
 /* Call when a device is enabled or disabled. */
-static device_enabled_callback_t device_enabled_callback;
-static void *device_enabled_cb_data;
+struct device_enabled_cb *device_enable_cbs;
+
 /* Thread that handles audio input and output. */
 static struct audio_thread *audio_thread;
 /* List of all streams. */
@@ -67,6 +79,8 @@ static struct cras_timer *idle_timer;
 static int stream_list_suspended = 0;
 /* If init device failed, retry after 1 second. */
 static const unsigned int INIT_DEV_DELAY_MS = 1000;
+/* Flag to indicate that hotword streams are suspended. */
+static int hotword_suspended = 0;
 
 static void idle_dev_check(struct cras_timer *timer, void *data);
 
@@ -350,23 +364,27 @@ static void sys_mute_change(void *context, int muted, int user_muted,
 	}
 }
 
-static int dev_has_pinned_stream(unsigned int dev_idx)
+static void remove_all_streams_from_dev(struct cras_iodev *dev)
 {
-	const struct cras_rstream *rstream;
+	struct cras_rstream *rstream;
+
+	audio_thread_rm_open_dev(audio_thread, dev);
 
 	DL_FOREACH(stream_list_get(stream_list), rstream) {
-		if (rstream->is_pinned && (rstream->pinned_dev_idx == dev_idx))
-			return 1;
+		if (rstream->apm_list == NULL)
+			continue;
+		cras_apm_list_remove(rstream->apm_list, dev);
 	}
-	return 0;
 }
 
 static void close_dev(struct cras_iodev *dev)
 {
-	if (!cras_iodev_is_open(dev) ||
-	    dev_has_pinned_stream(dev->info.idx))
-		return;
-	audio_thread_rm_open_dev(audio_thread, dev);
+	if (!cras_iodev_is_open(dev))
+	       return;
+	if (cras_iodev_has_pinned_stream(dev))
+		syslog(LOG_ERR, "Closing device with pinned streams.");
+
+	remove_all_streams_from_dev(dev);
 	dev->idle_timeout.tv_sec = 0;
 	cras_iodev_close(dev);
 	if (idle_timer)
@@ -390,7 +408,7 @@ static void idle_dev_check(struct cras_timer *timer, void *data)
 		if (edev->dev->idle_timeout.tv_sec == 0)
 			continue;
 		if (timespec_after(&now, &edev->dev->idle_timeout)) {
-			audio_thread_rm_open_dev(audio_thread, edev->dev);
+			remove_all_streams_from_dev(edev->dev);
 			edev->dev->idle_timeout.tv_sec = 0;
 			cras_iodev_close(edev->dev);
 			continue;
@@ -430,13 +448,7 @@ static int init_device(struct cras_iodev *dev,
 	if (cras_iodev_is_open(dev))
 		return 0;
 
-	if (dev->ext_format == NULL) {
-		rc = cras_iodev_set_format(dev, &rstream->format);
-		if (rc)
-			return rc;
-	}
-
-	rc = cras_iodev_open(dev, rstream->cb_threshold);
+	rc = cras_iodev_open(dev, rstream->cb_threshold, &rstream->format);
 	if (rc)
 		return rc;
 
@@ -454,6 +466,9 @@ static void suspend_devs()
 	DL_FOREACH(stream_list_get(stream_list), rstream) {
 		if (rstream->is_pinned) {
 			struct cras_iodev *dev;
+
+			if ((rstream->flags & HOTWORD_STREAM) == HOTWORD_STREAM)
+				continue;
 
 			dev = find_dev(rstream->pinned_dev_idx);
 			if (dev) {
@@ -484,8 +499,11 @@ static void resume_devs()
 	struct cras_rstream *rstream;
 
 	stream_list_suspended = 0;
-	DL_FOREACH(stream_list_get(stream_list), rstream)
+	DL_FOREACH(stream_list_get(stream_list), rstream) {
+		if ((rstream->flags & HOTWORD_STREAM) == HOTWORD_STREAM)
+			continue;
 		stream_added_cb(rstream);
+	}
 }
 
 /* Called when the system audio is suspended or resumed. */
@@ -521,7 +539,7 @@ static void sys_cap_mute_change(void *context, int muted, int mute_locked)
 	}
 }
 
-static int disable_device(struct enabled_dev *edev);
+static int disable_device(struct enabled_dev *edev, bool force);
 static int enable_device(struct cras_iodev *dev);
 
 static void possibly_disable_fallback(enum CRAS_STREAM_DIRECTION dir)
@@ -530,14 +548,36 @@ static void possibly_disable_fallback(enum CRAS_STREAM_DIRECTION dir)
 
 	DL_FOREACH(enabled_devs[dir], edev) {
 		if (edev->dev == fallback_devs[dir])
-			disable_device(edev);
+			disable_device(edev, false);
 	}
 }
 
 static void possibly_enable_fallback(enum CRAS_STREAM_DIRECTION dir)
 {
+	if (fallback_devs[dir] == NULL)
+		return;
 	if (!cras_iodev_list_dev_is_enabled(fallback_devs[dir]))
 		enable_device(fallback_devs[dir]);
+}
+
+/*
+ * Adds stream to one or more open iodevs. If the stream has processing effect
+ * turned on, create new APM instance and add to the list. This makes sure the
+ * time consuming APM creation happens in main thread.
+ */
+static int add_stream_to_open_devs(struct cras_rstream *stream,
+				    struct cras_iodev **iodevs,
+				    unsigned int num_iodevs)
+{
+	int i;
+	if (stream->apm_list) {
+		for (i = 0; i < num_iodevs; i++)
+			cras_apm_list_add(stream->apm_list,
+					  iodevs[i],
+					  iodevs[i]->ext_format);
+	}
+	return audio_thread_add_stream(audio_thread,
+				       stream, iodevs, num_iodevs);
 }
 
 static int init_and_attach_streams(struct cras_iodev *dev)
@@ -560,8 +600,7 @@ static int init_and_attach_streams(struct cras_iodev *dev)
 				       dev->info.name, rc);
 				return rc;
 			}
-			audio_thread_add_stream(audio_thread,
-						stream, &dev, 1);
+			add_stream_to_open_devs(stream, &dev, 1);
 		}
 	}
 	return 0;
@@ -593,15 +632,10 @@ static void schedule_init_device_retry(struct enabled_dev *edev)
 				tm, INIT_DEV_DELAY_MS, init_device_cb, edev);
 }
 
-static int pinned_stream_added(struct cras_rstream *rstream)
+static int init_pinned_device(struct cras_iodev *dev,
+			      struct cras_rstream *rstream)
 {
-	struct cras_iodev *dev;
 	int rc;
-
-	/* Check that the target device is valid for pinned streams. */
-	dev = find_dev(rstream->pinned_dev_idx);
-	if (!dev)
-		return -EINVAL;
 
 	/* Make sure the active node is configured properly, it could be
 	 * disabled when last normal stream removed. */
@@ -611,8 +645,52 @@ static int pinned_stream_added(struct cras_rstream *rstream)
 	rc = init_device(dev, rstream);
 	if (rc && (rc != -EAGAIN))
 		return rc;
+	return 0;
+}
 
-	return audio_thread_add_stream(audio_thread, rstream, &dev, 1);
+static int close_pinned_device(struct cras_iodev *dev)
+{
+	close_dev(dev);
+	dev->update_active_node(dev, dev->active_node->idx, 0);
+	return 0;
+}
+
+static struct cras_iodev *find_pinned_device(struct cras_rstream *rstream)
+{
+	struct cras_iodev *dev;
+	if (!rstream->is_pinned)
+		return NULL;
+
+	dev = find_dev(rstream->pinned_dev_idx);
+
+	if ((rstream->flags & HOTWORD_STREAM) != HOTWORD_STREAM)
+		return dev;
+
+	/* Double check node type for hotword stream */
+	if (dev && dev->active_node->type != CRAS_NODE_TYPE_HOTWORD) {
+		syslog(LOG_ERR, "Hotword stream pinned to invalid dev %u",
+		       dev->info.idx);
+		return NULL;
+	}
+
+	return hotword_suspended ? empty_hotword_dev : dev;
+}
+
+static int pinned_stream_added(struct cras_rstream *rstream)
+{
+	struct cras_iodev *dev;
+	int rc;
+
+	/* Check that the target device is valid for pinned streams. */
+	dev = find_pinned_device(rstream);
+	if (!dev)
+		return -EINVAL;
+
+	rc = init_pinned_device(dev, rstream);
+	if (rc)
+		return rc;
+
+	return add_stream_to_open_devs(rstream, &dev, 1);
 }
 
 static int stream_added_cb(struct cras_rstream *rstream)
@@ -651,8 +729,7 @@ static int stream_added_cb(struct cras_rstream *rstream)
 		iodevs[num_iodevs++] = edev->dev;
 	}
 	if (num_iodevs) {
-		rc = audio_thread_add_stream(audio_thread, rstream,
-					     iodevs, num_iodevs);
+		rc = add_stream_to_open_devs(rstream, iodevs, num_iodevs);
 		if (rc) {
 			syslog(LOG_ERR, "adding stream to thread fail");
 			return rc;
@@ -687,7 +764,7 @@ static int possibly_close_enabled_devs(enum CRAS_STREAM_DIRECTION dir)
 	/* No more default streams, close any device that doesn't have a stream
 	 * pinned to it. */
 	DL_FOREACH(enabled_devs[dir], edev) {
-		if (dev_has_pinned_stream(edev->dev->info.idx))
+		if (cras_iodev_has_pinned_stream(edev->dev))
 			continue;
 		if (dir == CRAS_STREAM_INPUT) {
 			close_dev(edev->dev);
@@ -706,11 +783,12 @@ static void pinned_stream_removed(struct cras_rstream *rstream)
 {
 	struct cras_iodev *dev;
 
-	dev = find_dev(rstream->pinned_dev_idx);
-	if (!cras_iodev_list_dev_is_enabled(dev)) {
-		close_dev(dev);
-		dev->update_active_node(dev, dev->active_node->idx, 0);
-	}
+	dev = find_pinned_device(rstream);
+	if (!dev)
+		return;
+	if (!cras_iodev_list_dev_is_enabled(dev) &&
+	    !cras_iodev_has_pinned_stream(dev))
+		close_pinned_device(dev);
 }
 
 /* Returns the number of milliseconds left to drain this stream.  This is passed
@@ -737,6 +815,7 @@ static int enable_device(struct cras_iodev *dev)
 	int rc;
 	struct enabled_dev *edev;
 	enum CRAS_STREAM_DIRECTION dir = dev->direction;
+	struct device_enabled_cb *callback;
 
 	DL_FOREACH(enabled_devs[dir], edev) {
 		if (edev->dev == dev)
@@ -755,17 +834,19 @@ static int enable_device(struct cras_iodev *dev)
 		return rc;
 	}
 
-	if (device_enabled_callback)
-		device_enabled_callback(dev, 1, device_enabled_cb_data);
+	DL_FOREACH(device_enable_cbs, callback)
+		callback->enabled_cb(dev, callback->cb_data);
 
 	return 0;
 }
 
-static int disable_device(struct enabled_dev *edev)
+/* Set `force to true to flush any pinned streams before closing the device. */
+static int disable_device(struct enabled_dev *edev, bool force)
 {
 	struct cras_iodev *dev = edev->dev;
 	enum CRAS_STREAM_DIRECTION dir = dev->direction;
 	struct cras_rstream *stream;
+	struct device_enabled_cb *callback;
 
 	DL_DELETE(enabled_devs[dir], edev);
 	if (edev->init_timer) {
@@ -776,17 +857,52 @@ static int disable_device(struct enabled_dev *edev)
 	free(edev);
 	dev->is_enabled = 0;
 
-	/* Pull all default streams off this device. */
+	/*
+	 * Pull all default streams off this device.
+	 * Pull all pinned streams off as well if force is true.
+	 */
 	DL_FOREACH(stream_list_get(stream_list), stream) {
-		if (stream->direction != dev->direction || stream->is_pinned)
+		if (stream->direction != dev->direction)
+			continue;
+		if (stream->is_pinned && !force)
 			continue;
 		audio_thread_disconnect_stream(audio_thread, stream, dev);
 	}
-	if (device_enabled_callback)
-		device_enabled_callback(dev, 0, device_enabled_cb_data);
+	if (cras_iodev_has_pinned_stream(dev))
+		return 0;
+	DL_FOREACH(device_enable_cbs, callback)
+		callback->disabled_cb(dev, callback->cb_data);
 	close_dev(dev);
 	dev->update_active_node(dev, dev->active_node->idx, 0);
 
+	return 0;
+}
+
+/*
+ * Assume the device is not in enabled_devs list.
+ * Assume there is no default stream on the device.
+ * An example is that this device is unplugged while it is playing
+ * a pinned stream. The device and stream may have been removed in
+ * audio thread due to I/O error handling.
+ */
+static int force_close_pinned_only_device(struct cras_iodev *dev)
+{
+	struct cras_rstream *rstream;
+
+	/* Pull pinned streams off this device. */
+	DL_FOREACH(stream_list_get(stream_list), rstream) {
+		if (rstream->direction != dev->direction)
+			continue;
+		if (!rstream->is_pinned)
+			continue;
+		if (dev->info.idx != rstream->pinned_dev_idx)
+			continue;
+		audio_thread_disconnect_stream(audio_thread, rstream, dev);
+	}
+	if (cras_iodev_has_pinned_stream(dev))
+		return -EEXIST;
+	close_dev(dev);
+	dev->update_active_node(dev, dev->active_node->idx, 0);
 	return 0;
 }
 
@@ -815,16 +931,22 @@ void cras_iodev_list_init()
 
 	/* Add an empty device so there is always something to play to or
 	 * capture from. */
-	fallback_devs[CRAS_STREAM_OUTPUT] =
-			empty_iodev_create(CRAS_STREAM_OUTPUT);
-	fallback_devs[CRAS_STREAM_INPUT] =
-			empty_iodev_create(CRAS_STREAM_INPUT);
+	fallback_devs[CRAS_STREAM_OUTPUT] = empty_iodev_create(
+			CRAS_STREAM_OUTPUT,
+			CRAS_NODE_TYPE_UNKNOWN);
+	fallback_devs[CRAS_STREAM_INPUT] = empty_iodev_create(
+			CRAS_STREAM_INPUT,
+			CRAS_NODE_TYPE_UNKNOWN);
 	enable_device(fallback_devs[CRAS_STREAM_OUTPUT]);
 	enable_device(fallback_devs[CRAS_STREAM_INPUT]);
 
+	empty_hotword_dev = empty_iodev_create(
+			CRAS_STREAM_INPUT,
+			CRAS_NODE_TYPE_HOTWORD);
+
 	/* Create loopback devices. */
-	loopback_iodev_create(LOOPBACK_POST_MIX_PRE_DSP);
-	loopback_iodev_create(LOOPBACK_POST_DSP);
+	loopdev_post_mix = loopback_iodev_create(LOOPBACK_POST_MIX_PRE_DSP);
+	loopdev_post_dsp = loopback_iodev_create(LOOPBACK_POST_DSP);
 
 	audio_thread = audio_thread_create();
 	if (!audio_thread) {
@@ -838,12 +960,17 @@ void cras_iodev_list_init()
 
 void cras_iodev_list_deinit()
 {
+	audio_thread_destroy(audio_thread);
+	loopback_iodev_destroy(loopdev_post_dsp);
+	loopback_iodev_destroy(loopdev_post_mix);
+	empty_iodev_destroy(empty_hotword_dev);
+	empty_iodev_destroy(fallback_devs[CRAS_STREAM_INPUT]);
+	empty_iodev_destroy(fallback_devs[CRAS_STREAM_OUTPUT]);
+	stream_list_destroy(stream_list);
 	if (list_observer) {
 		cras_observer_remove(list_observer);
 		list_observer = NULL;
 	}
-	audio_thread_destroy(audio_thread);
-	stream_list_destroy(stream_list);
 }
 
 int cras_iodev_list_dev_is_enabled(const struct cras_iodev *dev)
@@ -873,11 +1000,25 @@ void cras_iodev_list_add_active_node(enum CRAS_STREAM_DIRECTION dir,
 	if (!new_dev || new_dev->direction != dir)
 		return;
 
+	/* If the new dev is already enabled but its active node needs to be
+	 * changed. Disable new dev first, update active node, and then
+	 * re-enable it again.
+	 */
+	if (cras_iodev_list_dev_is_enabled(new_dev)) {
+		if (node_index_of(node_id) == new_dev->active_node->idx)
+			return;
+		else
+			cras_iodev_list_disable_dev(new_dev, true);
+	}
+
 	new_dev->update_active_node(new_dev, node_index_of(node_id), 1);
 	cras_iodev_list_enable_dev(new_dev);
 }
 
-void cras_iodev_list_disable_dev(struct cras_iodev *dev)
+/*
+ * Disables device which may or may not be in enabled_devs list.
+ */
+void cras_iodev_list_disable_dev(struct cras_iodev *dev, bool force_close)
 {
 	struct enabled_dev *edev, *edev_to_disable = NULL;
 
@@ -890,16 +1031,25 @@ void cras_iodev_list_disable_dev(struct cras_iodev *dev)
 			is_the_only_enabled_device = 0;
 	}
 
-	if (!edev_to_disable)
+	/*
+	 * Disables the device for these two cases:
+	 * 1. Disable a device in the enabled_devs list.
+	 * 2. Force close a device that is not in the enabled_devs list,
+	 *    but it is running a pinned stream.
+	 */
+	if (!edev_to_disable) {
+		if (force_close)
+			force_close_pinned_only_device(dev);
 		return;
+	}
 
 	/* If the device to be closed is the only enabled device, we should
 	 * enable the fallback device first then disable the target
 	 * device. */
-	if (is_the_only_enabled_device)
+	if (is_the_only_enabled_device && fallback_devs[dev->direction])
 		enable_device(fallback_devs[dev->direction]);
 
-	disable_device(edev_to_disable);
+	disable_device(edev_to_disable, force_close);
 
 	cras_iodev_list_notify_active_node_changed(dev->direction);
 	return;
@@ -914,7 +1064,7 @@ void cras_iodev_list_rm_active_node(enum CRAS_STREAM_DIRECTION dir,
 	if (!dev)
 		return;
 
-	cras_iodev_list_disable_dev(dev);
+	cras_iodev_list_disable_dev(dev, false);
 }
 
 int cras_iodev_list_add_output(struct cras_iodev *output)
@@ -952,7 +1102,7 @@ int cras_iodev_list_rm_output(struct cras_iodev *dev)
 	/* Retire the current active output device before removing it from
 	 * list, otherwise it could be busy and remain in the list.
 	 */
-	cras_iodev_list_disable_dev(dev);
+	cras_iodev_list_disable_dev(dev, true);
 	res = rm_dev_from_list(dev);
 	if (res == 0)
 		cras_iodev_list_update_device_list();
@@ -966,7 +1116,7 @@ int cras_iodev_list_rm_input(struct cras_iodev *dev)
 	/* Retire the current active input device before removing it from
 	 * list, otherwise it could be busy and remain in the list.
 	 */
-	cras_iodev_list_disable_dev(dev);
+	cras_iodev_list_disable_dev(dev, true);
 	res = rm_dev_from_list(dev);
 	if (res == 0)
 		cras_iodev_list_update_device_list();
@@ -1026,6 +1176,97 @@ void cras_iodev_list_update_device_list()
 						CRAS_MAX_IONODES);
 
 	cras_system_state_update_complete();
+}
+
+/* Look up the first hotword stream and the device it pins to. */
+int find_hotword_stream_dev(struct cras_iodev **dev,
+			    struct cras_rstream **stream)
+{
+	DL_FOREACH(stream_list_get(stream_list), *stream) {
+		if (((*stream)->flags & HOTWORD_STREAM) != HOTWORD_STREAM)
+			continue;
+
+		*dev = find_dev((*stream)->pinned_dev_idx);
+		if (*dev == NULL)
+			return -ENOENT;
+		break;
+	}
+	return 0;
+}
+
+/* Suspend/resume hotword streams functions are used to provide seamless
+ * experience to cras clients when there's hardware limitation about concurrent
+ * DSP and normal recording. The empty hotword iodev is used to hold all
+ * hotword streams during suspend, so client side will not know about the
+ * transition, and can still remove or add streams. At resume, the real hotword
+ * device will be initialized and opened again to re-arm the DSP.
+ */
+int cras_iodev_list_suspend_hotword_streams()
+{
+	struct cras_iodev *hotword_dev;
+	struct cras_rstream *stream = NULL;
+	int rc;
+
+	rc = find_hotword_stream_dev(&hotword_dev, &stream);
+	if (rc)
+		return rc;
+
+	if (stream == NULL) {
+		hotword_suspended = 1;
+		return 0;
+	}
+	/* Move all existing hotword streams to the empty hotword iodev. */
+	init_pinned_device(empty_hotword_dev, stream);
+	DL_FOREACH(stream_list_get(stream_list), stream) {
+		if ((stream->flags & HOTWORD_STREAM) != HOTWORD_STREAM)
+			continue;
+		if (stream->pinned_dev_idx != hotword_dev->info.idx) {
+			syslog(LOG_ERR,
+			       "Failed to suspend hotword stream on dev %u",
+				stream->pinned_dev_idx);
+			continue;
+		}
+
+		audio_thread_disconnect_stream(audio_thread, stream, hotword_dev);
+		audio_thread_add_stream(audio_thread, stream, &empty_hotword_dev, 1);
+	}
+	close_pinned_device(hotword_dev);
+	hotword_suspended = 1;
+	return 0;
+}
+
+int cras_iodev_list_resume_hotword_stream()
+{
+	struct cras_iodev *hotword_dev;
+	struct cras_rstream *stream = NULL;
+	int rc;
+
+	rc = find_hotword_stream_dev(&hotword_dev, &stream);
+	if (rc)
+		return rc;
+
+	if (stream == NULL) {
+		hotword_suspended = 0;
+		return 0;
+	}
+	/* Move all existing hotword streams to the real hotword iodev. */
+	init_pinned_device(hotword_dev, stream);
+	DL_FOREACH(stream_list_get(stream_list), stream) {
+		if ((stream->flags & HOTWORD_STREAM) != HOTWORD_STREAM)
+			continue;
+		if (stream->pinned_dev_idx != hotword_dev->info.idx) {
+			syslog(LOG_ERR,
+			       "Fail to resume hotword stream on dev %u",
+			       stream->pinned_dev_idx);
+			continue;
+		}
+
+		audio_thread_disconnect_stream(audio_thread, stream, empty_hotword_dev);
+		audio_thread_add_stream(audio_thread, stream, &hotword_dev, 1);
+	}
+	close_pinned_device(empty_hotword_dev);
+	hotword_suspended = 0;
+	return 0;
 }
 
 char *cras_iodev_list_get_hotword_models(cras_node_id_t node_id)
@@ -1112,7 +1353,7 @@ void cras_iodev_list_select_node(enum CRAS_STREAM_DIRECTION direction,
 	DL_FOREACH(enabled_devs[direction], edev) {
 		if (edev->dev != fallback_devs[direction] &&
 		    !(new_node_already_enabled && edev->dev == new_dev)) {
-			disable_device(edev);
+			disable_device(edev, false);
 		}
 	}
 
@@ -1197,22 +1438,29 @@ struct stream_list *cras_iodev_list_get_stream_list()
 }
 
 int cras_iodev_list_set_device_enabled_callback(
-		device_enabled_callback_t device_enabled_cb, void *cb_data)
+		device_enabled_callback_t enabled_cb,
+		device_disabled_callback_t disabled_cb,
+		void *cb_data)
 {
-	if (!device_enabled_cb) {
-		device_enabled_callback = NULL;
-		device_enabled_cb_data = NULL;
-		return 0;
+	struct device_enabled_cb *callback;
+
+	DL_FOREACH(device_enable_cbs, callback) {
+		if (callback->cb_data != cb_data)
+			continue;
+
+		DL_DELETE(device_enable_cbs, callback);
+		free(callback);
 	}
 
-	/* TODO(chinyue): Allow multiple callbacks to be registered. */
-	if (device_enabled_callback) {
-		syslog(LOG_ERR, "Device enabled callback already registered.");
-		return -EEXIST;
+	if (enabled_cb && disabled_cb) {
+		callback = (struct device_enabled_cb *)
+				calloc(1, sizeof(*callback));
+		callback->enabled_cb = enabled_cb;
+		callback->disabled_cb = disabled_cb;
+		callback->cb_data = cb_data;
+		DL_APPEND(device_enable_cbs, callback);
 	}
 
-	device_enabled_callback = device_enabled_cb;
-	device_enabled_cb_data = cb_data;
 	return 0;
 }
 
