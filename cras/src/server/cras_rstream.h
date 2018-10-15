@@ -264,8 +264,17 @@ static inline int stream_uses_input(const struct cras_rstream *s)
 	return cras_stream_uses_input_hw(s->direction);
 }
 
+static inline int stream_is_server_only(const struct cras_rstream *s)
+{
+	return s->flags & SERVER_ONLY;
+}
+
 /* Gets the enabled effects of this stream. */
 unsigned int cras_rstream_get_effects(const struct cras_rstream *stream);
+
+/* Gets the format of data after stream specific processing. */
+struct cras_audio_format *cras_rstream_post_processing_format(
+		const struct cras_rstream *stream, void *dev_ptr);
 
 /* Checks how much time has passed since last stream fetch and records
  * the longest fetch interval. */

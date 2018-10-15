@@ -17,6 +17,7 @@
 #include "cras_tm.h"
 #include "cras_types.h"
 #include "cras_system_state.h"
+#include "server_stream.h"
 #include "stream_list.h"
 #include "test_iodev.h"
 #include "utlist.h"
@@ -38,8 +39,13 @@ struct iodev_list {
  */
 struct enabled_dev {
 	struct cras_iodev *dev;
-	struct cras_timer *init_timer;
 	struct enabled_dev *prev, *next;
+};
+
+struct dev_init_retry {
+	int dev_idx;
+	struct cras_timer *init_timer;
+	struct dev_init_retry *next, *prev;
 };
 
 struct device_enabled_cb {
@@ -62,6 +68,9 @@ static struct cras_iodev *empty_hotword_dev;
 /* Loopback devices. */
 static struct cras_iodev *loopdev_post_mix;
 static struct cras_iodev *loopdev_post_dsp;
+/* List of pending device init retries. */
+static struct dev_init_retry *init_retries;
+
 /* Keep a constantly increasing index for iodevs. Index 0 is reserved
  * to mean "no device". */
 static uint32_t next_iodev_idx = MAX_SPECIAL_DEVICE_IDX;
@@ -377,16 +386,60 @@ static void remove_all_streams_from_dev(struct cras_iodev *dev)
 	}
 }
 
-static void close_dev(struct cras_iodev *dev)
+/*
+ * If output dev has an echo reference dev associated, add a server
+ * stream to read audio data from it so APM can analyze.
+ */
+static void possibly_enable_echo_reference(struct cras_iodev *dev)
+{
+	if (dev->direction != CRAS_STREAM_OUTPUT)
+		return;
+
+	if (dev->echo_reference_dev == NULL)
+		return;
+
+	server_stream_create(stream_list, dev->echo_reference_dev->info.idx);
+}
+
+/*
+ * If output dev has an echo reference dev associated, check if there
+ * is server stream opened for it and remove it.
+ */
+static void possibly_disable_echo_reference(struct cras_iodev *dev)
+{
+	if (dev->echo_reference_dev == NULL)
+		return;
+
+	server_stream_destroy(stream_list, dev->echo_reference_dev->info.idx);
+}
+
+/*
+ * Close dev if it's opened, without the extra call to idle_dev_check.
+ * This is useful for closing a dev inside idle_dev_check function to
+ * avoid infinite recursive call.
+ *
+ * Returns:
+ *    -EINVAL if device was not opened, otherwise return 0.
+ */
+static int close_dev_without_idle_check(struct cras_iodev *dev)
 {
 	if (!cras_iodev_is_open(dev))
-	       return;
+	       return -EINVAL;
 	if (cras_iodev_has_pinned_stream(dev))
 		syslog(LOG_ERR, "Closing device with pinned streams.");
 
 	remove_all_streams_from_dev(dev);
 	dev->idle_timeout.tv_sec = 0;
 	cras_iodev_close(dev);
+	possibly_disable_echo_reference(dev);
+	return 0;
+}
+
+static void close_dev(struct cras_iodev *dev)
+{
+	if (close_dev_without_idle_check(dev))
+		return;
+
 	if (idle_timer)
 		cras_tm_cancel_timer(cras_system_state_get_tm(), idle_timer);
 	idle_dev_check(NULL, NULL);
@@ -408,9 +461,7 @@ static void idle_dev_check(struct cras_timer *timer, void *data)
 		if (edev->dev->idle_timeout.tv_sec == 0)
 			continue;
 		if (timespec_after(&now, &edev->dev->idle_timeout)) {
-			remove_all_streams_from_dev(edev->dev);
-			edev->dev->idle_timeout.tv_sec = 0;
-			cras_iodev_close(edev->dev);
+			close_dev_without_idle_check(edev->dev);
 			continue;
 		}
 		num_idle_devs++;
@@ -437,6 +488,24 @@ static void idle_dev_check(struct cras_timer *timer, void *data)
 					  idle_dev_check, NULL);
 }
 
+/*
+ * Cancel pending init tries. Called at device initialization or when device
+ * is disabled.
+ */
+static void cancel_pending_init_retries(unsigned int dev_idx)
+{
+	struct dev_init_retry *retry;
+
+	DL_FOREACH(init_retries, retry) {
+		if (retry->dev_idx != dev_idx)
+			continue;
+		cras_tm_cancel_timer(cras_system_state_get_tm(),
+				     retry->init_timer);
+		DL_DELETE(init_retries, retry);
+		free(retry);
+	}
+}
+
 /* Open the device potentially filling the output with a pre buffer. */
 static int init_device(struct cras_iodev *dev,
 		       struct cras_rstream *rstream)
@@ -447,6 +516,7 @@ static int init_device(struct cras_iodev *dev,
 
 	if (cras_iodev_is_open(dev))
 		return 0;
+	cancel_pending_init_retries(dev->info.idx);
 
 	rc = cras_iodev_open(dev, rstream->cb_threshold, &rstream->format);
 	if (rc)
@@ -455,6 +525,9 @@ static int init_device(struct cras_iodev *dev,
 	rc = audio_thread_add_open_dev(audio_thread, dev);
 	if (rc)
 		cras_iodev_close(dev);
+
+	possibly_enable_echo_reference(dev);
+
 	return rc;
 }
 
@@ -585,23 +658,37 @@ static int init_and_attach_streams(struct cras_iodev *dev)
 	int rc;
 	enum CRAS_STREAM_DIRECTION dir = dev->direction;
 	struct cras_rstream *stream;
+	int dev_enabled = cras_iodev_list_dev_is_enabled(dev);
 
 	/* If called after suspend, for example bluetooth
 	 * profile switching, don't add back the stream list. */
-	if (!stream_list_suspended) {
-		/* If there are active streams to attach to this device,
-		 * open it. */
-		DL_FOREACH(stream_list_get(stream_list), stream) {
-			if (stream->direction != dir || stream->is_pinned)
-				continue;
-			rc = init_device(dev, stream);
-			if (rc) {
-				syslog(LOG_ERR, "Enable %s failed, rc = %d",
-				       dev->info.name, rc);
-				return rc;
-			}
-			add_stream_to_open_devs(stream, &dev, 1);
+	if (stream_list_suspended)
+		return 0;
+
+	/* If there are active streams to attach to this device,
+	 * open it. */
+	DL_FOREACH(stream_list_get(stream_list), stream) {
+		if (stream->direction != dir)
+			continue;
+		/*
+		 * Don't attach this stream if (1) this stream pins to a
+		 * different device, or (2) this is a normal stream, but
+		 * device is not enabled.
+		 */
+		if(stream->is_pinned) {
+		   if (stream->pinned_dev_idx != dev->info.idx)
+			continue;
+		} else if (!dev_enabled) {
+			continue;
 		}
+
+		rc = init_device(dev, stream);
+		if (rc) {
+			syslog(LOG_ERR, "Enable %s failed, rc = %d",
+			       dev->info.name, rc);
+			return rc;
+		}
+		add_stream_to_open_devs(stream, &dev, 1);
 	}
 	return 0;
 }
@@ -609,10 +696,16 @@ static int init_and_attach_streams(struct cras_iodev *dev)
 static void init_device_cb(struct cras_timer *timer, void *arg)
 {
 	int rc;
-	struct enabled_dev *edev = (struct enabled_dev *)arg;
-	struct cras_iodev *dev = edev->dev;
+	struct dev_init_retry *retry = (struct dev_init_retry *)arg;
+	struct cras_iodev *dev = find_dev(retry->dev_idx);
 
-	edev->init_timer = NULL;
+	/*
+	 * First of all, remove retry record to avoid confusion to the
+	 * actual device init work.
+	 */
+	DL_DELETE(init_retries, retry);
+	free(retry);
+
 	if (cras_iodev_is_open(dev))
 		return;
 
@@ -623,19 +716,29 @@ static void init_device_cb(struct cras_timer *timer, void *arg)
 		possibly_disable_fallback(dev->direction);
 }
 
-static void schedule_init_device_retry(struct enabled_dev *edev)
+static int schedule_init_device_retry(struct cras_iodev *dev)
 {
+	struct dev_init_retry *retry;
 	struct cras_tm *tm = cras_system_state_get_tm();
 
-	if (edev->init_timer == NULL)
-		edev->init_timer = cras_tm_create_timer(
-				tm, INIT_DEV_DELAY_MS, init_device_cb, edev);
+	retry = (struct dev_init_retry *)calloc(1, sizeof(*retry));
+	if (!retry)
+		return -ENOMEM;
+
+	retry->dev_idx = dev->info.idx;
+	retry->init_timer = cras_tm_create_timer(
+			tm, INIT_DEV_DELAY_MS, init_device_cb, retry);
+	DL_APPEND(init_retries, retry);
+	return 0;
 }
 
 static int init_pinned_device(struct cras_iodev *dev,
 			      struct cras_rstream *rstream)
 {
 	int rc;
+
+	if (audio_thread_is_dev_open(audio_thread, dev))
+		return 0;
 
 	/* Make sure the active node is configured properly, it could be
 	 * disabled when last normal stream removed. */
@@ -687,8 +790,10 @@ static int pinned_stream_added(struct cras_rstream *rstream)
 		return -EINVAL;
 
 	rc = init_pinned_device(dev, rstream);
-	if (rc)
-		return rc;
+	if (rc) {
+		syslog(LOG_INFO, "init_pinned_device failed, rc %d", rc);
+		return schedule_init_device_retry(dev);
+	}
 
 	return add_stream_to_open_devs(rstream, &dev, 1);
 }
@@ -722,7 +827,7 @@ static int stream_added_cb(struct cras_rstream *rstream)
 			 */
 			syslog(LOG_ERR, "Init %s failed, rc = %d",
 			       edev->dev->info.name, rc);
-			schedule_init_device_retry(edev);
+			schedule_init_device_retry(edev->dev);
 			continue;
 		}
 
@@ -824,13 +929,13 @@ static int enable_device(struct cras_iodev *dev)
 
 	edev = calloc(1, sizeof(*edev));
 	edev->dev = dev;
-	edev->init_timer = NULL;
 	DL_APPEND(enabled_devs[dir], edev);
 	dev->is_enabled = 1;
 
 	rc = init_and_attach_streams(dev);
 	if (rc < 0) {
-		schedule_init_device_retry(edev);
+		syslog(LOG_INFO, "Enable device fail, rc %d", rc);
+		schedule_init_device_retry(dev);
 		return rc;
 	}
 
@@ -848,14 +953,15 @@ static int disable_device(struct enabled_dev *edev, bool force)
 	struct cras_rstream *stream;
 	struct device_enabled_cb *callback;
 
+	/*
+	 * Remove from enabled dev list. However this dev could have a stream
+	 * pinned to it, only cancel pending init timers when force flag is set.
+	 */
 	DL_DELETE(enabled_devs[dir], edev);
-	if (edev->init_timer) {
-		cras_tm_cancel_timer(cras_system_state_get_tm(),
-				     edev->init_timer);
-		edev->init_timer = NULL;
-	}
 	free(edev);
 	dev->is_enabled = 0;
+	if (force)
+		cancel_pending_init_retries(dev->info.idx);
 
 	/*
 	 * Pull all default streams off this device.
@@ -988,6 +1094,8 @@ int cras_iodev_list_dev_is_enabled(const struct cras_iodev *dev)
 void cras_iodev_list_enable_dev(struct cras_iodev *dev)
 {
 	possibly_disable_fallback(dev->direction);
+	/* Enable ucm setting of active node. */
+	dev->update_active_node(dev, dev->active_node->idx, 1);
 	enable_device(dev);
 	cras_iodev_list_notify_active_node_changed(dev->direction);
 }

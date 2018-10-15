@@ -9,6 +9,7 @@
 #include <webrtc-apm/webrtc_apm.h>
 
 #include "aec_config.h"
+#include "apm_config.h"
 #include "byte_buffer.h"
 #include "cras_apm_list.h"
 #include "cras_audio_area.h"
@@ -109,6 +110,7 @@ struct cras_apm_reverse_module {
 static struct cras_apm_reverse_module *rmodule = NULL;
 static struct cras_apm_list *apm_list = NULL;
 static struct aec_config *aec_config = NULL;
+static struct apm_config *apm_config = NULL;
 static const char *aec_config_dir = NULL;
 
 /* Update the global process reverse flag. Should be called when apms are added
@@ -263,7 +265,8 @@ struct cras_apm *cras_apm_list_add(struct cras_apm_list *list,
 	apm->apm_ptr = webrtc_apm_create(
 			apm->fmt.num_channels,
 			apm->fmt.frame_rate,
-			aec_config);
+			aec_config,
+			apm_config);
 	if (apm->apm_ptr == NULL) {
 		syslog(LOG_ERR, "Fail to create webrtc apm for ch %zu"
 				" rate %zu effect %lu",
@@ -318,14 +321,28 @@ int cras_apm_list_destroy(struct cras_apm_list *list)
 }
 
 /*
- * Updates the first enabled output iodev in the list and register
- * rmodule as ext dsp module to it. When this iodev is opened and
- * output data starts flow, APMs can anaylize the reverse stream.
- * This is expected to be called in main thread when output devices
- * enable/dsiable state changes.
+ * Determines the iodev to be used as the echo reference for APM reverse
+ * analysis. If there exists the special purpose "echo reference dev" then
+ * use it. Otherwise just use this output iodev.
+ */
+static struct cras_iodev *get_echo_reference_target(struct cras_iodev *iodev)
+{
+	return iodev->echo_reference_dev
+			? iodev->echo_reference_dev
+			: iodev;
+}
+
+/*
+ * Updates the first enabled output iodev in the list, determine the echo
+ * reference target base on this output iodev, and register rmodule as ext dsp
+ * module to this echo reference target.
+ * When this echo reference iodev is opened and audio data flows through its
+ * dsp pipeline, APMs will anaylize the reverse stream. This is expected to be
+ * called in main thread when output devices enable/dsiable state changes.
  */
 static void update_first_output_dev_to_process()
 {
+	struct cras_iodev *echo_ref;
 	struct cras_iodev *iodev =
 			cras_iodev_list_get_first_enabled_iodev(
 				CRAS_STREAM_OUTPUT);
@@ -333,8 +350,9 @@ static void update_first_output_dev_to_process()
 	if (iodev == NULL)
 		return;
 
-	rmodule->odev = iodev;
-	cras_iodev_set_ext_dsp_module(iodev, &rmodule->ext);
+	echo_ref = get_echo_reference_target(iodev);
+	rmodule->odev = echo_ref;
+	cras_iodev_set_ext_dsp_module(echo_ref, &rmodule->ext);
 }
 
 static void handle_device_enabled(struct cras_iodev *iodev, void *cb_data)
@@ -348,11 +366,15 @@ static void handle_device_enabled(struct cras_iodev *iodev, void *cb_data)
 
 static void handle_device_disabled(struct cras_iodev *iodev, void *cb_data)
 {
+	struct cras_iodev *echo_ref;
+
 	if (iodev->direction != CRAS_STREAM_OUTPUT)
 		return;
 
-	if (rmodule->odev == iodev) {
-		cras_iodev_set_ext_dsp_module(iodev, NULL);
+	echo_ref = get_echo_reference_target(iodev);
+
+	if (rmodule->odev == echo_ref) {
+		cras_iodev_set_ext_dsp_module(echo_ref, NULL);
 		rmodule->odev = NULL;
 	}
 
@@ -447,6 +469,9 @@ int cras_apm_list_init(const char *device_config_dir)
 	if (aec_config)
 		free(aec_config);
 	aec_config = aec_config_get(device_config_dir);
+	if (apm_config)
+		free(apm_config);
+	apm_config = apm_config_get(device_config_dir);
 
 	update_first_output_dev_to_process();
 	cras_iodev_list_set_device_enabled_callback(
@@ -469,6 +494,14 @@ void cras_apm_list_reload_aec_config()
 	/* Dump the config content at reload only, for debug. */
 	if (aec_config)
 		aec_config_dump(aec_config);
+
+	if (apm_config)
+		free(apm_config);
+	apm_config = apm_config_get(aec_config_dir);
+
+	/* Dump the config content at reload only, for debug. */
+	if (apm_config)
+		apm_config_dump(apm_config);
 }
 
 int cras_apm_list_deinit()
@@ -569,6 +602,11 @@ void cras_apm_list_put_processed(struct cras_apm *apm, unsigned int frames)
 {
 	buf_increment_read(apm->buffer,
 			   frames * cras_get_format_bytes(&apm->fmt));
+}
+
+struct cras_audio_format *cras_apm_list_get_format(struct cras_apm *apm)
+{
+	return &apm->fmt;
 }
 
 void cras_apm_list_set_aec_dump(struct cras_apm_list *list, void *dev_ptr,

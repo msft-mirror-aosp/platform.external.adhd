@@ -286,6 +286,20 @@ unsigned int cras_rstream_get_effects(const struct cras_rstream *stream)
 			: 0;
 }
 
+struct cras_audio_format *cras_rstream_post_processing_format(
+		const struct cras_rstream *stream, void *dev_ptr)
+{
+	struct cras_apm *apm;
+
+	if (NULL == stream->apm_list)
+		return NULL;
+
+	apm = cras_apm_list_get(stream->apm_list, dev_ptr);
+	if (NULL == apm)
+		return NULL;
+	return cras_apm_list_get_format(apm);
+}
+
 void cras_rstream_record_fetch_interval(struct cras_rstream *rstream,
 					const struct timespec *now)
 {
@@ -336,6 +350,12 @@ int cras_rstream_audio_ready(struct cras_rstream *stream, size_t count)
 	int rc;
 
 	cras_shm_buffer_write_complete(&stream->shm);
+
+	/* Mark shm as used. */
+	if (stream_is_server_only(stream)) {
+		cras_shm_buffer_read_current(&stream->shm, count);
+		return 0;
+	}
 
 	init_audio_message(&msg, AUDIO_MESSAGE_DATA_READY, count);
 	rc = write(stream->fd, &msg, sizeof(msg));
@@ -461,6 +481,9 @@ int cras_rstream_flush_old_audio_messages(struct cras_rstream *stream)
 	int err;
 
 	if (!stream->fd)
+		return 0;
+
+	if (stream_is_server_only(stream))
 		return 0;
 
 	pollfd.fd = stream->fd;

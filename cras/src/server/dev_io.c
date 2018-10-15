@@ -248,13 +248,62 @@ static unsigned int get_stream_limit(
 }
 
 /*
+ * The minimum wake time for a input device, which is 5ms. It's only used by
+ * function get_input_dev_max_wake_ts.
+ */
+static const struct timespec min_input_dev_wake_ts = {
+	0, 5 * 1000 * 1000 /* 5 ms. */
+};
+
+/*
+ * Get input device maximum sleep time, which is the approximate time that the
+ * device will have hw_level = buffer_size / 2 samples. Some devices have
+ * capture period = 2 so the audio_thread should wake up and consume some
+ * samples from hardware at that time. To prevent busy loop occurs, the returned
+ * sleep time should be >= 5ms.
+ *
+ * Returns: 0 on success negative error on device failure.
+ */
+static int get_input_dev_max_wake_ts(
+	struct open_dev *adev,
+	unsigned int curr_level,
+	struct timespec *res_ts)
+{
+	struct timespec dev_wake_ts, now;
+	unsigned int dev_rate, half_buffer_size, target_frames;
+
+	if(!adev || !adev->dev || !adev->dev->format ||
+	   !adev->dev->format->frame_rate || !adev->dev->buffer_size)
+		return -EINVAL;
+
+	*res_ts = min_input_dev_wake_ts;
+
+	dev_rate = adev->dev->format->frame_rate;
+	half_buffer_size = adev->dev->buffer_size / 2;
+	if(curr_level < half_buffer_size)
+		target_frames = half_buffer_size - curr_level;
+	else
+		target_frames = 0;
+
+	cras_frames_to_time(target_frames, dev_rate, &dev_wake_ts);
+
+	if (timespec_after(&dev_wake_ts, res_ts)) {
+		*res_ts = dev_wake_ts;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+	add_timespecs(res_ts, &now);
+	return 0;
+}
+
+/*
  * Set wake_ts for this device to be the earliest wake up time for
  * dev_streams.
  */
 static int set_input_dev_wake_ts(struct open_dev *adev)
 {
 	int rc;
-	struct timespec level_tstamp, wake_time_out, min_ts, now;
+	struct timespec level_tstamp, wake_time_out, min_ts, now, dev_wake_ts;
 	unsigned int curr_level, cap_limit;
 	struct dev_stream *stream;
 	struct dev_stream *cap_limit_stream;
@@ -273,8 +322,8 @@ static int set_input_dev_wake_ts(struct open_dev *adev)
 		clock_gettime(CLOCK_MONOTONIC_RAW, &level_tstamp);
 
 
-	cap_limit = get_stream_limit(adev, adev->dev->buffer_size,
-				     &cap_limit_stream);
+	cap_limit = get_stream_limit(adev, UINT_MAX, &cap_limit_stream);
+
 	/*
 	 * Loop through streams to find the earliest time audio thread
 	 * should wake up.
@@ -303,8 +352,21 @@ static int set_input_dev_wake_ts(struct open_dev *adev)
 			min_ts = wake_time_out;
 		}
 	}
+
+	if(adev->dev->active_node &&
+	   adev->dev->active_node->type != CRAS_NODE_TYPE_HOTWORD) {
+		rc = get_input_dev_max_wake_ts(adev, curr_level, &dev_wake_ts);
+		if(rc < 0) {
+			syslog(LOG_ERR,
+			       "Failed to call get_input_dev_max_wake_ts."
+			       "rc = %d", rc);
+		} else if(timespec_after(&min_ts, &dev_wake_ts)) {
+			min_ts = dev_wake_ts;
+		}
+	}
+
 	adev->wake_ts = min_ts;
-	return 0;
+	return rc;
 }
 
 /* Read samples from an input device to the specified stream.
@@ -328,6 +390,8 @@ static int capture_to_streams(struct open_dev *adev)
 	if (rc < 0)
 		return rc;
 	hw_level = rc;
+
+	cras_iodev_update_highest_hw_level(idev, hw_level);
 
 	ATLOG(atlog, AUDIO_THREAD_READ_AUDIO_TSTAMP, idev->info.idx,
 	      hw_tstamp.tv_sec, hw_tstamp.tv_nsec);
@@ -366,6 +430,7 @@ static int capture_to_streams(struct open_dev *adev)
 		DL_FOREACH(adev->dev->streams, stream) {
 			unsigned int this_read;
 			unsigned int area_offset;
+			float software_gain_scaler;
 
 			if ((stream->stream->flags & TRIGGER_ONLY) &&
 			    stream->stream->triggered)
@@ -374,10 +439,18 @@ static int capture_to_streams(struct open_dev *adev)
 			input_data_get_for_stream(idev->input_data, stream->stream,
 						  idev->buf_state,
 						  &area, &area_offset);
+			/*
+			 * APM has more advanced gain control mechanism, so
+			 * don't apply the CRAS software gain to this stream
+			 * if APM is used.
+			 */
+			software_gain_scaler = stream->stream->apm_list
+				? 1.0f
+				: cras_iodev_get_software_gain_scaler(idev);
 
 			this_read = dev_stream_capture(
-				stream, area, area_offset,
-				cras_iodev_get_software_gain_scaler(idev));
+					stream, area, area_offset,
+					software_gain_scaler);
 
 			input_data_put_for_stream(idev->input_data, stream->stream,
 						  idev->buf_state, this_read);
@@ -513,6 +586,9 @@ void update_dev_wakeup_time(struct open_dev *adev, unsigned int *hw_level)
 	if (!timespec_is_nonzero(&adev->wake_ts))
 		adev->wake_ts = now;
 
+	if (cras_iodev_state(adev->dev) == CRAS_IODEV_STATE_NORMAL_RUN)
+		cras_iodev_update_highest_hw_level(adev->dev, *hw_level);
+
 	est_rate = adev->dev->ext_format->frame_rate *
 			cras_iodev_get_est_rate_ratio(adev->dev);
 
@@ -643,23 +719,7 @@ int write_output_samples(struct open_dev **odevs,
 	ATLOG(atlog, AUDIO_THREAD_FILL_AUDIO_DONE, hw_level,
 	      total_written, odev->min_cb_level);
 
-	/* Update device wake up time and get the new hardware level. */
-	update_dev_wakeup_time(adev, &hw_level);
-
-	/*
-	 * If new hardware level is less than or equal to the written frames, we can
-	 * suppose underrun happened. But keep in mind there may have a false
-	 * positive. If hardware level changed just after frames being written, we may
-	 * get hw_level <= total _written here without underrun happened. However, we
-	 * can still treat it as underrun because it is an abnormal state we should
-	 * handle it.
-	 */
-	if (hw_level <= total_written) {
-		ATLOG(atlog, AUDIO_THREAD_UNDERRUN, adev->dev->info.idx, hw_level,
-		      total_written);
-		return cras_iodev_output_underrun(odev);
-	}
-	return 0;
+	return total_written;
 }
 
 /*
@@ -692,16 +752,34 @@ int dev_io_send_captured_samples(struct open_dev *idev_list)
 	return 0;
 }
 
+static void handle_dev_err(
+		int err_rc,
+		struct open_dev **odevs,
+		struct open_dev *adev)
+{
+	if (err_rc == -EPIPE) {
+		/* Handle severe underrun. */
+		ATLOG(atlog, AUDIO_THREAD_SEVERE_UNDERRUN,
+		      adev->dev->info.idx, 0, 0);
+		cras_iodev_reset_request(adev->dev);
+	} else {
+		/* Device error, close it. */
+		dev_io_rm_open_dev(odevs, adev);
+	}
+}
+
 int dev_io_capture(struct open_dev **list)
 {
 	struct open_dev *idev_list = *list;
 	struct open_dev *adev;
+	int rc;
 
 	DL_FOREACH(idev_list, adev) {
 		if (!cras_iodev_is_open(adev->dev))
 			continue;
-		if (capture_to_streams(adev) < 0)
-			dev_io_rm_open_dev(list, adev);
+		rc = capture_to_streams(adev);
+		if (rc < 0)
+			handle_dev_err(rc, list, adev);
 	}
 
 	return 0;
@@ -724,6 +802,7 @@ int dev_io_playback_write(struct open_dev **odevs,
 	struct open_dev *adev;
 	struct dev_stream *curr;
 	int rc;
+	unsigned int hw_level, total_written;
 
 	/* For multiple output case, update the number of queued frames in shm
 	 * of all streams before starting write output samples. */
@@ -741,14 +820,43 @@ int dev_io_playback_write(struct open_dev **odevs,
 
 		rc = write_output_samples(odevs, adev, output_converter);
 		if (rc < 0) {
-			if (rc == -EPIPE) {
-				/* Handle severe underrun. */
-				ATLOG(atlog, AUDIO_THREAD_SEVERE_UNDERRUN,
-				      adev->dev->info.idx, 0, 0);
-				cras_iodev_reset_request(adev->dev);
-			} else {
-				/* Device error, close it. */
-				dev_io_rm_open_dev(odevs, adev);
+			handle_dev_err(rc, odevs, adev);
+		} else {
+			total_written = rc;
+
+			/*
+			 * Skip the underrun check and device wake up time update if
+			 * device should not wake up.
+			 */
+			if (!cras_iodev_odev_should_wake(adev->dev))
+				continue;
+
+			/*
+			 * Update device wake up time and get the new hardware
+			 * level.
+			 */
+			update_dev_wakeup_time(adev, &hw_level);
+
+			/*
+			 * If new hardware level is less than or equal to the
+			 * written frames, we can suppose underrun happened. But
+			 * keep in mind there may have a false positive. If
+			 * hardware level changed just after frames being
+			 * written, we may get hw_level <= total_written here
+			 * without underrun happened. However, we can still
+			 * treat it as underrun because it is an abnormal state
+			 * we should handle it.
+			 */
+			if (hw_level <= total_written) {
+				ATLOG(atlog, AUDIO_THREAD_UNDERRUN,
+				      adev->dev->info.idx,
+				      hw_level, total_written);
+				rc = cras_iodev_output_underrun(adev->dev);
+				if(rc < 0) {
+					handle_dev_err(rc, odevs, adev);
+				} else {
+					update_dev_wakeup_time(adev, &hw_level);
+				}
 			}
 		}
 	}
@@ -839,6 +947,10 @@ void dev_io_rm_open_dev(struct open_dev **odev_list,
 	/* Metrics logs the number of underruns of this device. */
 	cras_server_metrics_num_underruns(
 		cras_iodev_get_num_underruns(dev_to_rm->dev));
+
+	/* Metrics logs the highest_hw_level of this device. */
+	cras_server_metrics_highest_hw_level(
+		dev_to_rm->dev->highest_hw_level, dev_to_rm->dev->direction);
 
 	check_non_empty_state_transition(*odev_list);
 

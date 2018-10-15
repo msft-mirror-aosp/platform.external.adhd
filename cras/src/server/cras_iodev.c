@@ -922,6 +922,7 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 
 	iodev->reset_request_pending = 0;
 	iodev->state = CRAS_IODEV_STATE_OPEN;
+	iodev->highest_hw_level = 0;
 
 	if (iodev->direction == CRAS_STREAM_OUTPUT) {
 		/* If device supports start ops, device can be in open state.
@@ -932,7 +933,11 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 			iodev->state = CRAS_IODEV_STATE_NO_STREAM_RUN;
 	} else {
 		iodev->input_data = input_data_create(iodev);
-		iodev->ext_dsp_module = &iodev->input_data->ext;
+		/* If this is the echo reference dev, its ext_dsp_module will
+		 * be set to APM reverse module. Do not override it to its
+		 * input data. */
+		if (iodev->ext_dsp_module == NULL)
+			iodev->ext_dsp_module = &iodev->input_data->ext;
 
 		/* Input device starts running right after opening.
 		 * No stream state is only for output device. Input device
@@ -959,8 +964,11 @@ int cras_iodev_close(struct cras_iodev *iodev)
 	if (!cras_iodev_is_open(iodev))
 		return 0;
 
-	if (iodev->input_data)
+	if (iodev->input_data) {
+		if (iodev->ext_dsp_module == &iodev->input_data->ext)
+			iodev->ext_dsp_module = NULL;
 		input_data_destroy(&iodev->input_data);
+	}
 
 	rc = iodev->close_dev(iodev);
 	if (rc)
@@ -977,6 +985,7 @@ int cras_iodev_close(struct cras_iodev *iodev)
 int cras_iodev_put_input_buffer(struct cras_iodev *iodev)
 {
 	unsigned int min_frames;
+	unsigned int dsp_frames;
 	struct input_data *data = iodev->input_data;
 
 	if (iodev->streams)
@@ -984,7 +993,10 @@ int cras_iodev_put_input_buffer(struct cras_iodev *iodev)
 	else
 		min_frames = data->area->frames;
 
-	iodev->input_dsp_offset = iodev->input_frames_read - min_frames;
+	// Update the max number of frames has applied input dsp.
+	dsp_frames = MAX(iodev->input_frames_read, iodev->input_dsp_offset);
+	iodev->input_dsp_offset = dsp_frames - min_frames;
+
 	input_data_set_all_streams_read(data, min_frames);
 	rate_estimator_add_frames(iodev->rate_est, -min_frames);
 	return iodev->put_buffer(iodev, min_frames);
@@ -1462,3 +1474,10 @@ int cras_iodev_has_pinned_stream(const struct cras_iodev *dev)
 	}
 	return 0;
 }
+
+void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
+		unsigned int hw_level)
+{
+	iodev->highest_hw_level = MAX(iodev->highest_hw_level, hw_level);
+}
+

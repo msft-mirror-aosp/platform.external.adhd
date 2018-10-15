@@ -59,7 +59,7 @@ static inline void float_buffer_destroy(struct float_buffer **b)
 /* Gets the write pointer of given float_buffer. */
 static inline float *const *float_buffer_write_pointer(struct float_buffer *b)
 {
-	int i;
+	unsigned int i;
 	float *data = (float *)b->buf->bytes;
 
 	for (i = 0; i < b->num_channels; i++, data += b->buf->max_size)
@@ -85,7 +85,7 @@ static inline float *const *float_buffer_read_pointer(struct float_buffer *b,
 						      unsigned int offset,
 						      unsigned int *readable)
 {
-	int i;
+	unsigned int i;
 	float *data = (float *)b->buf->bytes;
 	unsigned int nread = buf_readable(b->buf);
 
@@ -97,8 +97,8 @@ static inline float *const *float_buffer_read_pointer(struct float_buffer *b,
 		offset = offset + b->buf->read_idx - b->buf->max_size;
 		*readable = MIN(*readable, b->buf->write_idx - offset);
 	} else {
+		*readable = MIN(*readable, nread - offset);
 		offset += b->buf->read_idx;
-		*readable = MIN(*readable, nread);
 	}
 
 	for (i = 0; i < b->num_channels; i++, data += b->buf->max_size)

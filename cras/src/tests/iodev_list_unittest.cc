@@ -36,6 +36,7 @@ static int audio_thread_set_active_dev_called;
 static cras_iodev *audio_thread_add_open_dev_dev;
 static int audio_thread_add_open_dev_called;
 static int audio_thread_rm_open_dev_called;
+static int audio_thread_is_dev_open_ret;
 static struct audio_thread thread;
 static struct cras_iodev loopback_input;
 static int cras_iodev_close_called;
@@ -45,6 +46,8 @@ static struct cras_iodev dummy_empty_iodev[2];
 static stream_callback *stream_add_cb;
 static stream_callback *stream_rm_cb;
 static struct cras_rstream *stream_list_get_ret;
+static int server_stream_create_called;
+static int server_stream_destroy_called;
 static int audio_thread_drain_stream_return;
 static int audio_thread_drain_stream_called;
 static int cras_tm_create_timer_called;
@@ -103,6 +106,8 @@ class IoDevTestSuite : public testing::Test {
 
       cras_iodev_close_called = 0;
       stream_list_get_ret = 0;
+      server_stream_create_called = 0;
+      server_stream_destroy_called = 0;
       audio_thread_drain_stream_return = 0;
       audio_thread_drain_stream_called = 0;
       cras_tm_create_timer_called = 0;
@@ -110,6 +115,7 @@ class IoDevTestSuite : public testing::Test {
 
       audio_thread_disconnect_stream_called = 0;
       audio_thread_disconnect_stream_stream = NULL;
+      audio_thread_is_dev_open_ret = 0;
       cras_iodev_has_pinned_stream_ret.clear();
 
       sample_rates_[0] = 44100;
@@ -208,6 +214,9 @@ class IoDevTestSuite : public testing::Test {
       audio_thread_dev_start_ramp_req =
           CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK;
       cras_iodev_is_zero_volume_ret = 0;
+
+      dummy_empty_iodev[0].state = CRAS_IODEV_STATE_CLOSE;
+      dummy_empty_iodev[1].state = CRAS_IODEV_STATE_CLOSE;
     }
 
     virtual void TearDown() {
@@ -347,6 +356,53 @@ TEST_F(IoDevTestSuite, InitDevFailShouldEnableFallback) {
   cras_iodev_list_deinit();
 }
 
+TEST_F(IoDevTestSuite, InitDevWithEchoRef) {
+  int rc;
+  struct cras_rstream rstream;
+  struct cras_rstream *stream_list = NULL;
+
+  memset(&rstream, 0, sizeof(rstream));
+  cras_iodev_list_init();
+
+  d1_.direction = CRAS_STREAM_OUTPUT;
+  d1_.echo_reference_dev = &d2_;
+  rc = cras_iodev_list_add_output(&d1_);
+  ASSERT_EQ(0, rc);
+
+  d2_.direction = CRAS_STREAM_INPUT;
+  snprintf(d2_.active_node->name, CRAS_NODE_NAME_BUFFER_SIZE, "echo ref");
+  rc = cras_iodev_list_add_input(&d2_);
+  ASSERT_EQ(0, rc);
+
+  cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
+      cras_make_node_id(d1_.info.idx, 0));
+  /* No close call happened, because no stream exists. */
+  EXPECT_EQ(0, cras_iodev_close_called);
+
+  cras_iodev_open_ret[1] = 0;
+
+  DL_APPEND(stream_list, &rstream);
+  stream_list_get_ret = stream_list;
+  stream_add_cb(&rstream);
+
+  EXPECT_EQ(1, cras_iodev_open_called);
+  EXPECT_EQ(1, server_stream_create_called);
+  EXPECT_EQ(1, audio_thread_add_stream_called);
+
+  DL_DELETE(stream_list, &rstream);
+  stream_list_get_ret = stream_list;
+  stream_rm_cb(&rstream);
+
+  clock_gettime_retspec.tv_sec = 11;
+  clock_gettime_retspec.tv_nsec = 0;
+  cras_tm_timer_cb(NULL, NULL);
+
+  EXPECT_EQ(1, cras_iodev_close_called);
+  EXPECT_EQ(1, server_stream_destroy_called);
+
+  cras_iodev_list_deinit();
+}
+
 TEST_F(IoDevTestSuite, SelectNodeOpenFailShouldScheduleRetry) {
   struct cras_rstream rstream;
   struct cras_rstream *stream_list = NULL;
@@ -471,6 +527,42 @@ TEST_F(IoDevTestSuite, InitDevFailShouldScheduleRetry) {
   cras_iodev_list_deinit();
 }
 
+TEST_F(IoDevTestSuite, PinnedStreamInitFailShouldScheduleRetry) {
+  int rc;
+  struct cras_rstream rstream;
+  struct cras_rstream *stream_list = NULL;
+
+  memset(&rstream, 0, sizeof(rstream));
+  cras_iodev_list_init();
+
+  d1_.direction = CRAS_STREAM_OUTPUT;
+  rc = cras_iodev_list_add_output(&d1_);
+  ASSERT_EQ(0, rc);
+
+  rstream.is_pinned = 1;
+  rstream.pinned_dev_idx = d1_.info.idx;
+
+  cras_iodev_open_ret[0] = -5;
+  cras_iodev_open_ret[1] = 0;
+  cras_tm_timer_cb = NULL;
+  DL_APPEND(stream_list, &rstream);
+  stream_list_get_ret = stream_list;
+  stream_add_cb(&rstream);
+  /* Init pinned dev fail, not proceed to add stream. */
+  EXPECT_EQ(1, cras_iodev_open_called);
+  EXPECT_EQ(0, audio_thread_add_stream_called);
+
+  EXPECT_NE((void *)NULL, cras_tm_timer_cb);
+  EXPECT_EQ(1, cras_tm_create_timer_called);
+
+  cras_tm_timer_cb(NULL, cras_tm_timer_cb_data);
+  EXPECT_EQ(2, cras_iodev_open_called);
+  EXPECT_EQ(1, audio_thread_add_stream_called);
+
+  cras_iodev_list_rm_output(&d1_);
+  cras_iodev_list_deinit();
+}
+
 static void device_enabled_cb(struct cras_iodev *dev, void *cb_data)
 {
   device_enabled_dev = dev;
@@ -521,7 +613,8 @@ TEST_F(IoDevTestSuite, SelectNode) {
   EXPECT_EQ(&d1_, cras_iodev_list_get_first_enabled_iodev(CRAS_STREAM_OUTPUT));
 
   // There should be a disable device call for the fallback device.
-  EXPECT_EQ(1, audio_thread_rm_open_dev_called);
+  // But no close call actually happened, because no stream exists.
+  EXPECT_EQ(0, audio_thread_rm_open_dev_called);
   EXPECT_EQ(1, device_disabled_count);
   EXPECT_NE(&d1_, device_disabled_dev);
 
@@ -544,7 +637,7 @@ TEST_F(IoDevTestSuite, SelectNode) {
   EXPECT_EQ(3, device_enabled_count);
   // Additional disabled devices: d1_, fallback device.
   EXPECT_EQ(3, device_disabled_count);
-  EXPECT_EQ(3, audio_thread_rm_open_dev_called);
+  EXPECT_EQ(2, audio_thread_rm_open_dev_called);
   EXPECT_EQ(2, cras_observer_notify_active_node_called);
   EXPECT_EQ(&d2_, cras_iodev_list_get_first_enabled_iodev(CRAS_STREAM_OUTPUT));
 
@@ -1323,6 +1416,14 @@ TEST_F(IoDevTestSuite, AddRemovePinnedStream) {
   EXPECT_EQ(5, update_active_node_called);
   // close pinned device
   EXPECT_EQ(&d1_, update_active_node_iodev_val[4]);
+
+  // Assume dev is already opened, add pin stream should not trigger another
+  // update_active_node call, but will trigger audio_thread_add_stream.
+  audio_thread_is_dev_open_ret = 1;
+  EXPECT_EQ(0, stream_add_cb(&rstream));
+  EXPECT_EQ(5, update_active_node_called);
+  EXPECT_EQ(2, audio_thread_add_stream_called);
+
   cras_iodev_list_deinit();
 }
 
@@ -1523,6 +1624,12 @@ int audio_thread_rm_open_dev(struct audio_thread *thread,
   return 0;
 }
 
+int audio_thread_is_dev_open(struct audio_thread *thread,
+			     struct cras_iodev *dev)
+{
+  return audio_thread_is_dev_open_ret;
+}
+
 int audio_thread_add_stream(struct audio_thread *thread,
                             struct cras_rstream *stream,
                             struct cras_iodev **devs,
@@ -1688,6 +1795,16 @@ void stream_list_destroy(struct stream_list *list) {
 
 struct cras_rstream *stream_list_get(struct stream_list *list) {
   return stream_list_get_ret;
+}
+void server_stream_create(struct stream_list *stream_list,
+			  unsigned int dev_idx)
+{
+  server_stream_create_called++;
+}
+void server_stream_destroy(struct stream_list *stream_list,
+			   unsigned int dev_idx)
+{
+  server_stream_destroy_called++;
 }
 
 int cras_rstream_create(struct cras_rstream_config *config,

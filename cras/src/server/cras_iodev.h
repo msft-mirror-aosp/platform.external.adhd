@@ -157,6 +157,9 @@ struct cras_ionode {
  * min_buffer_level - Extra frames to keep queued in addition to requested.
  * dsp_context - The context used for dsp processing on the audio data.
  * dsp_name - The "dsp_name" dsp variable specified in the ucm config.
+ * echo_reference_dev - Used only for playback iodev. Pointer to the input
+ *        iodev, which can be used to record what is playing out from this
+ *        iodev. This will be used as the echo reference for echo cancellation.
  * is_enabled - True if this iodev is enabled, false otherwise.
  * software_volume_needed - True if volume control is not supported by hardware.
  * streams - List of audio streams serviced by dev.
@@ -235,6 +238,7 @@ struct cras_iodev {
 	unsigned int min_buffer_level;
 	struct cras_dsp_context *dsp_context;
 	const char *dsp_name;
+	struct cras_iodev *echo_reference_dev;
 	int is_enabled;
 	int software_volume_needed;
 	struct dev_stream *streams;
@@ -255,6 +259,7 @@ struct cras_iodev {
 	int input_streaming;
 	unsigned int input_frames_read;
 	unsigned int input_dsp_offset;
+	unsigned int highest_hw_level;
 	struct input_data *input_data;
 	struct cras_iodev *prev, *next;
 };
@@ -746,5 +751,13 @@ int cras_iodev_is_zero_volume(const struct cras_iodev *odev);
  *    1 if device has pinned stream. 0 otherwise.
  */
 int cras_iodev_has_pinned_stream(const struct cras_iodev *dev);
+
+/*
+ * Updates the highest hardware level of the device.
+ * Args:
+ *    iodev - The device.
+ */
+void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
+		unsigned int hw_level);
 
 #endif /* CRAS_IODEV_H_ */

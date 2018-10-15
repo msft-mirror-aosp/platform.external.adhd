@@ -70,6 +70,12 @@ TEST_F(DevIoSuite, SendCapturedFails) {
 /* Stubs */
 extern "C" {
 
+int cras_server_metrics_highest_hw_level(unsigned hw_level,
+		enum CRAS_STREAM_DIRECTION direction)
+{
+  return 0;
+}
+
 int cras_server_metrics_longest_fetch_delay(unsigned delay_msec)
 {
   return 0;
@@ -96,6 +102,11 @@ int input_data_put_for_stream(struct input_data *data,
 			   unsigned int frames)
 {
   return 0;
+}
+struct cras_audio_format *cras_rstream_post_processing_format(
+    const struct cras_rstream *stream, void *dev_ptr)
+{
+  return NULL;
 }
 }  // extern "C"
 
