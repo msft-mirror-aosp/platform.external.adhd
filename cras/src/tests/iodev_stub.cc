@@ -108,6 +108,11 @@ unsigned int cras_iodev_max_stream_offset(const struct cras_iodev *iodev) {
   return 0;
 }
 
+int cras_iodev_odev_should_wake(const struct cras_iodev *odev)
+{
+  return 1;
+}
+
 int cras_iodev_output_underrun(struct cras_iodev *odev) {
   return 0;
 }
@@ -133,6 +138,11 @@ unsigned int cras_iodev_frames_to_play_in_sleep(struct cras_iodev *odev,
   clock_gettime(CLOCK_MONOTONIC_RAW, hw_tstamp);
   *hw_level = 0;
   return 0;
+}
+
+void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
+		unsigned int hw_level)
+{
 }
 
 } // extern "C"

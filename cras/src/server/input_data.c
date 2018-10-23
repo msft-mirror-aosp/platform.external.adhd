@@ -22,6 +22,7 @@ void input_data_run(struct ext_dsp_module *ext,
 	float *const *wp;
 	int i;
 	unsigned int writable;
+	unsigned int offset = 0;
 
 	while (nframes) {
 		writable = float_buffer_writable(data->fbuffer);
@@ -32,9 +33,11 @@ void input_data_run(struct ext_dsp_module *ext,
 		}
 		wp = float_buffer_write_pointer(data->fbuffer);
 		for (i = 0; i < data->fbuffer->num_channels; i++)
-			memcpy(wp[i], ext->ports[i], writable * sizeof(float));
+			memcpy(wp[i], ext->ports[i] + offset, writable * sizeof(float));
+
 		float_buffer_written(data->fbuffer, writable);
 		nframes -= writable;
+		offset += writable;
 	}
 }
 
@@ -71,6 +74,9 @@ void input_data_destroy(struct input_data **data)
 void input_data_set_all_streams_read(struct input_data *data,
 				     unsigned int nframes)
 {
+	if (!data->fbuffer)
+		return;
+
 	if (float_buffer_level(data->fbuffer) < nframes) {
 		syslog(LOG_ERR, "All streams read %u frames exceeds %u"
 		       " in input_data's buffer",
@@ -90,8 +96,15 @@ int input_data_get_for_stream(struct input_data *data,
 	unsigned int apm_processed;
 	struct cras_apm *apm;
 
+	/*
+	 * It is possible that area buffer frames is smaller than the
+	 * offset of stream. In this case, just reset the offset value
+	 * to area->frames to prevent caller using these information get
+	 * bad access to data.
+	 */
 	*area = data->area;
-	*offset = buffer_share_id_offset(offsets, stream->stream_id);
+	*offset = MIN(buffer_share_id_offset(offsets, stream->stream_id),
+		      data->area->frames);
 
 	apm = cras_apm_list_get(stream->apm_list, data->dev_ptr);
 	if (apm == NULL)

@@ -562,7 +562,8 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       "num_channels: %u\n"
 		       "est_rate_ratio: %lf\n"
 		       "num_underruns: %u\n"
-		       "num_severe_underruns: %u\n",
+		       "num_severe_underruns: %u\n"
+		       "highest_hw_level: %u\n",
 		       (unsigned int)info->devs[i].buffer_size,
 		       (unsigned int)info->devs[i].min_buffer_level,
 		       (unsigned int)info->devs[i].min_cb_level,
@@ -571,7 +572,8 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       (unsigned int)info->devs[i].num_channels,
 		       info->devs[i].est_rate_ratio,
 		       (unsigned int)info->devs[i].num_underruns,
-		       (unsigned int)info->devs[i].num_severe_underruns);
+		       (unsigned int)info->devs[i].num_severe_underruns,
+		       (unsigned int)info->devs[i].highest_hw_level);
 		printf("\n");
 	}
 
@@ -1171,15 +1173,15 @@ static struct option long_options[] = {
 	{"config_global_remix", required_argument,	0, ';'},
 	{"set_hotword_model",	required_argument,	0, '<'},
 	{"get_hotword_models",	required_argument,	0, '>'},
-	{"syslog_mask",		required_argument,	0, 'L'},
-	{"mute_loop_test",	required_argument,	0, 'M'},
-	{"stream_type",		required_argument,	0, 'T'},
 	{"post_dsp",            required_argument,	0, 'A'},
-	{"effects",		required_argument,	0, 'E'},
 	{"stream_id",		required_argument,	0, 'B'},
 	{"aecdump",		required_argument,	0, 'C'},
 	{"reload_aec_config",	no_argument,		0, 'D'},
+	{"effects",		required_argument,	0, 'E'},
 	{"get_aec_supported",	no_argument,		0, 'F'},
+	{"syslog_mask",		required_argument,	0, 'L'},
+	{"mute_loop_test",	required_argument,	0, 'M'},
+	{"stream_type",		required_argument,	0, 'T'},
 	{0, 0, 0, 0}
 };
 

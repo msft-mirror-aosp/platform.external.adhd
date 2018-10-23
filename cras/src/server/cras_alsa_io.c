@@ -537,6 +537,7 @@ static int flush_buffer(struct cras_iodev *iodev)
 	snd_pcm_uframes_t nframes;
 
 	if (iodev->direction == CRAS_STREAM_INPUT) {
+		nframes = snd_pcm_avail(aio->handle);
 		nframes = snd_pcm_forwardable(aio->handle);
 		return snd_pcm_forward(aio->handle, nframes);
 	}
@@ -1377,6 +1378,21 @@ static struct alsa_input_node *get_input_node_from_jack(
 	return ain;
 }
 
+static const struct cras_alsa_jack *get_jack_from_node(struct cras_ionode *node)
+{
+	const struct cras_alsa_jack *jack = NULL;
+
+	if (node == NULL)
+		return NULL;
+
+	if (node->dev->direction == CRAS_STREAM_OUTPUT)
+		jack = ((struct alsa_output_node *)node)->jack;
+	else if (node->dev->direction == CRAS_STREAM_INPUT)
+		jack = ((struct alsa_input_node *)node)->jack;
+
+	return jack;
+}
+
 /*
  * Returns the dsp name specified in the ucm config. If there is a dsp
  * name specified for the jack of the active node, use that. Otherwise
@@ -2148,8 +2164,10 @@ int alsa_iodev_legacy_complete_init(struct cras_iodev *iodev)
 				   first_plugged_node(&aio->base),
 				   0);
 
-	/* Set plugged for the first USB device per card when it appears. */
-	if (aio->card_type == ALSA_CARD_TYPE_USB && is_first)
+	/* Set plugged for the first USB device per card when it appears if
+	 * there is no jack reporting plug status. */
+	if (aio->card_type == ALSA_CARD_TYPE_USB && is_first &&
+			!get_jack_from_node(iodev->active_node))
 		cras_iodev_set_node_attr(iodev->active_node,
 					 IONODE_ATTR_PLUGGED, 1);
 
@@ -2235,8 +2253,10 @@ void alsa_iodev_ucm_complete_init(struct cras_iodev *iodev)
 				   first_plugged_node(&aio->base),
 				   0);
 
-	/* Set plugged for the first USB device per card when it appears. */
-	if (aio->card_type == ALSA_CARD_TYPE_USB && aio->is_first)
+	/* Set plugged for the first USB device per card when it appears if
+	 * there is no jack reporting plug status. */
+	if (aio->card_type == ALSA_CARD_TYPE_USB && aio->is_first &&
+			!get_jack_from_node(iodev->active_node))
 		cras_iodev_set_node_attr(iodev->active_node,
 					 IONODE_ATTR_PLUGGED, 1);
 

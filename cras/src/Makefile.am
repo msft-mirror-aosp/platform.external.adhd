@@ -32,7 +32,8 @@ endif
 if HAVE_WEBRTC_APM
 CRAS_WEBRTC_APM_SOURCES = \
 	server/cras_apm_list.c \
-	server/config/aec_config.c
+	server/config/aec_config.c \
+	server/config/apm_config.c
 else
 CRAS_WEBRTC_APM_SOURCES =
 endif
@@ -148,6 +149,7 @@ cras_server_SOURCES = \
 	server/input_data.c \
 	server/linear_resampler.c \
 	server/polled_interval_checker.c \
+	server/server_stream.c \
 	server/stream_list.c \
 	server/test_iodev.c \
 	server/rate_estimator.c \
@@ -352,6 +354,7 @@ TESTS = \
 	edid_utils_unittest \
 	expr_unittest \
 	file_wait_unittest \
+	float_buffer_unittest \
 	fmt_conv_unittest \
 	hfp_info_unittest \
 	buffer_share_unittest \
@@ -712,6 +715,12 @@ file_wait_unittest_SOURCES = tests/file_wait_unittest.cc \
 file_wait_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	$(CRAS_UT_TMPDIR_CFLAGS)
 file_wait_unittest_LDADD = -lgtest -lpthread
+
+
+float_buffer_unittest_SOURCES = tests/float_buffer_unittest.cc
+float_buffer_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
+	-I$(top_srcdir)/src/server
+float_buffer_unittest_LDADD = -lgtest -lpthread
 
 fmt_conv_unittest_SOURCES = tests/fmt_conv_unittest.cc server/cras_fmt_conv.c
 fmt_conv_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \

@@ -2230,6 +2230,7 @@ void cras_client_destroy(struct cras_client *client)
 	client->server_err_cb = NULL;
 	cras_client_stop(client);
 	server_disconnect(client);
+	close(client->server_event_fd);
 	close(client->command_fds[0]);
 	close(client->command_fds[1]);
 	close(client->stream_fds[0]);
@@ -2354,6 +2355,7 @@ struct cras_stream_params *cras_client_unified_params_create(
 	params->cb_threshold = block_size;
 	params->stream_type = stream_type;
 	params->flags = flags;
+	params->effects = 0;
 	params->user_data = user_data;
 	params->aud_cb = 0;
 	params->unified_cb = unified_cb;
