@@ -16,17 +16,6 @@
 struct cras_rclient;
 struct dev_mix;
 
-/* Holds identifiers for an shm segment.
- *  shm_fd - File descriptor shared with client to access shm.
- *  shm_name - Name of the shm area.
- *  length - Size of the shm region.
- */
-struct rstream_shm_info {
-	int shm_fd;
-	char shm_name[NAME_MAX];
-	size_t length;
-};
-
 /* Holds informations about the master active device.
  * Members:
  *    dev_id - id of the master device.
@@ -51,7 +40,6 @@ struct master_dev_info {
  *    master_dev_info - The info of the master device this stream attaches to.
  *    is_draining - The stream is draining and waiting to be removed.
  *    client - The client who uses this stream.
- *    shm_info - Configuration data for shared memory
  *    shm - shared memory
  *    audio_area - space for playback/capture audio
  *    format - format of the stream
@@ -59,9 +47,12 @@ struct master_dev_info {
  *    sleep_interval_ts - Time between audio callbacks.
  *    last_fetch_ts - The time of the last stream fetch.
  *    longest_fetch_interval_ts - Longest interval between two fetches.
+ *    start_ts - The time when the stream started.
+ *    first_missed_cb_ts - The time when the first missed callback happens.
  *    buf_state - State of the buffer from all devices for this stream.
  *    apm_list - List of audio processing module instances.
  *    num_attached_devs - Number of iodevs this stream has attached to.
+ *    num_missed_cb - Number of callback schedules have been missed.
  *    queued_frames - Cached value of the number of queued frames in shm.
  *    is_pinned - True if the stream is a pinned stream, false otherwise.
  *    pinned_dev_idx - device the stream is pinned, 0 if none.
@@ -78,17 +69,19 @@ struct cras_rstream {
 	int is_draining;
 	struct master_dev_info master_dev;
 	struct cras_rclient *client;
-	struct rstream_shm_info shm_info;
-	struct cras_audio_shm shm;
+	struct cras_audio_shm *shm;
 	struct cras_audio_area *audio_area;
 	struct cras_audio_format format;
 	struct timespec next_cb_ts;
 	struct timespec sleep_interval_ts;
 	struct timespec last_fetch_ts;
 	struct timespec longest_fetch_interval;
+	struct timespec start_ts;
+	struct timespec first_missed_cb_ts;
 	struct buffer_share *buf_state;
 	struct cras_apm_list *apm_list;
 	int num_attached_devs;
+	int num_missed_cb;
 	int queued_frames;
 	int is_pinned;
 	uint32_t pinned_dev_idx;
@@ -215,41 +208,24 @@ static inline void cras_rstream_set_is_draining(struct cras_rstream *stream,
 	stream->is_draining = is_draining;
 }
 
-/* Gets the shm key used to find the outputshm region. */
-static inline int cras_rstream_output_shm_fd(const struct cras_rstream *stream)
+/* Gets the backing fd for this stream's shm region. */
+static inline int cras_rstream_shm_fd(const struct cras_rstream *stream)
 {
-	return stream->shm_info.shm_fd;
+	return stream->shm->info.fd;
 }
 
-/* Gets the shm key used to find the input shm region. */
-static inline int cras_rstream_input_shm_fd(const struct cras_rstream *stream)
+/* Gets shared memory region for this stream. */
+static inline struct cras_audio_shm *
+cras_rstream_shm(struct cras_rstream *stream)
 {
-	return stream->shm_info.shm_fd;
+	return stream->shm;
 }
 
 /* Gets the total size of shm memory allocated. */
 static inline size_t cras_rstream_get_total_shm_size(
 		const struct cras_rstream *stream)
 {
-	if (stream->direction == CRAS_STREAM_OUTPUT)
-		return cras_shm_total_size(&stream->shm);
-
-	/* Use the shm size for loopback streams. */
-	return cras_shm_total_size(&stream->shm);
-}
-
-/* Gets shared memory region for this stream. */
-static inline
-struct cras_audio_shm *cras_rstream_input_shm(struct cras_rstream *stream)
-{
-	return &stream->shm;
-}
-
-/* Gets shared memory region for this stream. */
-static inline
-struct cras_audio_shm *cras_rstream_output_shm(struct cras_rstream *stream)
-{
-	return &stream->shm;
+	return cras_shm_total_size(stream->shm);
 }
 
 /* Checks if the stream uses an output device. */
@@ -307,13 +283,13 @@ unsigned int cras_rstream_dev_offset(const struct cras_rstream *rstream,
 
 static inline unsigned int cras_rstream_level(struct cras_rstream *rstream)
 {
-	const struct cras_audio_shm *shm = cras_rstream_input_shm(rstream);
+	const struct cras_audio_shm *shm = cras_rstream_shm(rstream);
 	return cras_shm_frames_written(shm);
 }
 
 static inline int cras_rstream_input_level_met(struct cras_rstream *rstream)
 {
-	const struct cras_audio_shm *shm = cras_rstream_input_shm(rstream);
+	const struct cras_audio_shm *shm = cras_rstream_shm(rstream);
 	return cras_shm_frames_written(shm) >= rstream->cb_threshold;
 }
 

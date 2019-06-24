@@ -23,6 +23,7 @@
 #include "cras_bt_adapter.h"
 #include "cras_bt_device.h"
 #include "cras_bt_constants.h"
+#include "cras_bt_log.h"
 #include "cras_bt_io.h"
 #include "cras_bt_profile.h"
 #include "cras_hfp_ag_profile.h"
@@ -34,7 +35,15 @@
 #include "cras_tm.h"
 #include "utlist.h"
 
-#define DEFAULT_HFP_MTU_BYTES 48
+
+/*
+ * Bluetooth Core 5.0 spec, vol 4, part B, section 2 describes
+ * the recommended HCI packet size in one USB transfer for CVSD
+ * and MSBC codec.
+ */
+#define USB_MSBC_PKT_SIZE	60
+#define USB_CVSD_PKT_SIZE	48
+#define DEFAULT_SCO_PKT_SIZE	USB_CVSD_PKT_SIZE
 
 
 static const unsigned int PROFILE_SWITCH_DELAY_MS = 500;
@@ -70,6 +79,8 @@ static const unsigned int PROFILE_CONN_RETRIES = 3;
  *    switch_profile_timer - The timer used to delay enabling iodev after
  *        profile switch.
  *    append_iodev_cb - The callback to trigger when an iodev is appended.
+ *    sco_fd - The file descriptor of the SCO connection.
+ *    sco_ref_count - The reference counts of the SCO connection.
  */
 struct cras_bt_device {
 	DBusConnection *conn;
@@ -91,6 +102,8 @@ struct cras_bt_device {
 	struct cras_timer *suspend_timer;
 	struct cras_timer *switch_profile_timer;
 	void (*append_iodev_cb)(void *data);
+	int sco_fd;
+	size_t sco_ref_count;
 
 	struct cras_bt_device *prev, *next;
 };
@@ -271,7 +284,7 @@ int cras_bt_device_disconnect(DBusConnection *conn,
 	return 0;
 }
 
-void cras_bt_device_destroy(struct cras_bt_device *device)
+static void cras_bt_device_destroy(struct cras_bt_device *device)
 {
 	struct cras_tm *tm = cras_system_state_get_tm();
 	DL_DELETE(devices, device);
@@ -282,10 +295,30 @@ void cras_bt_device_destroy(struct cras_bt_device *device)
 		cras_tm_cancel_timer(tm, device->switch_profile_timer);
 	if (device->suspend_timer)
 		cras_tm_cancel_timer(tm, device->suspend_timer);
+	free(device->adapter_obj_path);
 	free(device->object_path);
 	free(device->address);
 	free(device->name);
 	free(device);
+}
+
+void cras_bt_device_remove(struct cras_bt_device *device)
+{
+	/*
+	 * We expect BT stack to disconnect this device before removing it,
+	 * but it may not the case if there's issue at BT side. Print error
+	 * log whenever this happens.
+	 */
+	if (device->connected)
+		syslog(LOG_ERR, "Removing dev with connected profiles %u",
+		       device->connected_profiles);
+	/*
+	 * Possibly clean up the associated A2DP and HFP AG iodevs that are
+	 * still accessing this device.
+	 */
+	cras_a2dp_suspend_connected_device(device);
+	cras_hfp_ag_suspend_connected_device(device);
+	cras_bt_device_destroy(device);
 }
 
 void cras_bt_device_reset()
@@ -308,30 +341,6 @@ struct cras_bt_device *cras_bt_device_get(const char *object_path)
 	}
 
 	return NULL;
-}
-
-size_t cras_bt_device_get_list(struct cras_bt_device ***device_list_out)
-{
-	struct cras_bt_device *device;
-	struct cras_bt_device **device_list = NULL;
-	size_t num_devices = 0;
-
-	DL_FOREACH(devices, device) {
-		struct cras_bt_device **tmp;
-
-		tmp = realloc(device_list,
-			      sizeof(device_list[0]) * (num_devices + 1));
-		if (!tmp) {
-			free(device_list);
-			return -ENOMEM;
-		}
-
-		device_list = tmp;
-		device_list[num_devices++] = device;
-	}
-
-	*device_list_out = device_list;
-	return num_devices;
 }
 
 const char *cras_bt_device_object_path(const struct cras_bt_device *device)
@@ -443,6 +452,7 @@ destroy_bt_io:
 
 void cras_bt_device_a2dp_configured(struct cras_bt_device *device)
 {
+	BTLOG(btlog, BT_A2DP_CONFIGURED, device->connected_profiles, 0);
 	device->connected_profiles |= CRAS_BT_DEVICE_PROFILE_A2DP_SINK;
 }
 
@@ -468,6 +478,7 @@ int cras_bt_device_audio_gateway_initialized(struct cras_bt_device *device)
 	int rc = 0;
 	struct cras_tm *tm;
 
+	BTLOG(btlog, BT_AUDIO_GATEWAY_INIT, device->profiles, 0);
 	/* Marks HFP/HSP as connected. This is what connection watcher
 	 * checks. */
 	device->connected_profiles |=
@@ -565,6 +576,9 @@ static void bt_device_conn_watch_cb(struct cras_timer *timer, void *arg)
 	struct cras_tm *tm;
 	struct cras_bt_device *device = (struct cras_bt_device *)arg;
 
+	BTLOG(btlog, BT_DEV_CONN_WATCH_CB,
+	      device->conn_watch_retries,
+	      device->profiles);
 	device->conn_watch_timer = NULL;
 
 	/* If A2DP is not ready, try connect it after a while. */
@@ -640,6 +654,9 @@ static void cras_bt_device_set_connected(struct cras_bt_device *device,
 {
 	struct cras_tm *tm = cras_system_state_get_tm();
 
+	if (device->connected || value)
+		BTLOG(btlog, BT_DEV_CONNECTED_CHANGE, device->profiles, value);
+
 	if (device->connected && !value) {
 		cras_bt_profile_on_device_disconnected(device);
 		/* Device is disconnected, resets connected profiles. */
@@ -656,12 +673,50 @@ static void cras_bt_device_set_connected(struct cras_bt_device *device,
 	}
 }
 
+/*
+ * Check if the uuid is of a new audio profile that isn't listed
+ * as supported by device.
+ * Args:
+ *    device - The BT device holding supported profiles bitmap.
+ *    uuid - UUID string from the device properties notified by BlueZ.
+ * Returns:
+ *    True if uuid is a new audio profiles not already supported by device.
+ */
+static int update_supported_profiles(struct cras_bt_device *device,
+				     const char *uuid)
+{
+	static unsigned int audio_profiles =
+			CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
+			CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE |
+			CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY;
+
+	enum cras_bt_device_profile profile =
+			cras_bt_device_profile_from_uuid(uuid);
+
+	if (profile == 0)
+		return 0;
+
+	/* Do nothing if this profile is not new. */
+	if (device->profiles & profile)
+		return 0;
+
+	/* Log this event as we might need to re-intialize the BT audio nodes
+	 * if new audio profile is reported for already connected device. */
+	if (device->connected && (profile & audio_profiles))
+		BTLOG(btlog, BT_NEW_AUDIO_PROFILE_AFTER_CONNECT,
+		      device->profiles, profile);
+	device->profiles |= profile;
+	cras_bt_device_log_profile(device, profile);
+
+	return (profile & audio_profiles);
+}
+
 void cras_bt_device_update_properties(struct cras_bt_device *device,
 				      DBusMessageIter *properties_array_iter,
 				      DBusMessageIter *invalidated_array_iter)
 {
 
-	int get_profile = 0;
+	int has_new_audio_profile = 0;
 
 	while (dbus_message_iter_get_arg_type(properties_array_iter) !=
 	       DBUS_TYPE_INVALID) {
@@ -726,17 +781,12 @@ void cras_bt_device_update_properties(struct cras_bt_device *device,
 			while (dbus_message_iter_get_arg_type(
 				       &uuid_array_iter) != DBUS_TYPE_INVALID) {
 				const char *uuid;
-				enum cras_bt_device_profile profile;
-
-				get_profile = 1;
 
 				dbus_message_iter_get_basic(&uuid_array_iter,
 							    &uuid);
-				profile = cras_bt_device_profile_from_uuid(
-					uuid);
 
-				device->profiles |= profile;
-				cras_bt_device_log_profile(device, profile);
+				has_new_audio_profile =
+					update_supported_profiles(device, uuid);
 
 				dbus_message_iter_next(&uuid_array_iter);
 			}
@@ -776,12 +826,12 @@ void cras_bt_device_update_properties(struct cras_bt_device *device,
 		dbus_message_iter_next(invalidated_array_iter);
 	}
 
-	/* If updated properties includes profile, and device is connected,
-	 * we need to start connection watcher. This is needed because on
-	 * some bluetooth device, supported profiles do not present when
-	 * device interface is added and they are updated later.
+	/* If updated properties includes new audio profile, and device is
+	 * connected, we need to start connection watcher. This is needed
+	 * because on some bluetooth device, supported profiles do not present
+	 * when device interface is added and they are updated later.
 	 */
-	if (get_profile && device->connected) {
+	if (has_new_audio_profile && device->connected) {
 		cras_bt_device_start_new_conn_watch_timer(device);
 	}
 }
@@ -812,7 +862,30 @@ static int bt_address(const char *str, struct sockaddr *addr)
 	return 0;
 }
 
-int cras_bt_device_sco_connect(struct cras_bt_device *device)
+/* Apply codec specific settings to the socket fd. */
+static int apply_codec_settings(int fd, uint8_t codec)
+{
+	struct bt_voice voice;
+
+	memset(&voice, 0, sizeof(voice));
+	if (codec == HFP_CODEC_ID_CVSD)
+		return 0;
+
+	if (codec != HFP_CODEC_ID_MSBC) {
+		syslog(LOG_ERR, "Unsupported codec %d", codec);
+		return -1;
+	}
+
+	voice.setting = BT_VOICE_TRANSPARENT;
+
+	if (setsockopt(fd, SOL_BLUETOOTH, BT_VOICE, &voice, sizeof(voice)) < 0) {
+		syslog(LOG_ERR, "Failed to apply voice setting");
+		return -1;
+	}
+	return 0;
+}
+
+int cras_bt_device_sco_connect(struct cras_bt_device *device, int codec)
 {
 	int sk = 0, err;
 	struct sockaddr addr;
@@ -827,7 +900,8 @@ int cras_bt_device_sco_connect(struct cras_bt_device *device)
 		goto error;
 	}
 
-	sk = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO);
+	sk = socket(PF_BLUETOOTH, SOCK_SEQPACKET | O_NONBLOCK | SOCK_CLOEXEC,
+		    BTPROTO_SCO);
 	if (sk < 0) {
 		syslog(LOG_ERR, "Failed to create socket: %s (%d)",
 				strerror(errno), errno);
@@ -851,6 +925,11 @@ int cras_bt_device_sco_connect(struct cras_bt_device *device)
 
 	if (bt_address(cras_bt_device_address(device), &addr))
 		goto error;
+
+	err = apply_codec_settings(sk, codec);
+	if (err)
+		goto error;
+
 	err = connect(sk, (struct sockaddr *) &addr, sizeof(addr));
 	if (err && errno != EINPROGRESS) {
 		syslog(LOG_ERR, "Failed to connect: %s (%d)",
@@ -871,27 +950,37 @@ int cras_bt_device_sco_connect(struct cras_bt_device *device)
 		goto error;
 	}
 
+	BTLOG(btlog, BT_SCO_CONNECT, 1, sk);
 	return sk;
 
 error:
+	BTLOG(btlog, BT_SCO_CONNECT, 0, sk);
 	if (sk)
 		close(sk);
 	return -1;
 }
 
-int cras_bt_device_sco_mtu(struct cras_bt_device *device, int sco_socket)
+
+
+int cras_bt_device_sco_packet_size(struct cras_bt_device *device,
+				   int sco_socket, int codec)
 {
 	struct sco_options so;
 	socklen_t len = sizeof(so);
 	struct cras_bt_adapter *adapter;
 
 	adapter = cras_bt_adapter_get(device->adapter_obj_path);
-	if (cras_bt_adapter_on_usb(adapter))
-		return DEFAULT_HFP_MTU_BYTES;
 
+	if (cras_bt_adapter_on_usb(adapter)) {
+		return (codec == HFP_CODEC_ID_MSBC)
+				? USB_MSBC_PKT_SIZE
+				: USB_CVSD_PKT_SIZE;
+	}
+
+	/* For non-USB cases, query the SCO MTU from driver. */
 	if (getsockopt(sco_socket, SOL_SCO, SCO_OPTIONS, &so, &len) < 0) {
 		syslog(LOG_ERR, "Get SCO options error: %s", strerror(errno));
-		return DEFAULT_HFP_MTU_BYTES;
+		return DEFAULT_SCO_PKT_SIZE;
 	}
 	return so.mtu;
 }
@@ -995,18 +1084,6 @@ int cras_bt_device_switch_profile(struct cras_bt_device *device,
 	return rc;
 }
 
-void cras_bt_device_iodev_buffer_size_changed(struct cras_bt_device *device)
-{
-	struct cras_iodev *iodev;
-
-	iodev = device->bt_iodevs[CRAS_STREAM_INPUT];
-	if (iodev && cras_iodev_is_open(iodev))
-		cras_bt_io_update_buffer_size(iodev);
-	iodev = device->bt_iodevs[CRAS_STREAM_OUTPUT];
-	if (iodev && cras_iodev_is_open(iodev))
-		cras_bt_io_update_buffer_size(iodev);
-}
-
 static void profile_switch_delay_cb(struct cras_timer *timer, void *arg)
 {
 	struct cras_bt_device *device = (struct cras_bt_device *)arg;
@@ -1025,11 +1102,8 @@ static void profile_switch_delay_cb(struct cras_timer *timer, void *arg)
 	 * We should NOT call into update_active_node from main thread
 	 * because that may mess up the active node content.
 	 */
-	if (cras_iodev_list_dev_is_enabled(iodev))
-		return;
-
 	iodev->update_active_node(iodev, 0, 1);
-	cras_iodev_list_enable_dev(iodev);
+	cras_iodev_list_resume_dev(iodev->info.idx);
 }
 
 static void bt_device_switch_profile_with_delay(struct cras_bt_device *device,
@@ -1053,20 +1127,17 @@ static void bt_device_switch_profile(struct cras_bt_device *device,
 				     int enable_dev)
 {
 	struct cras_iodev *iodev;
-	int was_enabled[CRAS_NUM_DIRECTIONS] = {0};
 	int dir;
 
-	/* If a bt iodev is active, temporarily remove it from the active
-	 * device list. Note that we need to check all bt_iodevs for the
-	 * situation that both input and output are active while switches
-	 * from HFP/HSP to A2DP.
+	/* If a bt iodev is active, temporarily force close it.
+	 * Note that we need to check all bt_iodevs for the situation that both
+	 * input and output are active while switches from HFP/HSP to A2DP.
 	 */
 	for (dir = 0; dir < CRAS_NUM_DIRECTIONS; dir++) {
 		iodev = device->bt_iodevs[dir];
 		if (!iodev)
 			continue;
-		was_enabled[dir] = cras_iodev_list_dev_is_enabled(iodev);
-		cras_iodev_list_disable_dev(iodev, false);
+		cras_iodev_list_suspend_dev(iodev->info.idx);
 	}
 
 	for (dir = 0; dir < CRAS_NUM_DIRECTIONS; dir++) {
@@ -1082,16 +1153,13 @@ static void bt_device_switch_profile(struct cras_bt_device *device,
 		 * would fail to playback afterwards when the switching happens
 		 * too soon, so put this task in a delayed callback.
 		 */
-		if (was_enabled[dir] ||
-		    (enable_dev && iodev == bt_iodev)) {
-			if (dir == CRAS_STREAM_INPUT) {
-				iodev->update_active_node(iodev, 0, 1);
-				cras_iodev_list_enable_dev(iodev);
-			} else {
-				bt_device_switch_profile_with_delay(
-						device,
-						PROFILE_SWITCH_DELAY_MS);
-			}
+		if (dir == CRAS_STREAM_INPUT) {
+			iodev->update_active_node(iodev, 0, 1);
+			cras_iodev_list_resume_dev(iodev->info.idx);
+		} else {
+			bt_device_switch_profile_with_delay(
+					device,
+					PROFILE_SWITCH_DELAY_MS);
 		}
 	}
 }
@@ -1100,6 +1168,7 @@ static void bt_device_suspend_cb(struct cras_timer *timer, void *arg)
 {
 	struct cras_bt_device *device = (struct cras_bt_device *)arg;
 
+	BTLOG(btlog, BT_DEV_SUSPEND_CB, 0, 0);
 	device->suspend_timer = NULL;
 
 	cras_a2dp_suspend_connected_device(device);
@@ -1181,4 +1250,25 @@ void cras_bt_device_update_hardware_volume(struct cras_bt_device *device,
 
 	iodev->active_node->volume = volume;
 	cras_iodev_list_notify_node_volume(iodev->active_node);
+}
+
+int cras_bt_device_get_sco(struct cras_bt_device *device, int codec)
+{
+	if (device->sco_ref_count == 0) {
+		device->sco_fd = cras_bt_device_sco_connect(device, codec);
+		if (device->sco_fd < 0)
+			return device->sco_fd;
+	}
+
+	++device->sco_ref_count;
+	return 0;
+}
+
+void cras_bt_device_put_sco(struct cras_bt_device *device)
+{
+	if (device->sco_ref_count == 0)
+		return;
+
+	if (--device->sco_ref_count == 0)
+		close(device->sco_fd);
 }

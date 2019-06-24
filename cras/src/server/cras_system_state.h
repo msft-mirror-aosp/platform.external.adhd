@@ -13,6 +13,7 @@
 #ifndef CRAS_SYSTEM_STATE_H_
 #define CRAS_SYSTEM_STATE_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "cras_types.h"
@@ -122,6 +123,15 @@ int cras_system_get_default_output_buffer_size();
 
 /* Returns if system aec is supported. */
 int cras_system_get_aec_supported();
+
+/* Returns the system aec group id is available. */
+int cras_system_get_aec_group_id();
+
+/* Sets the flag to enable or disable bluetooth wideband speech feature. */
+void cras_system_set_bt_wbs_enabled(bool enabled);
+
+/* Gets the elable flag of bluetooth wideband speech feature. */
+bool cras_system_get_bt_wbs_enabled();
 
 /* Adds a card at the given index to the system.  When a new card is found
  * (through a udev event notification) this will add the card to the system,
@@ -318,5 +328,10 @@ void cras_system_state_add_snapshot(struct cras_audio_thread_snapshot *);
  * Dump snapshots from system state to shared memory with client
  */
 void cras_system_state_dump_snapshots();
+
+/*
+ * Returns true if in the main thread.
+ */
+int cras_system_state_in_main_thread();
 
 #endif /* CRAS_SYSTEM_STATE_H_ */

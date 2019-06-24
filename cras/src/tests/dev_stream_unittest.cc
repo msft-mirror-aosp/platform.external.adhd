@@ -107,6 +107,7 @@ static int cras_rstream_audio_ready_called;
 static int cras_rstream_audio_ready_count;
 static int cras_rstream_is_pending_reply_ret;
 static int cras_rstream_flush_old_audio_messages_called;
+static int cras_server_metrics_missed_cb_event_called;
 
 class CreateSuite : public testing::Test{
   protected:
@@ -128,6 +129,7 @@ class CreateSuite : public testing::Test{
       rstream_.format.num_channels = 2;
       rstream_.format = fmt_s16le_44_1;
       rstream_.flags = 0;
+      rstream_.num_missed_cb = 0;
 
       config_format_converter_from_fmt = NULL;
       config_format_converter_called = 0;
@@ -138,6 +140,7 @@ class CreateSuite : public testing::Test{
       cras_rstream_audio_ready_count = 0;
       cras_rstream_is_pending_reply_ret = 0;
       cras_rstream_flush_old_audio_messages_called = 0;
+      cras_server_metrics_missed_cb_event_called = 0;
 
       memset(&copy_area_call, 0xff, sizeof(copy_area_call));
       memset(&conv_frames_call, 0xff, sizeof(conv_frames_call));
@@ -164,7 +167,7 @@ class CreateSuite : public testing::Test{
           sizeof(*area) + 2 * sizeof(struct cras_channel_area));
       stream_area->num_channels = 2;
       rstream_.audio_area = stream_area;
-      int16_t *shm_samples = (int16_t *)rstream_.shm.area->samples;
+      int16_t* shm_samples = (int16_t*)rstream_.shm->area->samples;
       stream_area->channels[0].step_bytes = 4;
       stream_area->channels[0].buf = (uint8_t *)(shm_samples);
       stream_area->channels[1].step_bytes = 4;
@@ -174,12 +177,17 @@ class CreateSuite : public testing::Test{
     virtual void TearDown() {
       free(area);
       free(stream_area);
-      free(rstream_.shm.area);
+      free(rstream_.shm->area);
+      free(rstream_.shm);
       audio_thread_event_log_deinit(atlog);
     }
 
-    void SetupShm(struct cras_audio_shm *shm) {
+    void SetupShm(struct cras_audio_shm** shm_out) {
       int16_t *buf;
+      struct cras_audio_shm* shm;
+
+      shm = static_cast<struct cras_audio_shm*>(
+          calloc(1, sizeof(struct cras_audio_shm)));
 
       shm->area = static_cast<struct cras_audio_shm_area *>(
           calloc(1, kBufferFrames * 4 + sizeof(cras_audio_shm_area)));
@@ -192,6 +200,8 @@ class CreateSuite : public testing::Test{
         buf[i] = i;
       cras_shm_set_mute(shm, 0);
       cras_shm_set_volume_scaler(shm, 1.0);
+
+      *shm_out = shm;
     }
 
     void SetUpFmtConv(unsigned int in_rate, unsigned int out_rate,
@@ -671,31 +681,6 @@ TEST_F(CreateSuite, DevStreamIsPending) {
   dev_stream_destroy(dev_stream);
 }
 
-TEST_F(CreateSuite, StreamCanFetch) {
-  struct dev_stream *dev_stream;
-  unsigned int dev_id = 9;
-
-  dev_stream = dev_stream_create(&rstream_, dev_id, &fmt_s16le_44_1,
-                                 (void *)0x55, &cb_ts);
-
-  /* Verify stream cannot fetch when it's still pending. */
-  cras_rstream_is_pending_reply_ret = 1;
-  EXPECT_EQ(0, dev_stream_can_fetch(dev_stream));
-
-  /* Verify stream can fetch when buffer available. */
-  cras_rstream_is_pending_reply_ret = 0;
-  rstream_.shm.area->write_offset[0] = 0;
-  rstream_.shm.area->write_offset[1] = 0;
-  EXPECT_EQ(1, dev_stream_can_fetch(dev_stream));
-
-  /* Verify stream cannot fetch when there's still buffer. */
-  cras_rstream_is_pending_reply_ret = 0;
-  rstream_.shm.area->write_offset[0] = kBufferFrames;
-  rstream_.shm.area->write_offset[1] = kBufferFrames;
-  EXPECT_EQ(0, dev_stream_can_fetch(dev_stream));
-  dev_stream_destroy(dev_stream);
-}
-
 TEST_F(CreateSuite, StreamCanSend) {
   struct dev_stream *dev_stream;
   unsigned int dev_id = 9;
@@ -717,6 +702,7 @@ TEST_F(CreateSuite, StreamCanSend) {
   clock_gettime_retspec.tv_nsec = 0;
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(0, cras_rstream_audio_ready_called);
+  EXPECT_EQ(0, cras_server_metrics_missed_cb_event_called);
   EXPECT_EQ(0, rc);
 
   // Case 2: Not enough samples. Time is late enough.
@@ -729,6 +715,7 @@ TEST_F(CreateSuite, StreamCanSend) {
   // Stream still can not send samples to client.
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(0, cras_rstream_audio_ready_called);
+  EXPECT_EQ(0, cras_server_metrics_missed_cb_event_called);
   EXPECT_EQ(0, rc);
 
   // Case 3: Enough samples. Time is not late enough.
@@ -739,10 +726,11 @@ TEST_F(CreateSuite, StreamCanSend) {
   clock_gettime_retspec.tv_nsec = 0;
   // Enough samples are written.
   written_frames = rstream_.cb_threshold + 10;
-  cras_shm_buffer_written(&rstream_.shm, written_frames);
+  cras_shm_buffer_written(rstream_.shm, written_frames);
   // Stream still can not send samples to client.
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(0, cras_rstream_audio_ready_called);
+  EXPECT_EQ(0, cras_server_metrics_missed_cb_event_called);
   EXPECT_EQ(0, rc);
 
   // Case 4: Enough samples. Time is late enough.
@@ -752,6 +740,7 @@ TEST_F(CreateSuite, StreamCanSend) {
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(1, cras_rstream_audio_ready_called);
   EXPECT_EQ(rstream_.cb_threshold, cras_rstream_audio_ready_count);
+  EXPECT_EQ(0, cras_server_metrics_missed_cb_event_called);
   EXPECT_EQ(0, rc);
 
   // Check next_cb_ts is increased by one sleep interval.
@@ -776,6 +765,7 @@ TEST_F(CreateSuite, StreamCanSend) {
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(1, cras_rstream_audio_ready_called);
   EXPECT_EQ(rstream_.cb_threshold, cras_rstream_audio_ready_count);
+  EXPECT_EQ(1, cras_server_metrics_missed_cb_event_called);
   EXPECT_EQ(0, rc);
 
   // Check next_cb_ts is rest to be now plus one sleep interval.
@@ -833,7 +823,7 @@ TEST_F(CreateSuite, StreamCanSendBulkAudio) {
   clock_gettime_retspec.tv_nsec = 0;
   // Enough samples are written.
   written_frames = rstream_.cb_threshold + 10;
-  cras_shm_buffer_written(&rstream_.shm, written_frames);
+  cras_shm_buffer_written(rstream_.shm, written_frames);
   // Bulk audio stream can send all written samples to client.
   rc = dev_stream_capture_update_rstream(dev_stream);
   EXPECT_EQ(1, cras_rstream_audio_ready_called);
@@ -878,7 +868,7 @@ TEST_F(CreateSuite, TriggerOnlyStreamSendOnlyOnce) {
   dev_stream->stream->triggered = 0;
 
   // Check first trigger callback called.
-  cras_shm_buffer_written(&rstream_.shm, rstream_.cb_threshold);
+  cras_shm_buffer_written(rstream_.shm, rstream_.cb_threshold);
   clock_gettime_retspec.tv_sec = 1;
   clock_gettime_retspec.tv_nsec = 0;
   dev_stream_capture_update_rstream(dev_stream);
@@ -886,7 +876,7 @@ TEST_F(CreateSuite, TriggerOnlyStreamSendOnlyOnce) {
   EXPECT_EQ(1, dev_stream->stream->triggered);
 
   // No future callback will be called for TRIGGER_ONLY streams.
-  cras_shm_buffer_written(&rstream_.shm, rstream_.cb_threshold);
+  cras_shm_buffer_written(rstream_.shm, rstream_.cb_threshold);
   clock_gettime_retspec.tv_sec = 2;
   clock_gettime_retspec.tv_nsec = 0;
   dev_stream_capture_update_rstream(dev_stream);
@@ -913,7 +903,7 @@ TEST_F(CreateSuite, InputDevStreamWakeTimeByNextCbTs) {
 
   // Assume there are enough samples for stream.
   written_frames = rstream_.cb_threshold + 10;
-  cras_shm_buffer_written(&rstream_.shm, written_frames);
+  cras_shm_buffer_written(rstream_.shm, written_frames);
 
   rc = dev_stream_wake_time(dev_stream, curr_level,
                             &level_tstamp, rstream_.cb_threshold, 0,
@@ -948,7 +938,7 @@ TEST_F(CreateSuite, InputDevStreamWakeTimeByDevice) {
 
   // Assume there are not enough samples for stream.
   written_frames = 123;
-  cras_shm_buffer_written(&rstream_.shm, written_frames);
+  cras_shm_buffer_written(rstream_.shm, written_frames);
 
   // Compute wake up time for device level to reach enough samples
   // for one cb_threshold:
@@ -996,6 +986,45 @@ TEST_F(CreateSuite, InputDevStreamWakeTimeByDevice) {
   EXPECT_EQ(rstream_.next_cb_ts.tv_sec, wake_time_out.tv_sec);
   EXPECT_EQ(rstream_.next_cb_ts.tv_nsec, wake_time_out.tv_nsec);
   EXPECT_EQ(0, rc);
+  dev_stream_destroy(dev_stream);
+}
+
+TEST_F(CreateSuite, UpdateNextWakeTime) {
+  struct dev_stream *dev_stream;
+  unsigned int dev_id = 9;
+  struct timespec expected_next_cb_ts;
+
+  rstream_.direction = CRAS_STREAM_OUTPUT;
+  dev_stream = dev_stream_create(&rstream_, dev_id, &fmt_s16le_44_1,
+                                 (void *) 0x55, &cb_ts);
+
+  // Case 1: The new next_cb_ts is greater than now. Do not need to reschedule.
+  rstream_.next_cb_ts.tv_sec = 2;
+  rstream_.next_cb_ts.tv_nsec = 0;
+  clock_gettime_retspec.tv_sec = 2;
+  clock_gettime_retspec.tv_nsec = 500;
+  expected_next_cb_ts = rstream_.next_cb_ts;
+
+  dev_stream_update_next_wake_time(dev_stream);
+  EXPECT_EQ(0, cras_server_metrics_missed_cb_event_called);
+  add_timespecs(&expected_next_cb_ts,
+                &rstream_.sleep_interval_ts);
+  EXPECT_EQ(expected_next_cb_ts.tv_sec, rstream_.next_cb_ts.tv_sec);
+  EXPECT_EQ(expected_next_cb_ts.tv_nsec, rstream_.next_cb_ts.tv_nsec);
+
+  // Case 2: The new next_cb_ts is less than now. Need to reset schedule.
+  rstream_.next_cb_ts.tv_sec = 2;
+  rstream_.next_cb_ts.tv_nsec = 0;
+  clock_gettime_retspec.tv_sec = 3;
+  clock_gettime_retspec.tv_nsec = 0;
+  expected_next_cb_ts = clock_gettime_retspec;
+
+  dev_stream_update_next_wake_time(dev_stream);
+  EXPECT_EQ(1, cras_server_metrics_missed_cb_event_called);
+  add_timespecs(&expected_next_cb_ts,
+                &rstream_.sleep_interval_ts);
+  EXPECT_EQ(expected_next_cb_ts.tv_sec, rstream_.next_cb_ts.tv_sec);
+  EXPECT_EQ(expected_next_cb_ts.tv_nsec, rstream_.next_cb_ts.tv_nsec);
   dev_stream_destroy(dev_stream);
 }
 
@@ -1286,8 +1315,13 @@ int cras_rstream_flush_old_audio_messages(struct  cras_rstream *stream)
   return 0;
 }
 
+int cras_server_metrics_missed_cb_event(const struct cras_rstream* stream) {
+  cras_server_metrics_missed_cb_event_called++;
+  return 0;
+}
+
 //  From librt.
-int clock_gettime(clockid_t clk_id, struct timespec *tp) {
+int clock_gettime(clockid_t clk_id, struct timespec* tp) {
   tp->tv_sec = clock_gettime_retspec.tv_sec;
   tp->tv_nsec = clock_gettime_retspec.tv_nsec;
   return 0;

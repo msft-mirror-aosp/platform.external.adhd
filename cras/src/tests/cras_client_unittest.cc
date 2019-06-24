@@ -19,9 +19,7 @@ static int pthread_join_called;
 static int pthread_cond_timedwait_called;
 static int pthread_cond_timedwait_retval;
 static int close_called;
-static int pipe_called;
 static int sendmsg_called;
-static int write_called;
 static void *mmap_return_value;
 static int samples_ready_called;
 static int samples_ready_frames_value;
@@ -37,9 +35,7 @@ void InitStaticVariables() {
   pthread_cond_timedwait_called = 0;
   pthread_cond_timedwait_retval = 0;
   close_called = 0;
-  pipe_called = 0;
   sendmsg_called = 0;
-  write_called = 0;
   pthread_create_returned_value = 0;
   mmap_return_value = NULL;
   samples_ready_called = 0;
@@ -48,19 +44,25 @@ void InitStaticVariables() {
 
 class CrasClientTestSuite : public testing::Test {
   protected:
-
-    void InitShm(struct cras_audio_shm* shm) {
-      shm->area = static_cast<cras_audio_shm_area*>(
-          calloc(1, sizeof(*shm->area)));
-      cras_shm_set_frame_bytes(shm, 4);
-      cras_shm_set_used_size(shm, shm_writable_frames_ * 4);
-      memcpy(&shm->area->config, &shm->config, sizeof(shm->config));
-    }
+   struct cras_audio_shm* InitShm() {
+     struct cras_audio_shm* shm =
+         static_cast<struct cras_audio_shm*>(calloc(1, sizeof(*shm)));
+     shm->area =
+         static_cast<cras_audio_shm_area*>(calloc(1, sizeof(*shm->area)));
+     cras_shm_set_frame_bytes(shm, 4);
+     cras_shm_set_used_size(shm, shm_writable_frames_ * 4);
+     memcpy(&shm->area->config, &shm->config, sizeof(shm->config));
+     return shm;
+   }
 
     void FreeShm(struct cras_audio_shm* shm) {
-      if (shm->area) {
-        free(shm->area);
-        shm->area = NULL;
+      if (shm) {
+        if (shm->area) {
+          free(shm->area);
+          shm->area = NULL;
+        }
+        free(shm);
+        shm = NULL;
       }
     }
 
@@ -85,6 +87,8 @@ class CrasClientTestSuite : public testing::Test {
         free(stream_.config);
         stream_.config = NULL;
       }
+
+      FreeShm(stream_.shm);
     }
 
     void StreamConnected(CRAS_STREAM_DIRECTION direction);
@@ -120,12 +124,13 @@ int capture_samples_ready(cras_client* client,
 }
 
 TEST_F(CrasClientTestSuite, HandleCaptureDataReady) {
-  struct cras_audio_shm *shm = &stream_.capture_shm;
+  struct cras_audio_shm* shm;
 
   stream_.direction = CRAS_STREAM_INPUT;
 
   shm_writable_frames_ = 480;
-  InitShm(shm);
+  shm = InitShm();
+  stream_.shm = shm;
   stream_.config->buffer_frames = 480;
   stream_.config->cb_threshold = 480;
   stream_.config->aud_cb = capture_samples_ready;
@@ -164,7 +169,6 @@ TEST_F(CrasClientTestSuite, HandleCaptureDataReady) {
   handle_capture_data_ready(&stream_, 480);
   EXPECT_EQ(1, samples_ready_called);
   EXPECT_EQ(0, shm->area->read_buf_idx);
-  FreeShm(shm);
 }
 
 void CrasClientTestSuite::StreamConnected(CRAS_STREAM_DIRECTION direction) {
@@ -173,7 +177,7 @@ void CrasClientTestSuite::StreamConnected(CRAS_STREAM_DIRECTION direction) {
   int shm_max_size = 600;
   size_t format_bytes;
   size_t effects = 123;
-  struct cras_audio_shm_area area;
+  struct cras_audio_shm_area* area;
 
   stream_.direction = direction;
   set_audio_format(&stream_.config->format, SND_PCM_FORMAT_S16_LE, 48000, 4);
@@ -183,11 +187,11 @@ void CrasClientTestSuite::StreamConnected(CRAS_STREAM_DIRECTION direction) {
 
   // Initialize shm area
   format_bytes = cras_get_format_bytes(&server_format);
-  memset(&area, 0, sizeof(area));
-  area.config.frame_bytes = format_bytes;
-  area.config.used_size = shm_writable_frames_ * format_bytes;
+  area = (struct cras_audio_shm_area*)calloc(1, sizeof(*area));
+  area->config.frame_bytes = format_bytes;
+  area->config.used_size = shm_writable_frames_ * format_bytes;
 
-  mmap_return_value = &area;
+  mmap_return_value = area;
 
   cras_fill_client_stream_connected(
       &msg,
@@ -201,13 +205,7 @@ void CrasClientTestSuite::StreamConnected(CRAS_STREAM_DIRECTION direction) {
 
   EXPECT_EQ(CRAS_THREAD_RUNNING, stream_.thread.state);
 
-  if (direction == CRAS_STREAM_OUTPUT) {
-    EXPECT_EQ(NULL, stream_.capture_shm.area);
-    EXPECT_EQ(&area, stream_.play_shm.area);
-  } else {
-    EXPECT_EQ(NULL, stream_.play_shm.area);
-    EXPECT_EQ(&area, stream_.capture_shm.area);
-  }
+  EXPECT_EQ(area, stream_.shm->area);
 }
 
 TEST_F(CrasClientTestSuite, InputStreamConnected) {
@@ -273,14 +271,21 @@ TEST_F(CrasClientTestSuite, OutputStreamConnectedFail) {
 
 TEST_F(CrasClientTestSuite, AddAndRemoveStream) {
   cras_stream_id_t stream_id;
+  struct cras_disconnect_stream_message msg;
+  int serv_fds[2];
+  int rc;
 
-  // Dynamically allocat the stream so that it can be freed later.
+  // Dynamically allocate the stream so that it can be freed later.
   struct client_stream* stream_ptr = (struct client_stream *)
       malloc(sizeof(*stream_ptr));
   memcpy(stream_ptr, &stream_, sizeof(client_stream));
+
   stream_ptr->config = (struct cras_stream_params *)
       malloc(sizeof(*(stream_ptr->config)));
   memcpy(stream_ptr->config, stream_.config, sizeof(*(stream_.config)));
+
+  stream_ptr->wake_fds[0] = -1;
+  stream_ptr->wake_fds[1] = -1;
 
   pthread_cond_timedwait_retval = ETIMEDOUT;
   EXPECT_EQ(-ETIMEDOUT, client_thread_add_stream(
@@ -294,20 +299,89 @@ TEST_F(CrasClientTestSuite, AddAndRemoveStream) {
   EXPECT_EQ(&client_, stream_ptr->client);
   EXPECT_EQ(stream_id, stream_ptr->id);
   EXPECT_EQ(pthread_create_called, 1);
-  EXPECT_EQ(pipe_called, 1);
+  EXPECT_NE(-1, stream_ptr->wake_fds[0]);
+  EXPECT_NE(-1, stream_ptr->wake_fds[1]);
   EXPECT_EQ(1, sendmsg_called); // send connect message to server
   EXPECT_EQ(stream_ptr, stream_from_id(&client_, stream_id));
 
   stream_ptr->thread.state = CRAS_THREAD_RUNNING;
 
+  rc = pipe(serv_fds);
+  EXPECT_EQ(0, rc);
+  client_.server_fd = serv_fds[1];
+  client_.server_fd_state = CRAS_SOCKET_STATE_CONNECTED;
   EXPECT_EQ(0, client_thread_rm_stream(&client_, stream_id));
 
-  // One for the disconnect message to server,
-  // the other is to wake_up the audio thread
-  EXPECT_EQ(2, write_called);
+  rc = read(serv_fds[0], &msg, sizeof(msg));
+  EXPECT_EQ(sizeof(msg), rc);
+  EXPECT_EQ(stream_id, msg.stream_id);
   EXPECT_EQ(1, pthread_join_called);
 
   EXPECT_EQ(NULL, stream_from_id(&client_, stream_id));
+}
+
+TEST_F(CrasClientTestSuite, SetOutputStreamVolume) {
+  cras_stream_id_t stream_id;
+
+  client_thread_add_stream(&client_, &stream_, &stream_id, NO_DEVICE);
+  EXPECT_EQ(&stream_, stream_from_id(&client_, stream_id));
+
+  /* Set volume before stream connected. */
+  client_thread_set_stream_volume(&client_, stream_id, 0.3f);
+  StreamConnected(CRAS_STREAM_OUTPUT);
+  EXPECT_EQ(0.3f, cras_shm_get_volume_scaler(stream_.shm));
+
+  /* Set volume after stream connected. */
+  client_thread_set_stream_volume(&client_, stream_id, 0.6f);
+  EXPECT_EQ(0.6f, cras_shm_get_volume_scaler(stream_.shm));
+}
+
+TEST_F(CrasClientTestSuite, SetInputStreamVolume) {
+  cras_stream_id_t stream_id;
+
+  client_thread_add_stream(&client_, &stream_, &stream_id, NO_DEVICE);
+  EXPECT_EQ(&stream_, stream_from_id(&client_, stream_id));
+
+  /* Set volume before stream connected. */
+  client_thread_set_stream_volume(&client_, stream_id, 0.3f);
+  StreamConnected(CRAS_STREAM_INPUT);
+  EXPECT_EQ(0.3f, cras_shm_get_volume_scaler(stream_.shm));
+
+  /* Set volume after stream connected. */
+  client_thread_set_stream_volume(&client_, stream_id, 0.6f);
+  EXPECT_EQ(0.6f, cras_shm_get_volume_scaler(stream_.shm));
+}
+
+TEST(CrasClientTest, InitStreamVolume) {
+  cras_stream_id_t stream_id;
+  struct cras_stream_params config;
+  struct add_stream_command_message cmd_msg;
+  int rc;
+  struct cras_client client;
+
+  memset(&client, 0, sizeof(client));
+  client.server_fd_state = CRAS_SOCKET_STATE_CONNECTED;
+
+  config.aud_cb = reinterpret_cast<cras_playback_cb_t>(0x123);
+  config.err_cb = reinterpret_cast<cras_error_cb_t>(0x456);
+  client.thread.state = CRAS_THREAD_RUNNING;
+  rc = pipe(client.command_reply_fds);
+  EXPECT_EQ(0, rc);
+  rc = pipe(client.command_fds);
+  EXPECT_EQ(0, rc);
+
+  rc = write(client.command_reply_fds[1], &rc, sizeof(rc));
+  cras_client_add_stream(&client, &stream_id, &config);
+
+  rc = read(client.command_fds[0], &cmd_msg, sizeof(cmd_msg));
+  EXPECT_EQ(sizeof(cmd_msg), rc);
+  EXPECT_NE((void *)NULL, cmd_msg.stream);
+
+  EXPECT_EQ(1.0f, cmd_msg.stream->volume_scaler);
+
+  if (cmd_msg.stream->config)
+    free(cmd_msg.stream->config);
+  free(cmd_msg.stream);
 }
 
 } // namepsace
@@ -320,21 +394,9 @@ int main(int argc, char **argv) {
 /* stubs */
 extern "C" {
 
-ssize_t write(int fd, const void *buf, size_t count) {
-  ++write_called;
-  return count;
-}
-
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   ++sendmsg_called;
   return msg->msg_iov->iov_len;
-}
-
-int pipe(int pipefd[2]) {
-  pipefd[0] = 1;
-  pipefd[1] = 2;
-  ++pipe_called;
-  return 0;
 }
 
 int close(int fd) {
