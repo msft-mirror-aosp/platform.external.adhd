@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <syslog.h>
 #include "cras_dsp_ini.h"
+#include "iniparser_wrapper.h"
 
 #define MAX_INI_KEY_LENGTH 64  /* names like "output_source:output_0" */
 #define MAX_NR_PORT 128	/* the max number of ports for a plugin */
 #define MAX_PORT_NAME_LENGTH 20 /* names like "output_32" */
+#define MAX_DUMMY_INI_CH 8 /* Max number of channels to create dummy ini */
 
 /* Format of the ini file (See dsp.ini.sample for an example).
 
@@ -71,7 +73,7 @@ static int lookup_flow(struct ini *ini, const char *name)
 	int i;
 	const struct flow *flow;
 
-	FOR_ARRAY_ELEMENT(&ini->flows, i, flow) {
+	ARRAY_ELEMENT_FOREACH(&ini->flows, i, flow) {
 		if (strcmp(flow->name, name) == 0)
 			return i;
 	}
@@ -173,8 +175,8 @@ static void fill_flow_info(struct ini *ini)
 	struct plugin **pplugin;
 	int *pport;
 
-	FOR_ARRAY_ELEMENT(&ini->plugins, i, plugin) {
-		FOR_ARRAY_ELEMENT(&plugin->ports, j, port) {
+	ARRAY_ELEMENT_FOREACH(&ini->plugins, i, plugin) {
+		ARRAY_ELEMENT_FOREACH(&plugin->ports, j, port) {
 			int flow_id = port->flow_id;
 			if (flow_id == INVALID_FLOW_ID)
 				continue;
@@ -248,7 +250,7 @@ struct plugin *find_first_playback_sink_plugin(struct ini *ini)
 	int i;
 	struct plugin *plugin;
 
-	FOR_ARRAY_ELEMENT(&ini->plugins, i, plugin) {
+	ARRAY_ELEMENT_FOREACH(&ini->plugins, i, plugin) {
 		if (strcmp(plugin->library, "builtin") != 0)
 			continue;
 		if (strcmp(plugin->label, "sink") != 0)
@@ -312,6 +314,55 @@ static int insert_swap_lr_plugin(struct ini *ini)
 	return 0;
 }
 
+struct ini *create_dummy_ini(const char *purpose, unsigned int num_channels)
+{
+	static char dummy_flow_names[MAX_DUMMY_INI_CH][8] = {
+		"{tmp:0}", "{tmp:1}", "{tmp:2}", "{tmp:3}",
+		"{tmp:4}", "{tmp:5}", "{tmp:6}", "{tmp:7}",
+	};
+	struct ini *ini;
+	struct plugin *source, *sink;
+	int tmp_flow_ids[MAX_DUMMY_INI_CH];
+	int i;
+
+	if (num_channels > MAX_DUMMY_INI_CH) {
+		syslog(LOG_ERR, "Unable to create %u channels of dummy ini",
+		       num_channels);
+		return NULL;
+	}
+
+	ini = calloc(1, sizeof(struct ini));
+	if (!ini) {
+		syslog(LOG_ERR, "no memory for ini struct");
+		return NULL;
+	}
+
+	for (i = 0; i < num_channels; i++)
+		tmp_flow_ids[i] = add_new_flow(ini, dummy_flow_names[i]);
+
+	source = ARRAY_APPEND_ZERO(&ini->plugins);
+	source->title = "source";
+	source->library = "builtin";
+	source->label = "source";
+	source->purpose = purpose;
+
+	for (i = 0; i < num_channels; i++)
+		add_audio_port(ini, source, tmp_flow_ids[i], PORT_OUTPUT);
+
+	sink = ARRAY_APPEND_ZERO(&ini->plugins);
+	sink->title = "sink";
+	sink->library = "builtin";
+	sink->label = "sink";
+	sink->purpose = purpose;
+
+	for (i = 0; i < num_channels; i++)
+		add_audio_port(ini, sink, tmp_flow_ids[i], PORT_INPUT);
+
+	fill_flow_info(ini);
+
+	return ini;
+}
+
 struct ini *cras_dsp_ini_create(const char *ini_filename)
 {
 	struct ini *ini;
@@ -327,9 +378,9 @@ struct ini *cras_dsp_ini_create(const char *ini_filename)
 		return NULL;
 	}
 
-	dict = iniparser_load((char *)ini_filename);
+	dict = iniparser_load_wrapper((char *)ini_filename);
 	if (!dict) {
-		syslog(LOG_ERR, "no ini file %s", ini_filename);
+		syslog(LOG_DEBUG, "no ini file %s", ini_filename);
 		goto bail;
 	}
 	ini->dict = dict;
@@ -365,7 +416,7 @@ void cras_dsp_ini_free(struct ini *ini)
 	int i;
 
 	/* free plugins */
-	FOR_ARRAY_ELEMENT(&ini->plugins, i, p) {
+	ARRAY_ELEMENT_FOREACH(&ini->plugins, i, p) {
 		cras_expr_expression_free(p->disable_expr);
 		ARRAY_FREE(&p->ports);
 	}
@@ -416,13 +467,13 @@ void cras_dsp_ini_dump(struct dumper *d, struct ini *ini)
 	dumpf(d, "ini->dict = %p\n", ini->dict);
 
 	dumpf(d, "number of plugins = %d\n", ARRAY_COUNT(&ini->plugins));
-	FOR_ARRAY_ELEMENT(&ini->plugins, i, plugin) {
+	ARRAY_ELEMENT_FOREACH(&ini->plugins, i, plugin) {
 		dumpf(d, "[plugin %d: %s]\n", i, plugin->title);
 		dumpf(d, "library=%s\n", plugin->library);
 		dumpf(d, "label=%s\n", plugin->label);
 		dumpf(d, "purpose=%s\n", plugin->purpose);
 		dumpf(d, "disable=%p\n", plugin->disable_expr);
-		FOR_ARRAY_ELEMENT(&plugin->ports, j, port) {
+		ARRAY_ELEMENT_FOREACH(&plugin->ports, j, port) {
 			dumpf(d,
 			      "  [%s port %d] type=%s, flow_id=%d, value=%g\n",
 			      port_direction_str(port->direction), j,
@@ -432,7 +483,7 @@ void cras_dsp_ini_dump(struct dumper *d, struct ini *ini)
 	}
 
 	dumpf(d, "number of flows = %d\n", ARRAY_COUNT(&ini->flows));
-	FOR_ARRAY_ELEMENT(&ini->flows, i, flow) {
+	ARRAY_ELEMENT_FOREACH(&ini->flows, i, flow) {
 		dumpf(d, "  [flow %d] %s, %s, %s:%d -> %s:%d\n",
 		      i, flow->name, port_type_str(flow->type),
 		      plugin_title(flow->from), flow->from_port,

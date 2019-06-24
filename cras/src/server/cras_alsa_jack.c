@@ -74,6 +74,12 @@ struct cras_gpio_jack {
  *    edid_file - File to read the EDID from (if available, HDMI only).
  *    display_info_timer - Timer used to poll display info for HDMI jacks.
  *    display_info_retries - Number of times to retry reading display info.
+ *
+ *    mixer_output/mixer_input fields are only used to find the node for this
+ *    jack. These are not used for setting volume or mute. There should be a
+ *    1:1 map between node and jack. node->jack follows the pointer; jack->node
+ *    is done by either searching node->jack pointers or searching the node that
+ *    has the same mixer_control as the jack.
  */
 struct cras_alsa_jack {
 	unsigned is_gpio;	/* !0 -> 'gpio' valid
@@ -89,7 +95,6 @@ struct cras_alsa_jack {
 	struct mixer_control *mixer_output;
 	struct mixer_control *mixer_input;
 	char *ucm_device;
-	const char *dsp_name;
 	const char* override_type_name;
 	const char *edid_file;
 	struct cras_timer *display_info_timer;
@@ -207,7 +212,6 @@ static void cras_free_jack(struct cras_alsa_jack *jack,
 		snd_hctl_elem_set_callback(jack->elem, NULL);
 
 	free((void *)jack->override_type_name);
-	free((void *)jack->dsp_name);
 	free(jack);
 }
 
@@ -500,14 +504,11 @@ static int cras_complete_gpio_jack(struct gpio_switch_list_data *data,
 				   unsigned switch_event)
 {
 	struct cras_alsa_jack_list *jack_list = data->jack_list;
-	enum CRAS_STREAM_DIRECTION direction = jack_list->direction;
 	int r;
 
 	if (jack->ucm_device) {
 		jack->edid_file = ucm_get_edid_file_for_dev(jack_list->ucm,
 							    jack->ucm_device);
-		jack->dsp_name = ucm_get_dsp_name(
-			jack->jack_list->ucm, jack->ucm_device, direction);
 	}
 
 	r = sys_input_get_switch_state(jack->gpio.fd, switch_event,
@@ -863,6 +864,15 @@ static int is_jack_control_in_list(const char * const *list,
 	return 0;
 }
 
+/* Check if the given name is a jack created for the connector control of a
+ * input/output terminal entity on a USB Audio Class 2.0 device. */
+static int is_jack_uac2(const char *jack_name,
+			enum CRAS_STREAM_DIRECTION direction)
+{
+	return jack_matches_regex(jack_name, direction == CRAS_STREAM_OUTPUT ?
+				  "^.* - Output Jack$" : "^.* - Input Jack$");
+}
+
 /* Looks for any JACK controls.  Monitors any found controls for changes and
  * decides to route based on plug/unlpug events. */
 static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
@@ -882,7 +892,6 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 	static const char eld_control_name[] = "ELD";
 	const char * const *jack_names;
 	unsigned int num_jack_names;
-	char device_name[6];
 
 	if (!jack_list->hctl) {
 		syslog(LOG_WARNING, "Can't search hctl for jacks.");
@@ -905,7 +914,8 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 		if (iface != SND_CTL_ELEM_IFACE_CARD)
 			continue;
 		name = snd_hctl_elem_get_name(elem);
-		if (!is_jack_control_in_list(jack_names, num_jack_names, name))
+		if (!is_jack_control_in_list(jack_names, num_jack_names, name) &&
+		    !is_jack_uac2(name, jack_list->direction))
 			continue;
 		if (hctl_jack_device_index(name) != jack_list->device_index)
 			continue;
@@ -917,7 +927,6 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 		jack->jack_list = jack_list;
 		DL_APPEND(jack_list->jacks, jack);
 
-		syslog(LOG_DEBUG, "Found Jack: %s for %s", name, device_name);
 		snd_hctl_elem_set_callback(elem, hctl_jack_cb);
 		snd_hctl_elem_set_callback_private(elem, jack);
 
@@ -943,9 +952,6 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 		}
 
 		if (jack->ucm_device) {
-			jack->dsp_name = ucm_get_dsp_name(
-				jack->jack_list->ucm, jack->ucm_device,
-				jack_list->direction);
 			jack->override_type_name = ucm_get_override_type_name(
 				jack->jack_list->ucm, jack->ucm_device);
 		}
@@ -1034,10 +1040,6 @@ static int find_hctl_jack_for_section(
 	else if (jack_list->direction == CRAS_STREAM_INPUT)
 		jack->mixer_input = cras_alsa_mixer_get_control_for_section(
 					jack_list->mixer, section);
-
-	jack->dsp_name = ucm_get_dsp_name(
-		jack->jack_list->ucm, jack->ucm_device,
-		jack_list->direction);
 
 	snd_hctl_elem_set_callback(elem, hctl_jack_cb);
 	snd_hctl_elem_set_callback_private(elem, jack);
@@ -1258,13 +1260,6 @@ void cras_alsa_jack_update_node_type(const struct cras_alsa_jack *jack,
 	if (!strcmp(jack->override_type_name, "Internal Speaker"))
 		*type = CRAS_NODE_TYPE_INTERNAL_SPEAKER;
 	return;
-}
-
-const char *cras_alsa_jack_get_dsp_name(const struct cras_alsa_jack *jack)
-{
-	if (jack == NULL)
-		return NULL;
-	return jack->dsp_name;
 }
 
 void cras_alsa_jack_enable_ucm(const struct cras_alsa_jack *jack, int enable)

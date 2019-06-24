@@ -770,7 +770,7 @@ int cras_alsa_mixer_add_controls_by_name_matching(
 				       "Failed to add mixer control '%s'"
 				       " with type '%d'",
 				       control->name, control->type);
-				return rc;
+				goto out;
 			}
 			found = 1;
 		}
@@ -806,7 +806,7 @@ int cras_alsa_mixer_add_controls_by_name_matching(
 				       "Failed to add mixer control '%s'"
 				       " with type '%d'",
 				       control->name, control->type);
-				return rc;
+				goto out;
 			}
 			found = 1;
 		}
@@ -836,7 +836,7 @@ int cras_alsa_mixer_add_controls_by_name_matching(
 				"Speaker", coupled_controls);
 		if (rc) {
 			syslog(LOG_ERR, "Could not add coupled output");
-			return rc;
+			goto out;
 		}
 	}
 
@@ -848,10 +848,45 @@ int cras_alsa_mixer_add_controls_by_name_matching(
 		rc = add_main_volume_control(cmix, other_elem);
 		if (rc) {
 			syslog(LOG_ERR, "Could not add other volume control");
-			return rc;
+			goto out;
 		}
 	}
 
+out:
+	mixer_name_free(default_controls);
+	return rc;
+}
+
+int cras_alsa_mixer_add_main_volume_control_by_name(
+		struct cras_alsa_mixer *cmix,
+		struct mixer_name *mixer_names)
+{
+	snd_mixer_elem_t *elem;
+	struct mixer_name *m_name;
+	int rc = 0;
+	snd_mixer_selem_id_t *sid;
+
+	if (!mixer_names)
+		return -EINVAL;
+
+	snd_mixer_selem_id_malloc(&sid);
+
+	DL_FOREACH(mixer_names, m_name) {
+		snd_mixer_selem_id_set_index(sid, 0);
+		snd_mixer_selem_id_set_name(sid, m_name->name);
+		elem = snd_mixer_find_selem(cmix->mixer, sid);
+		if (!elem) {
+			rc = -ENOENT;
+			syslog(LOG_ERR, "Unable to find simple control %s, 0",
+			       m_name->name);
+			break;
+		}
+		rc = add_main_volume_control(cmix, elem);
+		if (rc)
+			break;
+	}
+
+	snd_mixer_selem_id_free(sid);
 	return rc;
 }
 

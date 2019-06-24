@@ -14,6 +14,7 @@ extern "C" {
 #include "cras_alsa_io.h"
 #include "cras_alsa_mixer.h"
 #include "cras_alsa_ucm.h"
+#include "cras_iodev.h"
 #include "cras_types.h"
 #include "cras_util.h"
 #include "utlist.h"
@@ -26,11 +27,12 @@ static struct cras_alsa_mixer *cras_alsa_mixer_create_return;
 static size_t cras_alsa_mixer_destroy_called;
 static size_t cras_alsa_iodev_create_called;
 static struct cras_iodev **cras_alsa_iodev_create_return;
+static struct cras_iodev fake_dev1, fake_dev2, fake_dev3, fake_dev4;
 static struct cras_iodev *cras_alsa_iodev_create_default_return[] = {
-  reinterpret_cast<struct cras_iodev *>(2),
-  reinterpret_cast<struct cras_iodev *>(3),
-  reinterpret_cast<struct cras_iodev *>(4),
-  reinterpret_cast<struct cras_iodev *>(5),
+  &fake_dev1,
+  &fake_dev2,
+  &fake_dev3,
+  &fake_dev4,
 };
 static size_t cras_alsa_iodev_create_return_size;
 static size_t cras_alsa_iodev_legacy_complete_init_called;
@@ -86,9 +88,14 @@ static struct mixer_name *ucm_get_coupled_mixer_names_return_value;
 static struct mixer_name *coupled_output_names_value;
 static int ucm_has_fully_specified_ucm_flag_return_value;
 static int ucm_get_sections_called;
+static struct mixer_name *ucm_get_main_volume_names_return_value;
 static struct ucm_section *ucm_get_sections_return_value;
 static size_t cras_alsa_mixer_add_controls_in_section_called;
 static int cras_alsa_mixer_add_controls_in_section_return_value;
+static int cras_alsa_mixer_add_main_volume_control_by_name_called;
+static int cras_alsa_mixer_add_main_volume_control_by_name_return_value;
+static int ucm_get_echo_reference_dev_name_for_dev_called;
+static const char *ucm_get_echo_reference_dev_name_for_dev_return_value[4];
 
 static void ResetStubData() {
   cras_alsa_mixer_create_called = 0;
@@ -147,6 +154,7 @@ static void ResetStubData() {
   device_config_dir = reinterpret_cast<char *>(3);
   cras_card_config_dir = NULL;
   ucm_get_coupled_mixer_names_return_value = NULL;
+  ucm_get_main_volume_names_return_value = NULL;
   mixer_name_free(coupled_output_names_value);
   coupled_output_names_value = NULL;
   ucm_has_fully_specified_ucm_flag_return_value = 0;
@@ -154,6 +162,13 @@ static void ResetStubData() {
   ucm_get_sections_return_value = NULL;
   cras_alsa_mixer_add_controls_in_section_called = 0;
   cras_alsa_mixer_add_controls_in_section_return_value = 0;
+  cras_alsa_mixer_add_main_volume_control_by_name_called = 0;
+  cras_alsa_mixer_add_main_volume_control_by_name_return_value = 0;
+  ucm_get_echo_reference_dev_name_for_dev_called = 0;
+  fake_dev1.nodes = NULL;
+  fake_dev2.nodes = NULL;
+  fake_dev3.nodes = NULL;
+  fake_dev4.nodes = NULL;
 }
 
 TEST(AlsaCard, CreateFailInvalidCard) {
@@ -223,6 +238,7 @@ TEST(AlsaCard, CreateFailHctlOpen) {
   EXPECT_EQ(0, snd_hctl_nonblock_called);
   EXPECT_EQ(0, snd_hctl_load_called);
   EXPECT_EQ(1, cras_alsa_mixer_create_called);
+  cras_alsa_card_destroy(c);
 }
 
 TEST(AlsaCard, CreateFailHctlLoad) {
@@ -632,6 +648,11 @@ TEST(AlsaCard, CreateOneOutputWithCoupledMixers) {
   mixer_name_2 = (struct mixer_name*)malloc(sizeof(*mixer_name_2));
   mixer_name_1->name = name1;
   mixer_name_2->name = name2;
+  mixer_name_1->dir = CRAS_STREAM_OUTPUT;
+  mixer_name_2->dir = CRAS_STREAM_OUTPUT;
+  mixer_name_1->type = MIXER_NAME_VOLUME;
+  mixer_name_2->type = MIXER_NAME_VOLUME;
+
   DL_APPEND(ucm_get_coupled_mixer_names_return_value, mixer_name_1);
   DL_APPEND(ucm_get_coupled_mixer_names_return_value, mixer_name_2);
 
@@ -699,6 +720,52 @@ TEST(AlsaCard, CreateFullyUCMNoSections) {
   EXPECT_EQ(iniparser_load_called, iniparser_freedict_called);
 }
 
+TEST(AlsaCard, CreateFullyUCMTwoMainVolume) {
+  struct cras_alsa_card *c;
+  struct mixer_name *mixer_name_1, *mixer_name_2;
+  const char *name1 = strdup("MixerName1"), *name2 = strdup("MixerName2");
+  cras_alsa_card_info card_info;
+
+  ResetStubData();
+  card_info.card_type = ALSA_CARD_TYPE_INTERNAL;
+  card_info.card_index = 0;
+  ucm_has_fully_specified_ucm_flag_return_value = 1;
+
+  /* Creates a list of mixer names as return value of
+   * ucm_get_main_volume_names_return_value. */
+  mixer_name_1 = (struct mixer_name*)malloc(sizeof(*mixer_name_1));
+  mixer_name_2 = (struct mixer_name*)malloc(sizeof(*mixer_name_2));
+  mixer_name_1->name = name1;
+  mixer_name_2->name = name2;
+  mixer_name_1->dir = CRAS_STREAM_OUTPUT;
+  mixer_name_2->dir = CRAS_STREAM_OUTPUT;
+  mixer_name_1->type = MIXER_NAME_MAIN_VOLUME;
+  mixer_name_2->type = MIXER_NAME_MAIN_VOLUME;
+
+  DL_APPEND(ucm_get_main_volume_names_return_value, mixer_name_1);
+  DL_APPEND(ucm_get_main_volume_names_return_value, mixer_name_2);
+
+  c = cras_alsa_card_create(&card_info, device_config_dir,
+                            fake_blacklist, NULL);
+
+  EXPECT_EQ(static_cast<struct cras_alsa_card *>(NULL), c);
+  EXPECT_EQ(snd_ctl_close_called, snd_ctl_open_called);
+  EXPECT_EQ(0, cras_alsa_iodev_create_called);
+  EXPECT_EQ(0, cras_alsa_iodev_ucm_complete_init_called);
+  EXPECT_EQ(1, snd_ctl_card_info_called);
+  EXPECT_EQ(1, cras_alsa_mixer_add_main_volume_control_by_name_called);
+  EXPECT_EQ(1, ucm_get_sections_called);
+  EXPECT_EQ(0, cras_alsa_mixer_add_controls_in_section_called);
+
+
+  cras_alsa_card_destroy(c);
+  EXPECT_EQ(1, ucm_destroy_called);
+  EXPECT_EQ(0, cras_alsa_iodev_destroy_called);
+  EXPECT_EQ(NULL, cras_alsa_iodev_destroy_arg);
+  EXPECT_EQ(cras_alsa_mixer_create_called, cras_alsa_mixer_destroy_called);
+  EXPECT_EQ(iniparser_load_called, iniparser_freedict_called);
+}
+
 struct ucm_section *GenerateUcmSections (void) {
   struct ucm_section *sections = NULL;
   struct ucm_section *section;
@@ -714,10 +781,6 @@ struct ucm_section *GenerateUcmSections (void) {
   ucm_section_add_coupled(section, "SPK-L", MIXER_NAME_VOLUME);
   ucm_section_add_coupled(section, "SPK-R", MIXER_NAME_VOLUME);
   DL_APPEND(sections, section);
-
-  section = ucm_section_create("Mic", 0, CRAS_STREAM_INPUT,
-                               "my-sound-card Headset Jack", "gpio");
-  ucm_section_set_mixer_name(section, "CAPTURE");
 
   section = ucm_section_create("Internal Mic", 0, CRAS_STREAM_INPUT,
                                NULL, NULL);
@@ -810,6 +873,39 @@ TEST(AlsaCard, CreateFullyUCMFourDevicesFiveSections) {
   EXPECT_EQ(iniparser_load_called, iniparser_freedict_called);
 }
 
+TEST(AlsaCard, GG) {
+  struct cras_alsa_card *c;
+  cras_alsa_card_info card_info;
+  int info_rets[] = {0, 0, 0, 0, 0, -1};
+  struct cras_ionode nodes[4];
+  const char *echo_ref = "echo ref";
+
+  ResetStubData();
+  card_info.card_type = ALSA_CARD_TYPE_INTERNAL;
+  card_info.card_index = 0;
+  snd_ctl_pcm_info_rets_size = ARRAY_SIZE(info_rets);
+  snd_ctl_pcm_info_rets = info_rets;
+  ucm_has_fully_specified_ucm_flag_return_value = 1;
+  ucm_get_sections_return_value = GenerateUcmSections();
+
+  fake_dev1.nodes = nodes;
+  fake_dev2.nodes = nodes + 1;
+  fake_dev3.nodes = nodes + 2;
+  fake_dev4.nodes = nodes + 3;
+  snprintf(nodes[0].name, CRAS_NODE_NAME_BUFFER_SIZE, "dev1");
+  snprintf(nodes[1].name, CRAS_NODE_NAME_BUFFER_SIZE, "dev2");
+  snprintf(nodes[2].name, CRAS_NODE_NAME_BUFFER_SIZE, "dev3");
+  snprintf(nodes[3].name, CRAS_NODE_NAME_BUFFER_SIZE, "echo ref");
+
+  ucm_get_echo_reference_dev_name_for_dev_return_value[0] = strdup(echo_ref);
+
+  c = cras_alsa_card_create(&card_info, device_config_dir,
+                            fake_blacklist, NULL);
+
+  EXPECT_NE(static_cast<struct cras_alsa_card *>(NULL), c);
+  EXPECT_EQ(fake_dev1.echo_reference_dev, &fake_dev4);
+  cras_alsa_card_destroy(c);
+}
 
 /* Stubs */
 
@@ -928,6 +1024,12 @@ void snd_pcm_info_set_device(snd_pcm_info_t *obj, unsigned int val) {
 void snd_pcm_info_set_subdevice(snd_pcm_info_t *obj, unsigned int val) {
 }
 void snd_pcm_info_set_stream(snd_pcm_info_t *obj, snd_pcm_stream_t val) {
+}
+const char *snd_pcm_info_get_name(const snd_pcm_info_t *obj) {
+  return "Fake device name";
+}
+const char *snd_pcm_info_get_id(const snd_pcm_info_t *obj) {
+  return "Fake device id";
 }
 int snd_ctl_pcm_info(snd_ctl_t *ctl, snd_pcm_info_t *info) {
   int ret;
@@ -1058,10 +1160,29 @@ int ucm_has_fully_specified_ucm_flag(struct cras_use_case_mgr *mgr)
   return ucm_has_fully_specified_ucm_flag_return_value;
 }
 
+struct mixer_name *ucm_get_main_volume_names(struct cras_use_case_mgr *mgr)
+{
+  return ucm_get_main_volume_names_return_value;
+}
+
 struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 {
   ucm_get_sections_called++;
   return ucm_get_sections_return_value;
+}
+const char *ucm_get_echo_reference_dev_name_for_dev(
+    struct cras_use_case_mgr *mgr, const char *dev)
+{
+  int idx = ucm_get_echo_reference_dev_name_for_dev_called++;
+  return ucm_get_echo_reference_dev_name_for_dev_return_value[idx];
+}
+
+int cras_alsa_mixer_add_main_volume_control_by_name(
+		struct cras_alsa_mixer *cmix,
+		struct mixer_name *mixer_names)
+{
+  cras_alsa_mixer_add_main_volume_control_by_name_called++;
+  return cras_alsa_mixer_add_main_volume_control_by_name_return_value;
 }
 
 int cras_alsa_mixer_add_controls_in_section(
