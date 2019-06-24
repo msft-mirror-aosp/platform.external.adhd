@@ -62,12 +62,22 @@ static int effect_ns = 0;
 static int effect_agc = 0;
 static int effect_vad = 0;
 static char *aecdump_file = NULL;
+static char time_str[128];
 
 /* Conditional so the client thread can signal that main should exit. */
 static pthread_mutex_t done_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t done_cond = PTHREAD_COND_INITIALIZER;
 
 struct cras_audio_format *aud_format;
+struct {
+	char *name;
+	snd_pcm_format_t format;
+} supported_formats[] = {
+	{ "S16_LE", SND_PCM_FORMAT_S16_LE },
+	{ "S24_LE", SND_PCM_FORMAT_S24_LE },
+	{ "S32_LE", SND_PCM_FORMAT_S32_LE },
+	{ NULL, 0 },
+};
 
 static int terminate_stream_loop()
 {
@@ -373,8 +383,29 @@ static void print_user_muted(struct cras_client *client)
 	       cras_client_get_user_muted(client) ? "Muted" : "Not muted");
 }
 
+/*
+ * Convert time value from one clock to the other using given offset
+ * in sec and nsec.
+ */
+static void convert_time(unsigned int *sec, unsigned int *nsec,
+			 int32_t sec_offset, int32_t nsec_offset)
+{
+	sec_offset += *sec;
+	nsec_offset += *nsec;
+	if (nsec_offset >= 1000000000L) {
+		sec_offset++;
+		nsec_offset -= 1000000000L;
+	} else if (nsec_offset < 0) {
+		sec--;
+		nsec_offset += 1000000000L;
+	}
+	*sec = sec_offset;
+	*nsec = nsec_offset;
+}
+
 static void show_alog_tag(const struct audio_thread_event_log *log,
-			  unsigned int tag_idx)
+			  unsigned int tag_idx, int32_t sec_offset,
+			  int32_t nsec_offset)
 {
 	unsigned int tag = (log->log[tag_idx].tag_sec >> 24) & 0xff;
 	unsigned int sec = log->log[tag_idx].tag_sec & 0x00ffffff;
@@ -382,12 +413,37 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 	unsigned int data1 = log->log[tag_idx].data1;
 	unsigned int data2 = log->log[tag_idx].data2;
 	unsigned int data3 = log->log[tag_idx].data3;
+	time_t lt;
+	struct tm *t;
 
 	/* Skip unused log entries. */
 	if (log->log[tag_idx].tag_sec == 0 && log->log[tag_idx].nsec == 0)
 		return;
 
-	printf("%10u.%09u  ", sec, nsec);
+	/* Convert from monotomic raw clock to realtime clock. */
+	convert_time(&sec, &nsec, sec_offset, nsec_offset);
+	lt = sec;
+	t = localtime(&lt);
+	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", t);
+
+	printf("%s.%09u cras atlog  ", time_str, nsec);
+
+	/* Prepare realtime string for arguments. */
+	switch (tag) {
+	case AUDIO_THREAD_READ_AUDIO_TSTAMP:
+	case AUDIO_THREAD_FILL_AUDIO_TSTAMP:
+	case AUDIO_THREAD_STREAM_RESCHEDULE:
+	case AUDIO_THREAD_STREAM_SLEEP_TIME:
+	case AUDIO_THREAD_STREAM_SLEEP_ADJUST:
+	case AUDIO_THREAD_DEV_SLEEP_TIME:
+		sec = data2;
+		nsec = data3;
+		break;
+	}
+	convert_time(&sec, &nsec, sec_offset, nsec_offset);
+	lt = sec;
+	t = localtime(&lt);
+	strftime(time_str, 128, " %H:%M:%S", t);
 
 	switch (tag) {
 	case AUDIO_THREAD_WAKE:
@@ -402,8 +458,8 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 		       "READ_AUDIO", data1, data2, data3);
 		break;
 	case AUDIO_THREAD_READ_AUDIO_TSTAMP:
-		printf("%-30s dev:%u tstamp:%09d.%09d\n",
-		       "READ_AUDIO_TSTAMP", data1, (int)data2, (int)data3);
+		printf("%-30s dev:%u tstamp:%s.%09u\n",
+		       "READ_AUDIO_TSTAMP", data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_READ_AUDIO_DONE:
 		printf("%-30s read_remainder:%u\n", "READ_AUDIO_DONE", data1);
@@ -417,8 +473,8 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 		       "FILL_AUDIO", data1, data2);
 		break;
 	case AUDIO_THREAD_FILL_AUDIO_TSTAMP:
-		printf("%-30s dev:%u tstamp:%09d.%09d\n",
-		       "FILL_AUDIO_TSTAMP", data1, (int)data2, (int)data3);
+		printf("%-30s dev:%u tstamp:%s.%09u\n",
+		       "FILL_AUDIO_TSTAMP", data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_FILL_AUDIO_DONE:
 		printf("%-30s hw_level:%u total_written:%u min_cb_level:%u\n",
@@ -476,21 +532,28 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 		printf("%-30s wr_buf:%u shm_writable:%u offset:%u\n",
 		       "CONV_COPY", data1, data2, data3);
 		break;
+	case AUDIO_THREAD_STREAM_FETCH_PENDING:
+		printf("%-30s id:%x\n", "STREAM_FETCH_PENGING", data1);
+		break;
+	case AUDIO_THREAD_STREAM_RESCHEDULE:
+		printf("%-30s id:%x next_cb_ts:%s.%09u\n",
+		       "STREAM_RESCHEDULE", data1, time_str, nsec);
+		break;
 	case AUDIO_THREAD_STREAM_SLEEP_TIME:
-		printf("%-30s id:%x wake:%09u.%09d\n",
-		       "STREAM_SLEEP_TIME", data1, (int)data2, (int)data3);
+		printf("%-30s id:%x wake:%s.%09u\n",
+		       "STREAM_SLEEP_TIME", data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_STREAM_SLEEP_ADJUST:
-		printf("%-30s id:%x from:%09u.%09d\n",
-		       "STREAM_SLEEP_ADJUST", data1, data2, data3);
+		printf("%-30s id:%x from:%s.%09u\n",
+		       "STREAM_SLEEP_ADJUST", data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_STREAM_SKIP_CB:
 		printf("%-30s id:%x write_offset_0:%u write_offset_1:%u\n",
 		       "STREAM_SKIP_CB", data1, data2, data3);
 		break;
 	case AUDIO_THREAD_DEV_SLEEP_TIME:
-		printf("%-30s dev:%u wake:%09u.%09d\n",
-		       "DEV_SLEEP_TIME", data1, data2, data3);
+		printf("%-30s dev:%u wake:%s.%09u\n",
+		       "DEV_SLEEP_TIME", data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_SET_DEV_WAKE:
 		printf("%-30s dev:%u hw_level:%u sleep:%u\n",
@@ -543,7 +606,11 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 
 static void print_audio_debug_info(const struct audio_debug_info *info)
 {
+	struct timespec mono_time, real_time;
+	int32_t sec_offset;
+	int32_t nsec_offset;
 	int i, j;
+
 	printf("Audio Debug Stats:\n");
 	printf("-------------devices------------\n");
 	if (info->num_devs > MAX_DEBUG_DEVS)
@@ -563,7 +630,9 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       "est_rate_ratio: %lf\n"
 		       "num_underruns: %u\n"
 		       "num_severe_underruns: %u\n"
-		       "highest_hw_level: %u\n",
+		       "highest_hw_level: %u\n"
+		       "runtime: %u.%09u\n"
+		       "software_gain_scaler: %lf\n",
 		       (unsigned int)info->devs[i].buffer_size,
 		       (unsigned int)info->devs[i].min_buffer_level,
 		       (unsigned int)info->devs[i].min_cb_level,
@@ -573,7 +642,10 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       info->devs[i].est_rate_ratio,
 		       (unsigned int)info->devs[i].num_underruns,
 		       (unsigned int)info->devs[i].num_severe_underruns,
-		       (unsigned int)info->devs[i].highest_hw_level);
+		       (unsigned int)info->devs[i].highest_hw_level,
+		       (unsigned int)info->devs[i].runtime_sec,
+		       (unsigned int)info->devs[i].runtime_nsec,
+		       info->devs[i].software_gain_scaler);
 		printf("\n");
 	}
 
@@ -597,7 +669,12 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       "frame_rate: %u\n"
 		       "num_channels: %u\n"
 		       "longest_fetch_sec: %u.%09u\n"
-		       "num_overruns: %u\n",
+		       "num_overruns: %u\n"
+		       "is_pinned: %x\n"
+		       "pinned_dev_idx: %x\n"
+		       "num_missed_cb: %u\n"
+		       "%s: %lf\n"
+		       "runtime: %u.%09u\n",
 		       (unsigned int)info->streams[i].buffer_frames,
 		       (unsigned int)info->streams[i].cb_threshold,
 		       (unsigned int)info->streams[i].effects,
@@ -605,7 +682,15 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 		       (unsigned int)info->streams[i].num_channels,
 		       (unsigned int)info->streams[i].longest_fetch_sec,
 		       (unsigned int)info->streams[i].longest_fetch_nsec,
-		       (unsigned int)info->streams[i].num_overruns);
+		       (unsigned int)info->streams[i].num_overruns,
+		       (unsigned int)info->streams[i].is_pinned,
+		       (unsigned int)info->streams[i].pinned_dev_idx,
+		       (unsigned int)info->streams[i].num_missed_cb,
+		       (info->streams[i].direction == CRAS_STREAM_INPUT)
+				? "gain" : "volume",
+		       info->streams[i].stream_volume,
+		       (unsigned int)info->streams[i].runtime_sec,
+		       (unsigned int)info->streams[i].runtime_nsec);
 		printf("channel map:");
 		for (channel = 0; channel < CRAS_CH_MAX; channel++)
 			printf("%d ", info->streams[i].channel_layout[channel]);
@@ -614,11 +699,15 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 
 	printf("Audio Thread Event Log:\n");
 
+	clock_gettime(CLOCK_MONOTONIC_RAW, &mono_time);
+	clock_gettime(CLOCK_REALTIME, &real_time);
+	sec_offset = real_time.tv_sec - mono_time.tv_sec;
+	nsec_offset = real_time.tv_nsec - mono_time.tv_nsec;
 	j = info->log.write_pos;
 	i = 0;
 	printf("start at %d\n", j);
 	for (; i < info->log.len; i++) {
-		show_alog_tag(&info->log, j);
+		show_alog_tag(&info->log, j, sec_offset, nsec_offset);
 		j++;
 		j %= info->log.len;
 	}
@@ -631,6 +720,139 @@ static void audio_debug_info(struct cras_client *client)
 	if (!info)
 		return;
 	print_audio_debug_info(info);
+
+	/* Signal main thread we are done after the last chunk. */
+	pthread_mutex_lock(&done_mutex);
+	pthread_cond_signal(&done_cond);
+	pthread_mutex_unlock(&done_mutex);
+}
+
+static void show_btlog_tag(const struct cras_bt_event_log *log,
+			  unsigned int tag_idx, int32_t sec_offset,
+			  int32_t nsec_offset)
+{
+	unsigned int tag = (log->log[tag_idx].tag_sec >> 24) & 0xff;
+	unsigned int sec = log->log[tag_idx].tag_sec & 0x00ffffff;
+	unsigned int nsec = log->log[tag_idx].nsec;
+	unsigned int data1 = log->log[tag_idx].data1;
+	unsigned int data2 = log->log[tag_idx].data2;
+	time_t lt;
+	struct tm *t;
+
+	/* Skip unused log entries. */
+	if (log->log[tag_idx].tag_sec == 0 && log->log[tag_idx].nsec == 0)
+		return;
+
+	/* Convert from monotomic raw clock to realtime clock. */
+	convert_time(&sec, &nsec, sec_offset, nsec_offset);
+	lt = sec;
+	t = localtime(&lt);
+	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", t);
+
+	printf("%s.%09u cras btlog  ", time_str, nsec);
+
+	switch (tag) {
+	case BT_ADAPTER_ADDED:
+		printf("%-30s\n", "ADAPTER_ADDED");
+		break;
+	case BT_ADAPTER_REMOVED:
+		printf("%-30s\n", "ADAPTER_REMOVED");
+		break;
+	case BT_A2DP_CONFIGURED:
+		printf("%-30s connected profiles %u\n", "A2DP_CONFIGURED",
+		       data1);
+		break;
+	case BT_A2DP_START:
+		printf("%-30s\n", "A2DP_START");
+		break;
+	case BT_A2DP_SUSPENDED:
+		printf("%-30s\n", "A2DP_SUSPENDED");
+		break;
+	case BT_AUDIO_GATEWAY_INIT:
+		printf("%-30s supported profiles %u\n", "AUDIO_GATEWAY_INIT",
+		       data1);
+		break;
+	case BT_AUDIO_GATEWAY_START:
+		printf("%-30s \n", "AUDIO_GATEWAY_START");
+		break;
+	case BT_AVAILABLE_CODECS:
+		printf("%-30s codec #%u id %u\n", "AVAILABLE_CODECS", data1, data2);
+		break;
+	case BT_CODEC_SELECTION:
+		printf("%-30s dir %u codec id %u\n", "CODEC_SELECTION", data1, data2);
+		break;
+	case BT_DEV_CONNECTED_CHANGE:
+		printf("%-30s profiles %u now %u\n", "DEV_CONENCTED_CHANGE",
+		       data1, data2);
+		break;
+	case BT_DEV_CONN_WATCH_CB:
+		printf("%-30s %u retries left, supported profiles %u\n",
+		       "DEV_CONN_WATCH_CB", data1, data2);
+		break;
+	case BT_DEV_SUSPEND_CB:
+		printf("%-30s\n", "DEV_SUSPEND_CB");
+		break;
+	case BT_HFP_NEW_CONNECTION:
+		printf("%-30s\n", "HFP_NEW_CONNECTION");
+		break;
+	case BT_HFP_REQUEST_DISCONNECT:
+		printf("%-30s\n", "HFP_REQUEST_DISCONNECT");
+		break;
+	case BT_HFP_SUPPORTED_FEATURES:
+		printf("%-30s role %s features %u\n", "HFP_SUPPORTED_FEATURES",
+		       data1 ? "AG" : "HF", data2);
+		break;
+	case BT_HSP_NEW_CONNECTION:
+		printf("%-30s\n", "HSP_NEW_CONNECTION");
+		break;
+	case BT_HSP_REQUEST_DISCONNECT:
+		printf("%-30s\n", "HSP_REQUEST_DISCONNECT");
+		break;
+	case BT_NEW_AUDIO_PROFILE_AFTER_CONNECT:
+		printf("%-30s old %u, new %u\n", "NEW_AUDIO_PROFILE_AFTER_CONNECT",
+			data1, data2);
+		break;
+	case BT_RESET:
+		printf("%-30s\n", "RESET");
+		break;
+	case BT_SCO_CONNECT:
+		printf("%-30s %s sk %d\n", "SCO_CONNECT", data1 ? "success" : "failed",
+		       (int)data2);
+		break;
+	case BT_TRANSPORT_ACQUIRE:
+		printf("%-30s %s fd %d\n", "TRANSPORT_ACQUIRE",
+		       data1 ? "success" : "failed", (int)data2);
+		break;
+	case BT_TRANSPORT_RELEASE:
+		printf("%-30s\n", "TRANSPORT_RELEASE");
+		break;
+	default:
+		printf("%-30s\n", "UNKNOWN");
+		break;
+	}
+}
+
+static void cras_bt_debug_info(struct cras_client *client)
+{
+	const struct cras_bt_debug_info *info;
+	struct timespec mono_time, real_time;
+	int32_t sec_offset;
+	int32_t nsec_offset;
+	int i, j;
+
+	info = cras_client_get_bt_debug_info(client);
+	clock_gettime(CLOCK_MONOTONIC_RAW, &mono_time);
+	clock_gettime(CLOCK_REALTIME, &real_time);
+	sec_offset = real_time.tv_sec - mono_time.tv_sec;
+	nsec_offset = real_time.tv_nsec - mono_time.tv_nsec;
+	j = info->bt_log.write_pos;
+	i = 0;
+	printf("BT debug log:\n");
+	for (; i < info->bt_log.len; i++) {
+		show_btlog_tag(&info->bt_log, j, sec_offset, nsec_offset);
+		j++;
+		j %= info->bt_log.len;
+	}
 
 	/* Signal main thread we are done after the last chunk. */
 	pthread_mutex_lock(&done_mutex);
@@ -756,6 +978,7 @@ static int run_file_io_stream(struct cras_client *client,
 			      size_t block_size,
 			      enum CRAS_STREAM_TYPE stream_type,
 			      size_t rate,
+			      snd_pcm_format_t format,
 			      size_t num_channels,
 			      uint32_t flags,
 			      int is_loopback,
@@ -802,8 +1025,7 @@ static int run_file_io_stream(struct cras_client *client,
 		aud_cb = put_stdin_samples;
 	}
 
-	aud_format = cras_audio_format_create(SND_PCM_FORMAT_S16_LE, rate,
-					      num_channels);
+	aud_format = cras_audio_format_create(format, rate, num_channels);
 	if (aud_format == NULL)
 		return -ENOMEM;
 
@@ -993,6 +1215,7 @@ static int run_capture(struct cras_client *client,
 		       size_t block_size,
 		       enum CRAS_STREAM_TYPE stream_type,
 		       size_t rate,
+		       snd_pcm_format_t format,
 		       size_t num_channels,
 		       uint32_t flags,
 		       int is_loopback,
@@ -1005,8 +1228,8 @@ static int run_capture(struct cras_client *client,
 	}
 
 	run_file_io_stream(client, fd, CRAS_STREAM_INPUT, block_size,
-			   stream_type, rate, num_channels, flags, is_loopback,
-			   is_post_dsp);
+			   stream_type, rate, format, num_channels, flags,
+			   is_loopback, is_post_dsp);
 
 	close(fd);
 	return 0;
@@ -1017,6 +1240,7 @@ static int run_playback(struct cras_client *client,
 			size_t block_size,
 			enum CRAS_STREAM_TYPE stream_type,
 			size_t rate,
+			snd_pcm_format_t format,
 			size_t num_channels)
 {
 	int fd;
@@ -1028,7 +1252,7 @@ static int run_playback(struct cras_client *client,
 	}
 
 	run_file_io_stream(client, fd, CRAS_STREAM_OUTPUT, block_size,
-			   stream_type, rate, num_channels, 0, 0, 0);
+			   stream_type, rate, format, num_channels, 0, 0, 0);
 
 	close(fd);
 	return 0;
@@ -1076,6 +1300,23 @@ static void show_audio_debug_info(struct cras_client *client)
 	pthread_mutex_lock(&done_mutex);
 	pthread_cond_timedwait(&done_cond, &done_mutex, &wait_time);
 	pthread_mutex_unlock(&done_mutex);
+}
+
+static void show_cras_bt_debug_info(struct cras_client *client)
+{
+	struct timespec wait_time;
+
+	cras_client_run_thread(client);
+	cras_client_connected_wait(client); /* To synchronize data. */
+	cras_client_update_bt_debug_info(client, cras_bt_debug_info);
+
+	clock_gettime(CLOCK_REALTIME, &wait_time);
+	wait_time.tv_sec += 2;
+
+	pthread_mutex_lock(&done_mutex);
+	pthread_cond_timedwait(&done_cond, &done_mutex, &wait_time);
+	pthread_mutex_unlock(&done_mutex);
+
 }
 
 static void hotword_models_cb(struct cras_client *client,
@@ -1134,24 +1375,24 @@ static struct option long_options[] = {
 	{"show_total_rms",      no_argument, &show_total_rms, 1},
 	{"select_input",        required_argument,      0, 'a'},
 	{"block_size",		required_argument,	0, 'b'},
-	{"capture_file",	required_argument,	0, 'c'},
+	{"num_channels",        required_argument,      0, 'c'},
 	{"duration_seconds",	required_argument,	0, 'd'},
 	{"dump_events",	        no_argument,            0, 'e'},
-	{"dump_dsp",            no_argument,            0, 'f'},
+	{"format",	        required_argument,      0, 'f'},
 	{"capture_gain",        required_argument,      0, 'g'},
 	{"help",                no_argument,            0, 'h'},
 	{"dump_server_info",    no_argument,            0, 'i'},
 	{"check_output_plugged",required_argument,      0, 'j'},
 	{"add_active_input",	required_argument,	0, 'k'},
-	{"add_active_output",	required_argument,	0, 't'},
-	{"loopback_file",	required_argument,	0, 'l'},
+	{"dump_dsp",            no_argument,            0, 'l'},
 	{"dump_audio_thread",   no_argument,            0, 'm'},
-	{"num_channels",        required_argument,      0, 'n'},
+	{"syslog_mask",		required_argument,	0, 'n'},
 	{"channel_layout",      required_argument,      0, 'o'},
-	{"playback_file",	required_argument,	0, 'p'},
+	{"get_aec_group_id",	no_argument,		0, 'p'},
 	{"user_mute",           required_argument,      0, 'q'},
 	{"rate",		required_argument,	0, 'r'},
 	{"reload_dsp",          no_argument,            0, 's'},
+	{"add_active_output",	required_argument,	0, 't'},
 	{"mute",                required_argument,      0, 'u'},
 	{"volume",              required_argument,      0, 'v'},
 	{"set_node_volume",	required_argument,      0, 'w'},
@@ -1175,18 +1416,24 @@ static struct option long_options[] = {
 	{"get_hotword_models",	required_argument,	0, '>'},
 	{"post_dsp",            required_argument,	0, 'A'},
 	{"stream_id",		required_argument,	0, 'B'},
-	{"aecdump",		required_argument,	0, 'C'},
+	{"capture_file",	required_argument,	0, 'C'},
 	{"reload_aec_config",	no_argument,		0, 'D'},
 	{"effects",		required_argument,	0, 'E'},
 	{"get_aec_supported",	no_argument,		0, 'F'},
-	{"syslog_mask",		required_argument,	0, 'L'},
+	{"aecdump",		required_argument,	0, 'G'},
+	{"dump_bt",		no_argument,		0, 'H'},
+	{"set_wbs_enabled",	required_argument,	0, 'I'},
+	{"loopback_file",	required_argument,	0, 'L'},
 	{"mute_loop_test",	required_argument,	0, 'M'},
+	{"playback_file",	required_argument,	0, 'P'},
 	{"stream_type",		required_argument,	0, 'T'},
 	{0, 0, 0, 0}
 };
 
 static void show_usage()
 {
+	int i;
+
 	printf("--add_active_input <N>:<M> - Add the ionode with the given id"
 	       "to active input device list\n");
 	printf("--add_active_output <N>:<M> - Add the ionode with the given id"
@@ -1199,9 +1446,14 @@ static void show_usage()
 	printf("--channel_layout <layout_str> - Set multiple channel layout.\n");
 	printf("--check_output_plugged <output name> - Check if the output is plugged in\n");
 	printf("--dump_audio_thread - Dumps audio thread info.\n");
+	printf("--dump_bt - Dumps debug info for bt audio\n");
 	printf("--dump_dsp - Print status of dsp to syslog.\n");
 	printf("--dump_server_info - Print status of the server.\n");
 	printf("--duration_seconds <N> - Seconds to record or playback.\n");
+	printf("--format <name> - The sample format. Either");
+	for (i = 0; supported_formats[i].name; ++i)
+		printf(" %s", supported_formats[i].name);
+	printf(" (default to S16_LE).\n");
 	printf("--get_hotword_models <N>:<M> - Get the supported hotword models of node\n");
 	printf("--help - Print this message.\n");
 	printf("--listen_for_hotword <name> - Listen and capture hotword stream if supported\n");
@@ -1262,6 +1514,7 @@ int main(int argc, char **argv)
 	int rc = 0;
 	uint32_t stream_flags = 0;
 	cras_stream_id_t stream_id = 0;
+	snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
 
 	option_index = 0;
 	openlog("cras_test_client", LOG_PERROR, LOG_USER);
@@ -1279,98 +1532,18 @@ int main(int argc, char **argv)
 		goto destroy_exit;
 	}
 
+	if (argc == 1) {
+		/* Nothing specified, default to dump_server_info. */
+		print_server_info(client);
+		goto destroy_exit;
+	}
+
 	while (1) {
-		c = getopt_long(argc, argv, "o:s:",
+		c = getopt_long(argc, argv, "o:s:P:C:r:c:f:h",
 				long_options, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
-		case 'c':
-			capture_file = optarg;
-			break;
-		case 'p':
-			playback_file = optarg;
-			break;
-		case 'l':
-			loopback_file = optarg;
-			break;
-		case 'A':
-			post_dsp = atoi(optarg);
-			break;
-		case 'b':
-			block_size = atoi(optarg);
-			break;
-		case 'r':
-			rate = atoi(optarg);
-			break;
-		case 'n':
-			num_channels = atoi(optarg);
-			break;
-		case 'd':
-			duration_seconds = atof(optarg);
-			break;
-		case 'u': {
-			int mute = atoi(optarg);
-			rc = cras_client_set_system_mute(client, mute);
-			if (rc < 0) {
-				fprintf(stderr, "problem setting mute\n");
-				goto destroy_exit;
-			}
-			break;
-		}
-		case 'q': {
-			int mute = atoi(optarg);
-			rc = cras_client_set_user_mute(client, mute);
-			if (rc < 0) {
-				fprintf(stderr, "problem setting mute\n");
-				goto destroy_exit;
-			}
-			break;
-		}
-		case 'v': {
-			int volume = atoi(optarg);
-			volume = MIN(100, MAX(0, volume));
-			rc = cras_client_set_system_volume(client, volume);
-			if (rc < 0) {
-				fprintf(stderr, "problem setting volume\n");
-				goto destroy_exit;
-			}
-			break;
-		}
-		case 'g': {
-			long gain = atol(optarg);
-			rc = cras_client_set_system_capture_gain(client, gain);
-			if (rc < 0) {
-				fprintf(stderr, "problem setting capture\n");
-				goto destroy_exit;
-			}
-			break;
-		}
-		case 'j':
-			check_output_plugged(client, optarg);
-			break;
-		case 's':
-			cras_client_reload_dsp(client);
-			break;
-		case 'f':
-			cras_client_dump_dsp_info(client);
-			break;
-		case 'i':
-			print_server_info(client);
-			break;
-		case 'h':
-			show_usage();
-			break;
-		case 'x': {
-			int dev_index = atoi(strtok(optarg, ":"));
-			int node_index = atoi(strtok(NULL, ":"));
-			int value = atoi(strtok(NULL, ":")) ;
-			cras_node_id_t id = cras_make_node_id(dev_index,
-							      node_index);
-			enum ionode_attr attr = IONODE_ATTR_PLUGGED;
-			cras_client_set_node_attr(client, id, attr, value);
-			break;
-		}
 		case 'y':
 		case 'a': {
 			int dev_index = atoi(strtok(optarg, ":"));
@@ -1383,13 +1556,57 @@ int main(int argc, char **argv)
 			cras_client_select_node(client, direction, id);
 			break;
 		}
-		case 'z':
-			pause_in_playback_reply = atoi(optarg);
+		case 'b':
+			block_size = atoi(optarg);
+			break;
+		case 'c':
+			num_channels = atoi(optarg);
+			break;
+		case 'd':
+			duration_seconds = atof(optarg);
+			break;
+		case 'e':
+			show_audio_thread_snapshots(client);
+			break;
+		case 'f': {
+			int i;
+
+			for (i = 0; supported_formats[i].name; ++i) {
+				if (strcasecmp(optarg,
+					       supported_formats[i].name) == 0) {
+					format = supported_formats[i].format;
+					break;
+				}
+			}
+
+			if (!supported_formats[i].name) {
+				printf("Unsupported format: %s\n", optarg);
+				return -EINVAL;
+			}
+			break;
+		}
+		case 'g': {
+			long gain = atol(optarg);
+			rc = cras_client_set_system_capture_gain(client, gain);
+			if (rc < 0) {
+				fprintf(stderr, "problem setting capture\n");
+				goto destroy_exit;
+			}
+			break;
+		}
+		case 'h':
+			show_usage();
+			break;
+		case 'i':
+			print_server_info(client);
+			break;
+		case 'j':
+			check_output_plugged(client, optarg);
 			break;
 		case 'k':
 		case 't':
 		case '1':
-		case '2':{
+		case '2': {
 			int dev_index = atoi(strtok(optarg, ":"));
 			int node_index = atoi(strtok(NULL, ":"));
 			enum CRAS_STREAM_DIRECTION dir;
@@ -1405,6 +1622,59 @@ int main(int argc, char **argv)
 				cras_client_add_active_node(client, dir, id);
 			else
 				cras_client_rm_active_node(client, dir, id);
+			break;
+		}
+		case 'l':
+			cras_client_dump_dsp_info(client);
+			break;
+		case 'm':
+			show_audio_debug_info(client);
+			break;
+		case 'n': {
+			int log_level = atoi(optarg);
+
+			setlogmask(LOG_UPTO(log_level));
+			break;
+		}
+		case 'o':
+			channel_layout = optarg;
+			break;
+		case 'p':
+			printf("AEC group ID %d\n",
+					cras_client_get_aec_group_id(client));
+			break;
+		case 'q': {
+			int mute = atoi(optarg);
+			rc = cras_client_set_user_mute(client, mute);
+			if (rc < 0) {
+				fprintf(stderr, "problem setting mute\n");
+				goto destroy_exit;
+			}
+			break;
+		}
+		case 'r':
+			rate = atoi(optarg);
+			break;
+		case 's':
+			cras_client_reload_dsp(client);
+			break;
+		case 'u': {
+			int mute = atoi(optarg);
+			rc = cras_client_set_system_mute(client, mute);
+			if (rc < 0) {
+				fprintf(stderr, "problem setting mute\n");
+				goto destroy_exit;
+			}
+			break;
+		}
+		case 'v': {
+			int volume = atoi(optarg);
+			volume = MIN(100, MAX(0, volume));
+			rc = cras_client_set_system_volume(client, volume);
+			if (rc < 0) {
+				fprintf(stderr, "problem setting volume\n");
+				goto destroy_exit;
+			}
 			break;
 		}
 		case ':':
@@ -1445,6 +1715,20 @@ int main(int argc, char **argv)
 						client, id, value);
 			break;
 		}
+		case 'x': {
+			int dev_index = atoi(strtok(optarg, ":"));
+			int node_index = atoi(strtok(NULL, ":"));
+			int value = atoi(strtok(NULL, ":")) ;
+			cras_node_id_t id = cras_make_node_id(dev_index,
+							      node_index);
+			enum ionode_attr attr = IONODE_ATTR_PLUGGED;
+			cras_client_set_node_attr(client, id, attr, value);
+			break;
+		}
+		case 'z':
+			pause_in_playback_reply = atoi(optarg);
+			break;
+
 		case '0': {
 			int mute = atoi(optarg);
 			rc = cras_client_set_system_capture_mute(client, mute);
@@ -1454,15 +1738,6 @@ int main(int argc, char **argv)
 			}
 			break;
 		}
-		case 'e':
-			show_audio_thread_snapshots(client);
-			break;
-		case 'm':
-			show_audio_debug_info(client);
-			break;
-		case 'o':
-			channel_layout = optarg;
-			break;
 		case '3': {
 			int dev_index = atoi(strtok(optarg, ":"));
 			int node_index = atoi(strtok(NULL, ":"));
@@ -1501,6 +1776,7 @@ int main(int argc, char **argv)
 			cras_client_set_suspend(client, suspend);
 			break;
 		}
+
 		case '!': {
 			play_short_sound = 1;
 			play_short_sound_periods = atoi(optarg);
@@ -1548,6 +1824,7 @@ int main(int argc, char **argv)
 
 			s = strtok(NULL, ":");
 			if (!s && c == ';') {
+				//TODO: c never == ';'
 				show_usage();
 				return -EINVAL;
 			}
@@ -1560,17 +1837,18 @@ int main(int argc, char **argv)
 				print_hotword_models(client, id);
 			break;
 		}
-		case 'L': {
-			int log_level = atoi(optarg);
 
-			setlogmask(LOG_UPTO(log_level));
+		case 'A':
+			post_dsp = atoi(optarg);
 			break;
-		}
-		case 'M':
-			mute_loop_test(client, atoi(optarg));
+		case 'B':
+			stream_id = atoi(optarg);
 			break;
-		case 'T':
-			stream_type = atoi(optarg);
+		case 'C':
+			capture_file = optarg;
+			break;
+		case 'D':
+			cras_client_reload_aec_config(client);
 			break;
 		case 'E': {
 			char *s;
@@ -1591,18 +1869,32 @@ int main(int argc, char **argv)
 			}
 			break;
 		}
-		case 'B':
-			stream_id = atoi(optarg);
-			break;
-		case 'C':
-			aecdump_file = optarg;
-			break;
-		case 'D':
-			cras_client_reload_aec_config(client);
-			break;
 		case 'F':
 			printf("AEC supported %d\n",
 			       !!cras_client_get_aec_supported(client));
+			break;
+		case 'G':
+			aecdump_file = optarg;
+			break;
+		case 'H':
+			show_cras_bt_debug_info(client);
+			break;
+		case 'I':
+			cras_client_set_bt_wbs_enabled(client, atoi(optarg));
+			break;
+		case 'L':
+			loopback_file = optarg;
+			break;
+		case 'M':
+			mute_loop_test(client, atoi(optarg));
+			break;
+		case 'P':
+			playback_file = optarg;
+			break;
+		case 'T':
+			stream_type = atoi(optarg);
+			break;
+
 		default:
 			break;
 		}
@@ -1615,23 +1907,24 @@ int main(int argc, char **argv)
 	if (capture_file != NULL) {
 		if (strcmp(capture_file, "-") == 0)
 			rc = run_file_io_stream(client, 1, CRAS_STREAM_INPUT,
-					block_size, stream_type, rate,
+					block_size, stream_type, rate, format,
 					num_channels, stream_flags, 0, 0);
 		else
 			rc = run_capture(client, capture_file, block_size,
-					 stream_type, rate, num_channels,
-					 stream_flags, 0, 0);
+					 stream_type, rate, format,
+					 num_channels, stream_flags, 0, 0);
 	} else if (playback_file != NULL) {
 		if (strcmp(playback_file, "-") == 0)
 			rc = run_file_io_stream(client, 0, CRAS_STREAM_OUTPUT,
-					block_size, stream_type, rate,
+					block_size, stream_type, rate, format,
 					num_channels, stream_flags, 0, 0);
 		else
 			rc = run_playback(client, playback_file, block_size,
-					  stream_type, rate, num_channels);
+					  stream_type, rate, format,
+					  num_channels);
 	} else if (loopback_file != NULL) {
 		rc = run_capture(client, loopback_file, block_size,
-				 stream_type, rate, num_channels,
+				 stream_type, rate, format, num_channels,
 				 stream_flags, 1, post_dsp);
 	} else if (aecdump_file != NULL) {
 		run_aecdump(client, stream_id, 1);
