@@ -56,6 +56,8 @@ enum CRAS_SERVER_MESSAGE_ID {
 	CRAS_SERVER_REGISTER_NOTIFICATION,
 	CRAS_SERVER_SET_AEC_DUMP,
 	CRAS_SERVER_RELOAD_AEC_CONFIG,
+	CRAS_SERVER_DUMP_BT,
+	CRAS_SERVER_SET_BT_WBS_ENABLED,
 };
 
 enum CRAS_CLIENT_MESSAGE_ID {
@@ -355,6 +357,17 @@ static inline void cras_fill_dump_audio_thread(
 	m->header.length = sizeof(*m);
 }
 
+/* Dump bluetooth events and state changes. */
+struct __attribute__ ((__packed__)) cras_dump_bt {
+	struct cras_server_message header;
+};
+
+static inline void cras_fill_dump_bt(struct cras_dump_bt *m)
+{
+	m->header.id = CRAS_SERVER_DUMP_BT;
+	m->header.length = sizeof(*m);
+}
+
 /* Dump current audio thread snapshots to shard memory with the client. */
 struct __attribute__ ((__packed__)) cras_dump_snapshots {
 	struct cras_server_message header;
@@ -493,6 +506,20 @@ static inline void cras_fill_reload_aec_config(
 {
 	m->header.id = CRAS_SERVER_RELOAD_AEC_CONFIG;
 	m->header.length = sizeof(*m);
+}
+
+/* Sets the flag to enable or disable bluetooth wideband speech feature. */
+struct __attribute__ ((__packed__)) cras_set_bt_wbs_enabled {
+	struct cras_server_message header;
+	unsigned int enabled;
+};
+static inline void cras_fill_set_bt_wbs_enabled(
+		struct cras_set_bt_wbs_enabled *m,
+		unsigned int enabled)
+{
+	m->header.id = CRAS_SERVER_SET_BT_WBS_ENABLED;
+	m->header.length = sizeof(*m);
+	m->enabled = enabled;
 }
 
 struct __attribute__ ((__packed__)) cras_register_notification {

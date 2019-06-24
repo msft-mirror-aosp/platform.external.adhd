@@ -11,13 +11,9 @@
 #include "dev_stream.h"
 #include "cras_audio_area.h"
 #include "cras_mix.h"
+#include "cras_server_metrics.h"
 #include "cras_shm.h"
 
-/*
- * Sleep this much time past the buffer size to be sure at least
- * the buffer size is captured when the audio thread wakes up.
- */
-static const unsigned int capture_extra_sleep_frames = 20;
 /* Adjust device's sample rate by this step faster or slower. Used
  * to make sure multiple active device has stable buffer level.
  */
@@ -80,6 +76,7 @@ struct dev_stream *dev_stream_create(struct cras_rstream *stream,
 	out->dev_id = dev_id;
 	out->stream = stream;
 	out->dev_rate = dev_fmt->frame_rate;
+	out->is_running = 0;
 
 	max_frames = max_frames_for_conversion(stream->buffer_frames,
 					       stream_fmt->frame_rate,
@@ -132,15 +129,6 @@ struct dev_stream *dev_stream_create(struct cras_rstream *stream,
 			    stream_fmt->frame_rate,
 			    &stream->sleep_interval_ts);
 	stream->next_cb_ts = *cb_ts;
-
-	if (stream->direction != CRAS_STREAM_OUTPUT) {
-		struct timespec extra_sleep;
-
-		cras_frames_to_time(capture_extra_sleep_frames,
-				    stream->format.frame_rate, &extra_sleep);
-		add_timespecs(&stream->next_cb_ts, &stream->sleep_interval_ts);
-		add_timespecs(&stream->next_cb_ts, &extra_sleep);
-	}
 
 	cras_rstream_dev_attach(stream, dev_id, dev_ptr);
 
@@ -309,7 +297,7 @@ static unsigned int capture_copy_converted_to_stream(
 	unsigned int offset;
 	const struct cras_audio_format *fmt;
 
-	shm = cras_rstream_input_shm(rstream);
+	shm = cras_rstream_shm(rstream);
 
 	fmt = cras_fmt_conv_out_format(dev_stream->conv);
 	frame_bytes = cras_get_format_bytes(fmt);
@@ -397,7 +385,7 @@ unsigned int dev_stream_capture(struct dev_stream *dev_stream,
 			cras_rstream_dev_offset(rstream, dev_stream->dev_id);
 
 		/* Set up the shm area and copy to it. */
-		shm = cras_rstream_input_shm(rstream);
+		shm = cras_rstream_shm(rstream);
 		stream_samples = cras_shm_get_writeable_frames(
 				shm,
 				cras_rstream_get_cb_threshold(rstream),
@@ -471,7 +459,7 @@ unsigned int dev_stream_capture_avail(const struct dev_stream *dev_stream)
 	unsigned int dev_offset =
 		cras_rstream_dev_offset(rstream, dev_stream->dev_id);
 
-	shm = cras_rstream_input_shm(rstream);
+	shm = cras_rstream_shm(rstream);
 
 	wlimit = cras_rstream_get_max_write_frames(rstream);
 	wlimit -= dev_offset;
@@ -510,7 +498,30 @@ static void check_next_wake_time(struct dev_stream *dev_stream)
 		rstream->next_cb_ts = now;
 		add_timespecs(&rstream->next_cb_ts,
 			      &rstream->sleep_interval_ts);
+		ATLOG(atlog, AUDIO_THREAD_STREAM_RESCHEDULE, rstream->stream_id,
+		      rstream->next_cb_ts.tv_sec, rstream->next_cb_ts.tv_nsec);
+		cras_server_metrics_missed_cb_event(rstream);
 	}
+}
+
+void dev_stream_update_next_wake_time(struct dev_stream *dev_stream)
+{
+	struct cras_rstream *rstream = dev_stream->stream;
+
+	/*
+	 * The empty next_cb_ts means it is the first time update for input stream.
+	 * Initialize next_cb_ts without recording missed callback.
+	 */
+	if (rstream->direction == CRAS_STREAM_INPUT &&
+	    !timespec_is_nonzero(&rstream->next_cb_ts)) {
+		clock_gettime(CLOCK_MONOTONIC_RAW, &rstream->next_cb_ts);
+		add_timespecs(&rstream->next_cb_ts, &rstream->sleep_interval_ts);
+		return;
+	}
+	/* Update next callback time according to perfect schedule. */
+	add_timespecs(&rstream->next_cb_ts, &rstream->sleep_interval_ts);
+	/* Reset schedule if the schedule is missed. */
+	check_next_wake_time(dev_stream);
 }
 
 int dev_stream_playback_update_rstream(struct dev_stream *dev_stream)
@@ -555,10 +566,8 @@ int dev_stream_capture_update_rstream(struct dev_stream *dev_stream)
 	if (rstream->flags & BULK_AUDIO_OK)
 		frames_ready = cras_rstream_level(rstream);
 
-	ATLOG(atlog, AUDIO_THREAD_CAPTURE_POST,
-				    rstream->stream_id,
-				    frames_ready,
-				    rstream->shm.area->read_buf_idx);
+	ATLOG(atlog, AUDIO_THREAD_CAPTURE_POST, rstream->stream_id,
+	      frames_ready, rstream->shm->area->read_buf_idx);
 
 	rc = cras_rstream_audio_ready(rstream, frames_ready);
 
@@ -568,11 +577,7 @@ int dev_stream_capture_update_rstream(struct dev_stream *dev_stream)
 	if (rstream->flags & TRIGGER_ONLY)
 		rstream->triggered = 1;
 
-	/* Update next callback time according to perfect schedule. */
-	add_timespecs(&rstream->next_cb_ts,
-		      &rstream->sleep_interval_ts);
-	/* Reset schedule if the schedule is missed. */
-	check_next_wake_time(dev_stream);
+	dev_stream_update_next_wake_time(dev_stream);
 
 	return 0;
 }
@@ -626,7 +631,7 @@ void dev_stream_set_delay(const struct dev_stream *dev_stream,
 	unsigned int stream_frames;
 
 	if (rstream->direction == CRAS_STREAM_OUTPUT) {
-		shm = cras_rstream_output_shm(rstream);
+		shm = cras_rstream_shm(rstream);
 		stream_frames = cras_fmt_conv_out_frames_to_in(dev_stream->conv,
 							       delay_frames);
 		cras_set_playback_timestamp(rstream->format.frame_rate,
@@ -634,7 +639,7 @@ void dev_stream_set_delay(const struct dev_stream *dev_stream,
 						cras_shm_get_frames(shm),
 					    &shm->area->ts);
 	} else {
-		shm = cras_rstream_input_shm(rstream);
+		shm = cras_rstream_shm(rstream);
 		stream_frames = cras_fmt_conv_in_frames_to_out(dev_stream->conv,
 							       delay_frames);
 		if (cras_shm_frames_written(shm) == 0)
@@ -645,31 +650,16 @@ void dev_stream_set_delay(const struct dev_stream *dev_stream,
 	}
 }
 
-int dev_stream_can_fetch(struct dev_stream *dev_stream)
-{
-	struct cras_rstream *rstream = dev_stream->stream;
-	struct cras_audio_shm *shm;
-
-	shm = cras_rstream_output_shm(rstream);
-
-	/* Don't fetch if the previous request hasn't got response. */
-	return !cras_rstream_is_pending_reply(rstream) &&
-	       cras_shm_is_buffer_available(shm);
-}
-
 int dev_stream_request_playback_samples(struct dev_stream *dev_stream,
 					const struct timespec *now)
 {
-	struct cras_rstream *rstream = dev_stream->stream;
 	int rc;
 
 	rc = cras_rstream_request_audio(dev_stream->stream, now);
 	if (rc < 0)
 		return rc;
 
-	add_timespecs(&rstream->next_cb_ts,
-		      &rstream->sleep_interval_ts);
-	check_next_wake_time(dev_stream);
+	dev_stream_update_next_wake_time(dev_stream);
 
 	return 0;
 }
@@ -779,6 +769,9 @@ static int get_input_wake_time(struct dev_stream *dev_stream,
 	/* Using device timing means the stream neglects next callback time. */
 	if (rstream->flags & USE_DEV_TIMING)
 		*wake_time_out =  time_for_sample;
+
+	ATLOG(atlog, AUDIO_THREAD_STREAM_SLEEP_TIME, dev_stream->stream->stream_id,
+	      wake_time_out->tv_sec, wake_time_out->tv_nsec);
 
 	return 0;
 }

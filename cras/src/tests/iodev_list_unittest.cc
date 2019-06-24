@@ -24,12 +24,13 @@ namespace {
 
 struct cras_server_state server_state_stub;
 struct cras_server_state *server_state_update_begin_return;
+int system_get_mute_return;
 
 /* Data for stubs. */
 static struct cras_observer_ops *observer_ops;
 static int add_stream_called;
 static int rm_stream_called;
-static unsigned int set_node_attr_called;
+static unsigned int set_node_plugged_called;
 static cras_iodev *audio_thread_remove_streams_active_dev;
 static cras_iodev *audio_thread_set_active_dev_val;
 static int audio_thread_set_active_dev_called;
@@ -69,6 +70,9 @@ static unsigned update_active_node_called;
 static struct cras_iodev *update_active_node_iodev_val[5];
 static unsigned update_active_node_node_idx_val[5];
 static unsigned update_active_node_dev_enabled_val[5];
+static int  set_swap_mode_for_node_called;
+static int  set_swap_mode_for_node_enable;
+static int cras_iodev_start_volume_ramp_called;
 static size_t cras_observer_add_called;
 static size_t cras_observer_remove_called;
 static size_t cras_observer_notify_nodes_called;
@@ -80,18 +84,18 @@ static int cras_iodev_open_called;
 static int cras_iodev_open_ret[8];
 static int set_mute_called;
 static std::vector<struct cras_iodev*> set_mute_dev_vector;
-static struct cras_iodev *audio_thread_dev_start_ramp_dev;
+static std::vector<unsigned int> audio_thread_dev_start_ramp_dev_vector;
 static int audio_thread_dev_start_ramp_called;
 static enum CRAS_IODEV_RAMP_REQUEST audio_thread_dev_start_ramp_req ;
-static std::map<const struct cras_iodev*, enum CRAS_IODEV_STATE> cras_iodev_state_ret;
-static std::map<const struct cras_iodev*, int> cras_iodev_has_pinned_stream_ret;
+static std::map<int, bool> stream_list_has_pinned_stream_ret;
 static struct cras_rstream *audio_thread_disconnect_stream_stream;
 static int audio_thread_disconnect_stream_called;
-static int cras_iodev_is_zero_volume_ret;
+static struct cras_iodev fake_sco_in_dev, fake_sco_out_dev;
+static struct cras_ionode fake_sco_in_node, fake_sco_out_node;
 
-void dummy_update_active_node(struct cras_iodev *iodev,
-                              unsigned node_idx,
-                              unsigned dev_enabled) {
+int dev_idx_in_vector(std::vector<unsigned int> v, unsigned int idx)
+{
+  return std::find(v.begin(), v.end(), idx) != v.end();
 }
 
 int device_in_vector(std::vector<struct cras_iodev*> v, struct cras_iodev *dev)
@@ -116,7 +120,7 @@ class IoDevTestSuite : public testing::Test {
       audio_thread_disconnect_stream_called = 0;
       audio_thread_disconnect_stream_stream = NULL;
       audio_thread_is_dev_open_ret = 0;
-      cras_iodev_has_pinned_stream_ret.clear();
+      stream_list_has_pinned_stream_ret.clear();
 
       sample_rates_[0] = 44100;
       sample_rates_[1] = 48000;
@@ -138,6 +142,7 @@ class IoDevTestSuite : public testing::Test {
       d1_.set_capture_mute = NULL;
       d1_.update_supported_formats = NULL;
       d1_.update_active_node = update_active_node;
+      d1_.set_swap_mode_for_node = set_swap_mode_for_node;
       d1_.format = NULL;
       d1_.direction = CRAS_STREAM_OUTPUT;
       d1_.info.idx = -999;
@@ -188,11 +193,12 @@ class IoDevTestSuite : public testing::Test {
       loopback_input.supported_channel_counts = channel_counts_;
 
       server_state_update_begin_return = &server_state_stub;
+      system_get_mute_return = false;
 
       /* Reset stub data. */
       add_stream_called = 0;
       rm_stream_called = 0;
-      set_node_attr_called = 0;
+      set_node_plugged_called = 0;
       audio_thread_rm_open_dev_called = 0;
       audio_thread_add_open_dev_called = 0;
       audio_thread_set_active_dev_called = 0;
@@ -209,14 +215,24 @@ class IoDevTestSuite : public testing::Test {
       memset(cras_iodev_open_ret, 0, sizeof(cras_iodev_open_ret));
       set_mute_called = 0;
       set_mute_dev_vector.clear();
-      audio_thread_dev_start_ramp_dev = NULL;
+      set_swap_mode_for_node_called = 0;
+      set_swap_mode_for_node_enable = 0;
+      cras_iodev_start_volume_ramp_called = 0;
+      audio_thread_dev_start_ramp_dev_vector.clear();
       audio_thread_dev_start_ramp_called = 0;
       audio_thread_dev_start_ramp_req =
           CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK;
-      cras_iodev_is_zero_volume_ret = 0;
-
+      for (int i = 0; i < 5 ; i++)
+        update_active_node_iodev_val[i] = NULL;
+      DL_APPEND(fake_sco_in_dev.nodes, &fake_sco_in_node);
+      DL_APPEND(fake_sco_out_dev.nodes, &fake_sco_out_node);
+      fake_sco_in_node.is_sco_pcm = 0;
+      fake_sco_out_node.is_sco_pcm = 0;
       dummy_empty_iodev[0].state = CRAS_IODEV_STATE_CLOSE;
+      dummy_empty_iodev[0].update_active_node = update_active_node;
       dummy_empty_iodev[1].state = CRAS_IODEV_STATE_CLOSE;
+      dummy_empty_iodev[1].update_active_node = update_active_node;
+      dummy_hotword_iodev.update_active_node = update_active_node;
     }
 
     virtual void TearDown() {
@@ -242,6 +258,15 @@ class IoDevTestSuite : public testing::Test {
       update_active_node_iodev_val[i] = iodev;
       update_active_node_node_idx_val[i] = node_idx;
       update_active_node_dev_enabled_val[i] = dev_enabled;
+    }
+
+    static int set_swap_mode_for_node(struct cras_iodev *iodev,
+                                       struct cras_ionode *node,
+                                       int enable)
+    {
+      set_swap_mode_for_node_called++;
+      set_swap_mode_for_node_enable = enable;
+      return 0;
     }
 
     struct cras_iodev d1_;
@@ -497,6 +522,7 @@ TEST_F(IoDevTestSuite, InitDevFailShouldScheduleRetry) {
   cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
       cras_make_node_id(d1_.info.idx, 0));
 
+  update_active_node_called = 0;
   cras_iodev_open_ret[0] = -5;
   cras_iodev_open_ret[1] = 0;
   cras_tm_timer_cb = NULL;
@@ -506,6 +532,9 @@ TEST_F(IoDevTestSuite, InitDevFailShouldScheduleRetry) {
   /* open dev called twice, one for fallback device. */
   EXPECT_EQ(2, cras_iodev_open_called);
   EXPECT_EQ(1, audio_thread_add_stream_called);
+  EXPECT_EQ(0, update_active_node_called);
+  EXPECT_EQ(&dummy_empty_iodev[CRAS_STREAM_OUTPUT],
+            audio_thread_add_stream_dev);
 
   EXPECT_NE((void *)NULL, cras_tm_timer_cb);
   EXPECT_EQ(1, cras_tm_create_timer_called);
@@ -742,7 +771,7 @@ TEST_F(IoDevTestSuite, UpdateActiveNode) {
   cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
       cras_make_node_id(d2_.info.idx, 1));
 
-  EXPECT_EQ(1, update_active_node_called);
+  EXPECT_EQ(2, update_active_node_called);
   EXPECT_EQ(&d2_, update_active_node_iodev_val[0]);
   EXPECT_EQ(1, update_active_node_node_idx_val[0]);
   EXPECT_EQ(1, update_active_node_dev_enabled_val[0]);
@@ -753,13 +782,13 @@ TEST_F(IoDevTestSuite, UpdateActiveNode) {
   cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
       cras_make_node_id(d1_.info.idx, 0));
 
-  EXPECT_EQ(3, update_active_node_called);
-  EXPECT_EQ(&d2_, update_active_node_iodev_val[1]);
-  EXPECT_EQ(&d1_, update_active_node_iodev_val[2]);
-  EXPECT_EQ(2, update_active_node_node_idx_val[1]);
-  EXPECT_EQ(0, update_active_node_node_idx_val[2]);
-  EXPECT_EQ(0, update_active_node_dev_enabled_val[1]);
-  EXPECT_EQ(1, update_active_node_dev_enabled_val[2]);
+  EXPECT_EQ(5, update_active_node_called);
+  EXPECT_EQ(&d2_, update_active_node_iodev_val[2]);
+  EXPECT_EQ(&d1_, update_active_node_iodev_val[3]);
+  EXPECT_EQ(2, update_active_node_node_idx_val[2]);
+  EXPECT_EQ(0, update_active_node_node_idx_val[3]);
+  EXPECT_EQ(0, update_active_node_dev_enabled_val[2]);
+  EXPECT_EQ(1, update_active_node_dev_enabled_val[3]);
   EXPECT_EQ(2, cras_observer_notify_active_node_called);
   cras_iodev_list_deinit();
 }
@@ -836,11 +865,6 @@ TEST_F(IoDevTestSuite, AddRemoveOutput) {
 TEST_F(IoDevTestSuite, OutputMuteChangedToMute) {
   cras_iodev_list_init();
 
-  // d1_ and d3_ have ramp while d2_ does not have ramp.
-  d1_.ramp = reinterpret_cast<cras_ramp*>(0x123);
-  d2_.ramp = NULL;
-  d3_.ramp = reinterpret_cast<cras_ramp*>(0x124);
-
   cras_iodev_list_add_output(&d1_);
   cras_iodev_list_add_output(&d2_);
   cras_iodev_list_add_output(&d3_);
@@ -849,70 +873,29 @@ TEST_F(IoDevTestSuite, OutputMuteChangedToMute) {
   cras_iodev_list_enable_dev(&d1_);
   cras_iodev_list_enable_dev(&d2_);
 
-  // Assume d1 and d2 devices are in normal run.
-  cras_iodev_state_ret[&d1_] = CRAS_IODEV_STATE_NORMAL_RUN;
-  cras_iodev_state_ret[&d2_] = CRAS_IODEV_STATE_NORMAL_RUN;
-  cras_iodev_state_ret[&d3_] = CRAS_IODEV_STATE_CLOSE;
+  // Assume d1 and d2 devices are open.
+  d1_.state = CRAS_IODEV_STATE_OPEN;
+  d2_.state = CRAS_IODEV_STATE_OPEN;
+  d3_.state = CRAS_IODEV_STATE_CLOSE;
 
   // Execute the callback.
   observer_ops->output_mute_changed(NULL, 0, 1, 0);
 
-  // d1_ should set mute state through audio_thread_dev_start_ramp.
-  EXPECT_EQ(&d1_, audio_thread_dev_start_ramp_dev);
-  EXPECT_EQ(1, audio_thread_dev_start_ramp_called);
+  // d1_ and d2_ should set mute state through audio_thread_dev_start_ramp
+  // because they are both open.
+  EXPECT_EQ(2, audio_thread_dev_start_ramp_called);
+  ASSERT_TRUE(dev_idx_in_vector(audio_thread_dev_start_ramp_dev_vector,
+                                d2_.info.idx));
+  ASSERT_TRUE(dev_idx_in_vector(audio_thread_dev_start_ramp_dev_vector,
+                                d1_.info.idx));
   EXPECT_EQ(CRAS_IODEV_RAMP_REQUEST_DOWN_MUTE, audio_thread_dev_start_ramp_req);
 
-  // d2_ should set mute state right away.
   // d3_ should set mute state right away without calling ramp
-  // because it is not enabled.
-  EXPECT_EQ(2, set_mute_called);
-  EXPECT_EQ(2, set_mute_dev_vector.size());
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
+  // because it is not open.
+  EXPECT_EQ(1, set_mute_called);
+  EXPECT_EQ(1, set_mute_dev_vector.size());
   ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
 
-  // Assume d1_ should mute for volume.
-  // It should not use ramp.
-  cras_iodev_is_zero_volume_ret = 1;
-
-  // Clear stub data of interest.
-  audio_thread_dev_start_ramp_dev = NULL;
-  audio_thread_dev_start_ramp_called = 0;
-  set_mute_called = 0;
-  set_mute_dev_vector.clear();
-
-  // Execute the callback.
-  observer_ops->output_mute_changed(NULL, 0, 1, 0);
-
-  // Verify three devices all set mute state right away.
-  EXPECT_EQ(NULL, audio_thread_dev_start_ramp_dev);
-  EXPECT_EQ(0, audio_thread_dev_start_ramp_called);
-  EXPECT_EQ(3, set_mute_called);
-  EXPECT_EQ(3, set_mute_dev_vector.size());
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d1_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
-
-  // Assume d1_ is changed to no_stream run state
-  // It should not use ramp.
-  cras_iodev_state_ret[&d1_] = CRAS_IODEV_STATE_NO_STREAM_RUN;
-
-  // Clear stub data of interest.
-  audio_thread_dev_start_ramp_dev = NULL;
-  audio_thread_dev_start_ramp_called = 0;
-  set_mute_called = 0;
-  set_mute_dev_vector.clear();
-
-  // Execute the callback.
-  observer_ops->output_mute_changed(NULL, 0, 1, 0);
-
-  // Verify three devices all set mute state right away.
-  EXPECT_EQ(NULL, audio_thread_dev_start_ramp_dev);
-  EXPECT_EQ(0, audio_thread_dev_start_ramp_called);
-  EXPECT_EQ(3, set_mute_called);
-  EXPECT_EQ(3, set_mute_dev_vector.size());
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d1_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
   cras_iodev_list_deinit();
 }
 
@@ -920,11 +903,6 @@ TEST_F(IoDevTestSuite, OutputMuteChangedToMute) {
 TEST_F(IoDevTestSuite, OutputMuteChangedToUnmute) {
   cras_iodev_list_init();
 
-  // d1_ and d3_ have ramp while d2_ does not have ramp.
-  d1_.ramp = reinterpret_cast<cras_ramp*>(0x123);
-  d2_.ramp = NULL;
-  d3_.ramp = reinterpret_cast<cras_ramp*>(0x124);
-
   cras_iodev_list_add_output(&d1_);
   cras_iodev_list_add_output(&d2_);
   cras_iodev_list_add_output(&d3_);
@@ -933,71 +911,28 @@ TEST_F(IoDevTestSuite, OutputMuteChangedToUnmute) {
   cras_iodev_list_enable_dev(&d1_);
   cras_iodev_list_enable_dev(&d2_);
 
-  // Assume d1 and d2 devices are in normal run.
-  cras_iodev_state_ret[&d1_] = CRAS_IODEV_STATE_NORMAL_RUN;
-  cras_iodev_state_ret[&d2_] = CRAS_IODEV_STATE_NORMAL_RUN;
-  cras_iodev_state_ret[&d3_] = CRAS_IODEV_STATE_CLOSE;
+  // Assume d1 and d2 devices are open.
+  d1_.state = CRAS_IODEV_STATE_OPEN;
+  d2_.state = CRAS_IODEV_STATE_CLOSE;
+  d3_.state = CRAS_IODEV_STATE_CLOSE;
 
   // Execute the callback.
   observer_ops->output_mute_changed(NULL, 0, 0, 0);
 
   // d1_ should set mute state through audio_thread_dev_start_ramp.
-  EXPECT_EQ(&d1_, audio_thread_dev_start_ramp_dev);
   EXPECT_EQ(1, audio_thread_dev_start_ramp_called);
+  ASSERT_TRUE(dev_idx_in_vector(audio_thread_dev_start_ramp_dev_vector,
+                                d1_.info.idx));
   EXPECT_EQ(CRAS_IODEV_RAMP_REQUEST_UP_UNMUTE,
             audio_thread_dev_start_ramp_req);
 
-  // d2_ should set mute state right away.
-  // d3_ should set mute state right away without calling ramp
-  // because it is not enabled.
+  // d2_ and d3_ should set mute state right away because they both
+  // are closed.
   EXPECT_EQ(2, set_mute_called);
   EXPECT_EQ(2, set_mute_dev_vector.size());
   ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
   ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
 
-  // Assume d1_ should mute for volume.
-  // It should not use ramp.
-  cras_iodev_is_zero_volume_ret = 1;
-
-  // Clear stub data of interest.
-  audio_thread_dev_start_ramp_dev = NULL;
-  audio_thread_dev_start_ramp_called = 0;
-  set_mute_called = 0;
-  set_mute_dev_vector.clear();
-
-  // Execute the callback.
-  observer_ops->output_mute_changed(NULL, 0, 1, 0);
-
-  // Verify three devices all set mute state right away.
-  EXPECT_EQ(NULL, audio_thread_dev_start_ramp_dev);
-  EXPECT_EQ(0, audio_thread_dev_start_ramp_called);
-  EXPECT_EQ(3, set_mute_called);
-  EXPECT_EQ(3, set_mute_dev_vector.size());
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d1_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
-
-  // Assume d1_ is changed to no_stream run state
-  // It should not use ramp.
-  cras_iodev_state_ret[&d1_] = CRAS_IODEV_STATE_NO_STREAM_RUN;
-
-  // Clear stub data of interest.
-  audio_thread_dev_start_ramp_dev = NULL;
-  audio_thread_dev_start_ramp_called = 0;
-  set_mute_called = 0;
-  set_mute_dev_vector.clear();
-
-  // Execute the callback.
-  observer_ops->output_mute_changed(NULL, 0, 1, 0);
-
-  // Verify three devices all set mute state right away.
-  EXPECT_EQ(NULL, audio_thread_dev_start_ramp_dev);
-  EXPECT_EQ(0, audio_thread_dev_start_ramp_called);
-  EXPECT_EQ(3, set_mute_called);
-  EXPECT_EQ(3, set_mute_dev_vector.size());
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d1_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d2_));
-  ASSERT_TRUE(device_in_vector(set_mute_dev_vector, &d3_));
   cras_iodev_list_deinit();
 }
 
@@ -1209,7 +1144,7 @@ TEST_F(IoDevTestSuite, IodevListSetNodeAttr) {
   rc = cras_iodev_list_set_node_attr(cras_make_node_id(0, 0),
                                      IONODE_ATTR_PLUGGED, 1);
   EXPECT_LE(rc, 0);
-  EXPECT_EQ(0, set_node_attr_called);
+  EXPECT_EQ(0, set_node_plugged_called);
 
   // Add two device, each with one node.
   d1_.direction = CRAS_STREAM_INPUT;
@@ -1222,19 +1157,94 @@ TEST_F(IoDevTestSuite, IodevListSetNodeAttr) {
   rc = cras_iodev_list_set_node_attr(cras_make_node_id(d2_.info.idx, 1),
                                      IONODE_ATTR_PLUGGED, 1);
   EXPECT_LT(rc, 0);
-  EXPECT_EQ(0, set_node_attr_called);
+  EXPECT_EQ(0, set_node_plugged_called);
 
   // Mismatch id
   rc = cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 2),
                                      IONODE_ATTR_PLUGGED, 1);
   EXPECT_LT(rc, 0);
-  EXPECT_EQ(0, set_node_attr_called);
+  EXPECT_EQ(0, set_node_plugged_called);
 
   // Correct device id and node id
   rc = cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
                                      IONODE_ATTR_PLUGGED, 1);
   EXPECT_EQ(rc, 0);
-  EXPECT_EQ(1, set_node_attr_called);
+  EXPECT_EQ(1, set_node_plugged_called);
+  cras_iodev_list_deinit();
+}
+
+TEST_F(IoDevTestSuite, SetNodeVolumeCaptureGain) {
+  int rc;
+
+  cras_iodev_list_init();
+
+  d1_.direction = CRAS_STREAM_OUTPUT;
+  rc = cras_iodev_list_add_output(&d1_);
+  ASSERT_EQ(0, rc);
+  node1.idx = 1;
+  node1.dev = &d1_;
+
+  // Do not ramp without software volume.
+  d1_.software_volume_needed = 0;
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_VOLUME, 10);
+  EXPECT_EQ(1, cras_observer_notify_output_node_volume_called);
+  EXPECT_EQ(0, cras_iodev_start_volume_ramp_called);
+
+  // Even with software volume, device with NULL ramp won't trigger ramp start.
+  d1_.software_volume_needed = 1;
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_VOLUME, 20);
+  EXPECT_EQ(2, cras_observer_notify_output_node_volume_called);
+  EXPECT_EQ(0, cras_iodev_start_volume_ramp_called);
+
+  // System mute prevents volume ramp from starting
+  system_get_mute_return = true;
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_VOLUME, 20);
+  EXPECT_EQ(3, cras_observer_notify_output_node_volume_called);
+  EXPECT_EQ(0, cras_iodev_start_volume_ramp_called);
+
+  // Ramp starts only when it's non-NULL, software volume is used, and
+  // system is not muted
+  system_get_mute_return = false;
+  d1_.ramp = reinterpret_cast<struct cras_ramp*>(0x1);
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_VOLUME, 20);
+  EXPECT_EQ(4, cras_observer_notify_output_node_volume_called);
+  EXPECT_EQ(1, cras_iodev_start_volume_ramp_called);
+
+  d1_.direction = CRAS_STREAM_INPUT;
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_CAPTURE_GAIN, 15);
+  EXPECT_EQ(1, cras_observer_notify_input_node_gain_called);
+  cras_iodev_list_deinit();
+}
+
+TEST_F(IoDevTestSuite, SetNodeSwapLeftRight)
+{
+  int rc;
+
+  cras_iodev_list_init();
+
+  rc = cras_iodev_list_add_output(&d1_);
+  ASSERT_EQ(0, rc);
+  node1.idx = 1;
+  node1.dev = &d1_;
+
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_SWAP_LEFT_RIGHT, 1);
+  EXPECT_EQ(1, set_swap_mode_for_node_called);
+  EXPECT_EQ(1, set_swap_mode_for_node_enable);
+  EXPECT_EQ(1, node1.left_right_swapped);
+  EXPECT_EQ(1, cras_observer_notify_node_left_right_swapped_called);
+
+  cras_iodev_list_set_node_attr(cras_make_node_id(d1_.info.idx, 1),
+                                IONODE_ATTR_SWAP_LEFT_RIGHT, 0);
+  EXPECT_EQ(2, set_swap_mode_for_node_called);
+  EXPECT_EQ(0, set_swap_mode_for_node_enable);
+  EXPECT_EQ(0, node1.left_right_swapped);
+  EXPECT_EQ(2, cras_observer_notify_node_left_right_swapped_called);
   cras_iodev_list_deinit();
 }
 
@@ -1379,7 +1389,7 @@ TEST_F(IoDevTestSuite, AddRemovePinnedStream) {
   EXPECT_EQ(0, cras_iodev_list_add_output(&d1_));
   cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
       cras_make_node_id(d1_.info.idx, 0));
-  EXPECT_EQ(1, update_active_node_called);
+  EXPECT_EQ(2, update_active_node_called);
   EXPECT_EQ(&d1_, update_active_node_iodev_val[0]);
 
   d2_.direction = CRAS_STREAM_OUTPUT;
@@ -1392,36 +1402,43 @@ TEST_F(IoDevTestSuite, AddRemovePinnedStream) {
   rstream.pinned_dev_idx = d1_.info.idx;
 
   // Add pinned stream to d1.
+  update_active_node_called = 0;
   EXPECT_EQ(0, stream_add_cb(&rstream));
   EXPECT_EQ(1, audio_thread_add_stream_called);
   EXPECT_EQ(&d1_, audio_thread_add_stream_dev);
   EXPECT_EQ(&rstream, audio_thread_add_stream_stream);
-  EXPECT_EQ(2, update_active_node_called);
+  EXPECT_EQ(1, update_active_node_called);
   // Init d1_ because of pinned stream
-  EXPECT_EQ(&d1_, update_active_node_iodev_val[1]);
+  EXPECT_EQ(&d1_, update_active_node_iodev_val[0]);
 
   // Select d2, check pinned stream is not added to d2.
+  update_active_node_called = 0;
+  stream_list_has_pinned_stream_ret[d1_.info.idx] = 1;
   cras_iodev_list_select_node(CRAS_STREAM_OUTPUT,
       cras_make_node_id(d2_.info.idx, 0));
   EXPECT_EQ(1, audio_thread_add_stream_called);
-  EXPECT_EQ(4, update_active_node_called);
+  EXPECT_EQ(2, update_active_node_called);
   // Unselect d1_ and select to d2_
-  EXPECT_EQ(&d1_, update_active_node_iodev_val[2]);
-  EXPECT_EQ(&d2_, update_active_node_iodev_val[3]);
+  EXPECT_EQ(&d2_, update_active_node_iodev_val[0]);
+  EXPECT_EQ(&dummy_empty_iodev[CRAS_STREAM_OUTPUT],
+            update_active_node_iodev_val[1]);
 
   // Remove pinned stream from d1, check d1 is closed after stream removed.
+  update_active_node_called = 0;
+  stream_list_has_pinned_stream_ret[d1_.info.idx] = 0;
   EXPECT_EQ(0, stream_rm_cb(&rstream));
   EXPECT_EQ(1, cras_iodev_close_called);
   EXPECT_EQ(&d1_, cras_iodev_close_dev);
-  EXPECT_EQ(5, update_active_node_called);
+  EXPECT_EQ(1, update_active_node_called);
   // close pinned device
-  EXPECT_EQ(&d1_, update_active_node_iodev_val[4]);
+  EXPECT_EQ(&d1_, update_active_node_iodev_val[0]);
 
   // Assume dev is already opened, add pin stream should not trigger another
   // update_active_node call, but will trigger audio_thread_add_stream.
   audio_thread_is_dev_open_ret = 1;
+  update_active_node_called = 0;
   EXPECT_EQ(0, stream_add_cb(&rstream));
-  EXPECT_EQ(5, update_active_node_called);
+  EXPECT_EQ(0, update_active_node_called);
   EXPECT_EQ(2, audio_thread_add_stream_called);
 
   cras_iodev_list_deinit();
@@ -1456,7 +1473,7 @@ TEST_F(IoDevTestSuite, SuspendResumePinnedStream) {
   // Device state enters no_stream after stream is disconnected.
   d1_.state = CRAS_IODEV_STATE_NO_STREAM_RUN;
   // Device has no pinned stream now. But this pinned stream remains in stream_list.
-  cras_iodev_has_pinned_stream_ret[&d1_] = 0;
+  stream_list_has_pinned_stream_ret[d1_.info.idx] = 0;
 
   // Suspend
   observer_ops->suspend_changed(NULL, 1);
@@ -1568,6 +1585,24 @@ TEST_F(IoDevTestSuite, HotwordStreamsAddedAfterSuspend) {
   cras_iodev_list_deinit();
 }
 
+TEST_F(IoDevTestSuite, GetSCOPCMIodevs) {
+  cras_iodev_list_init();
+
+  fake_sco_in_dev.direction = CRAS_STREAM_INPUT;
+  fake_sco_in_node.is_sco_pcm = 1;
+  cras_iodev_list_add_input(&fake_sco_in_dev);
+  fake_sco_out_dev.direction = CRAS_STREAM_OUTPUT;
+  fake_sco_out_node.is_sco_pcm = 1;
+  cras_iodev_list_add_output(&fake_sco_out_dev);
+
+  EXPECT_EQ(&fake_sco_in_dev,
+	    cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_INPUT));
+  EXPECT_EQ(&fake_sco_out_dev,
+	    cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_OUTPUT));
+
+  cras_iodev_list_deinit();
+}
+
 }  //  namespace
 
 int main(int argc, char **argv) {
@@ -1584,6 +1619,10 @@ struct cras_server_state *cras_system_state_update_begin() {
 }
 
 void cras_system_state_update_complete() {
+}
+
+int cras_system_get_mute() {
+  return system_get_mute_return;
 }
 
 struct audio_thread *audio_thread_create() {
@@ -1618,7 +1657,8 @@ int audio_thread_add_open_dev(struct audio_thread *thread,
 }
 
 int audio_thread_rm_open_dev(struct audio_thread *thread,
-                               struct cras_iodev *dev)
+                             enum CRAS_STREAM_DIRECTION dir,
+                             unsigned int dev_idx)
 {
   audio_thread_rm_open_dev_called++;
   return 0;
@@ -1658,44 +1698,6 @@ int audio_thread_drain_stream(struct audio_thread *thread,
 	return audio_thread_drain_stream_return;
 }
 
-void set_node_volume(struct cras_ionode *node, int value)
-{
-  struct cras_iodev *dev = node->dev;
-  unsigned int volume;
-
-  if (dev->direction != CRAS_STREAM_OUTPUT)
-    return;
-
-  volume = (unsigned int)std::min(value, 100);
-  node->volume = volume;
-  if (dev->set_volume)
-    dev->set_volume(dev);
-
-  cras_iodev_list_notify_node_volume(node);
-}
-
-int cras_iodev_set_node_attr(struct cras_ionode *ionode,
-                             enum ionode_attr attr, int value)
-{
-  set_node_attr_called++;
-
-  switch (attr) {
-  case IONODE_ATTR_PLUGGED:
-    // plug_node(ionode, value);
-    break;
-  case IONODE_ATTR_VOLUME:
-    set_node_volume(ionode, value);
-    break;
-  case IONODE_ATTR_CAPTURE_GAIN:
-    // set_node_capture_gain(ionode, value);
-    break;
-  default:
-    return -EINVAL;
-  }
-
-  return 0;
-}
-
 struct cras_iodev *empty_iodev_create(enum CRAS_STREAM_DIRECTION direction,
                                       enum CRAS_NODE_TYPE node_type) {
   struct cras_iodev *dev;
@@ -1705,7 +1707,6 @@ struct cras_iodev *empty_iodev_create(enum CRAS_STREAM_DIRECTION direction,
     dev = &dummy_empty_iodev[direction];
   }
   dev->direction = direction;
-  dev->update_active_node = dummy_update_active_node;
   if (dev->active_node == NULL) {
     struct cras_ionode *node = (struct cras_ionode *)calloc(1, sizeof(*node));
     node->type = node_type;
@@ -1765,19 +1766,23 @@ int cras_iodev_set_mute(struct cras_iodev* iodev) {
   return 0;
 }
 
-int cras_iodev_is_zero_volume(const struct cras_iodev *iodev)
+void cras_iodev_set_node_plugged(struct cras_ionode *node, int plugged)
 {
-  return cras_iodev_is_zero_volume_ret;
+  set_node_plugged_called++;
 }
 
-enum CRAS_IODEV_STATE cras_iodev_state(const struct cras_iodev *iodev)
+int cras_iodev_start_volume_ramp(struct cras_iodev *odev,
+                                 unsigned int old_volume,
+                                 unsigned int new_volume)
 {
-	return cras_iodev_state_ret[iodev];
+  cras_iodev_start_volume_ramp_called++;
+  return 0;
 }
 
-int cras_iodev_has_pinned_stream(const struct cras_iodev *dev)
+bool stream_list_has_pinned_stream(struct stream_list *list,
+                                   unsigned int dev_idx)
 {
-  return cras_iodev_has_pinned_stream_ret[dev];
+  return stream_list_has_pinned_stream_ret[dev_idx];
 }
 
 struct stream_list *stream_list_create(stream_callback *add_cb,
@@ -1895,11 +1900,11 @@ void cras_observer_notify_input_node_gain(cras_node_id_t node_id,
 }
 
 int audio_thread_dev_start_ramp(struct audio_thread *thread,
-                                struct cras_iodev *dev,
+                                unsigned int dev_idx,
                                 enum CRAS_IODEV_RAMP_REQUEST request)
 {
   audio_thread_dev_start_ramp_called++;
-  audio_thread_dev_start_ramp_dev = dev;
+  audio_thread_dev_start_ramp_dev_vector.push_back(dev_idx);
   audio_thread_dev_start_ramp_req = request;
   return 0;
 }

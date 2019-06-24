@@ -29,6 +29,10 @@ struct cras_iodev;
  *    conv_buffer_size_frames - Size of conv_buffer in frames.
  *    dev_rate - Sampling rate of device. This is set when dev_stream is
  *               created.
+ *    is_running - For input stream, it should be set to true after it is added
+ *                 into device. For output stream, it should be set to true
+ *                 just before its first fetch to avoid affecting other existing
+ *                 streams.
  */
 struct dev_stream {
 	unsigned int dev_id;
@@ -39,6 +43,7 @@ struct dev_stream {
 	unsigned int conv_buffer_size_frames;
 	size_t dev_rate;
 	struct dev_stream *prev, *next;
+	int is_running;
 };
 
 struct dev_stream *dev_stream_create(struct cras_rstream *stream,
@@ -120,6 +125,9 @@ unsigned int dev_stream_capture_avail(const struct dev_stream *dev_stream);
  */
 unsigned int dev_stream_cb_threshold(const struct dev_stream *dev_stream);
 
+/* Update next callback time for the stream. */
+void dev_stream_update_next_wake_time(struct dev_stream *dev_stream);
+
 /*
  * If enough samples have been captured, post them to the client.
  * TODO(dgreid) - see if this function can be eliminated.
@@ -147,9 +155,6 @@ void cras_set_capture_timestamp(size_t frame_rate,
  */
 void dev_stream_set_delay(const struct dev_stream *dev_stream,
 			  unsigned int delay_frames);
-
-/* Returns if it's okay to request playback samples for this stream. */
-int dev_stream_can_fetch(struct dev_stream *dev_stream);
 
 /* Ask the client for cb_threshold samples of audio to play. */
 int dev_stream_request_playback_samples(struct dev_stream *dev_stream,
@@ -184,8 +189,18 @@ int dev_stream_wake_time(struct dev_stream *dev_stream,
  */
 int dev_stream_poll_stream_fd(const struct dev_stream *dev_stream);
 
+static inline int dev_stream_is_running(struct dev_stream *dev_stream)
+{
+	return dev_stream->is_running;
+}
+
+static inline void dev_stream_set_running(struct dev_stream *dev_stream)
+{
+	dev_stream->is_running = 1;
+}
+
 static inline const struct timespec *
-dev_stream_next_cb_ts(struct dev_stream *dev_stream)
+dev_stream_next_cb_ts(const struct dev_stream *dev_stream)
 {
 	if (dev_stream->stream->flags & USE_DEV_TIMING)
 		return NULL;

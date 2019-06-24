@@ -22,6 +22,7 @@ static const char mic_positions[] = "MicPositions";
 static const char override_type_name_var[] = "OverrideNodeType";
 static const char output_dsp_name_var[] = "OutputDspName";
 static const char input_dsp_name_var[] = "InputDspName";
+static const char dsp_name_var[] = "DspName";
 static const char mixer_var[] = "MixerName";
 static const char swap_mode_suffix[] = "Swap Mode";
 static const char min_buffer_level_var[] = "MinBufferLevel";
@@ -610,8 +611,8 @@ const char *ucm_get_edid_file_for_dev(struct cras_use_case_mgr *mgr,
 	return file_name;
 }
 
-const char *ucm_get_dsp_name(struct cras_use_case_mgr *mgr, const char *ucm_dev,
-			     int direction)
+const char *ucm_get_dsp_name_default(struct cras_use_case_mgr *mgr,
+				     int direction)
 {
 	const char *var = (direction == CRAS_STREAM_OUTPUT)
 		? output_dsp_name_var
@@ -619,17 +620,24 @@ const char *ucm_get_dsp_name(struct cras_use_case_mgr *mgr, const char *ucm_dev,
 	const char *dsp_name = NULL;
 	int rc;
 
-	rc = get_var(mgr, var, ucm_dev, uc_verb(mgr), &dsp_name);
+	rc = get_var(mgr, var, "", uc_verb(mgr), &dsp_name);
 	if (rc)
 		return NULL;
 
 	return dsp_name;
 }
 
-const char *ucm_get_dsp_name_default(struct cras_use_case_mgr *mgr,
-				     int direction)
+const char *ucm_get_dsp_name_for_dev(struct cras_use_case_mgr *mgr,
+				     const char *dev)
 {
-	return ucm_get_dsp_name(mgr, "", direction);
+	const char *dsp_name = NULL;
+	int rc;
+
+	rc = get_var(mgr, dsp_name_var, dev, uc_verb(mgr), &dsp_name);
+	if (rc)
+		return NULL;
+
+	return dsp_name;
 }
 
 int ucm_get_min_buffer_level(struct cras_use_case_mgr *mgr,
@@ -919,31 +927,45 @@ char *ucm_get_hotword_models(struct cras_use_case_mgr *mgr)
 	int i, num_entries;
 	int models_len = 0;
 	char *models = NULL;
-	const char *tmp;
+	const char *model_name;
 	char *identifier;
 
 	identifier = snd_use_case_identifier("_modifiers/%s", uc_verb(mgr));
 	num_entries = snd_use_case_get_list(mgr->mgr, identifier, &list);
 	free(identifier);
+
 	if (num_entries <= 0)
 		return 0;
-	models = (char *)malloc(num_entries * 8);
-	for (i = 0; i < num_entries; i+=2) {
+
+	models = (char *)malloc(
+			num_entries * (CRAS_MAX_HOTWORD_MODEL_NAME_SIZE + 1));
+
+	for (i = 0; i < num_entries; i += 2) {
 		if (!list[i])
 			continue;
-		if (0 == strncmp(list[i], hotword_model_prefix,
-				 strlen(hotword_model_prefix))) {
-			tmp = list[i] + strlen(hotword_model_prefix);
-			while (isspace(*tmp))
-				tmp++;
-			strcpy(models + models_len, tmp);
-			models_len += strlen(tmp);
-			if (i + 2 >= num_entries)
-				models[models_len] = '\0';
-			else
-				models[models_len++] = ',';
+
+		if (strncmp(list[i], hotword_model_prefix,
+			    strlen(hotword_model_prefix)))
+			continue;
+
+		model_name = list[i] + strlen(hotword_model_prefix);
+		while (isspace(*model_name))
+			model_name++;
+
+		if (strlen(model_name) > CRAS_MAX_HOTWORD_MODEL_NAME_SIZE) {
+			syslog(LOG_ERR,
+			       "Ignore hotword model %s because the it is"
+			       "too long.", list[i]);
+			continue;
 		}
+
+		if (models_len != 0)
+			models[models_len++] = ',';
+
+		strcpy(models + models_len, model_name);
+		models_len += strlen(model_name);
 	}
+	models[models_len++] = 0;
 	snd_use_case_free_list(list, num_entries);
 
 	return models;
@@ -1076,7 +1098,7 @@ const char *ucm_get_jack_type_for_dev(struct cras_use_case_mgr *mgr,
 	if (rc)
 		return NULL;
 
-	if (strcmp(name, "hctl") && strcmp(name, "gpio")) {
+	if (strcmp(name, "hctl") && strcmp(name, "gpio") && strcmp(name, "always")) {
 		syslog(LOG_ERR, "Unknown jack type: %s", name);
 		if(name)
 			free((void *)name);

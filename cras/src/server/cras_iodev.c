@@ -25,6 +25,7 @@
 #include "cras_mix.h"
 #include "cras_ramp.h"
 #include "cras_rstream.h"
+#include "cras_server_metrics.h"
 #include "cras_system_state.h"
 #include "cras_util.h"
 #include "dev_stream.h"
@@ -36,6 +37,23 @@
 static const float RAMP_UNMUTE_DURATION_SECS = 0.5;
 static const float RAMP_NEW_STREAM_DURATION_SECS = 0.01;
 static const float RAMP_MUTE_DURATION_SECS = 0.1;
+static const float RAMP_VOLUME_CHANGE_DURATION_SECS = 0.1;
+
+/*
+ * It is the lastest time for the device to wake up when it is in the normal
+ * run state. It represents how many remaining frames in the device buffer.
+ */
+static const struct timespec dev_normal_run_wake_up_time = {
+	0, 1 * 1000 * 1000 /* 1 msec. */
+};
+
+/*
+ * It is the lastest time for the device to wake up when it is in the no stream
+ * state. It represents how many remaining frames in the device buffer.
+ */
+static const struct timespec dev_no_stream_wake_up_time = {
+	0, 5 * 1000 * 1000 /* 5 msec. */
+};
 
 /*
  * Check issu b/72496547 and commit message for the history of
@@ -112,6 +130,10 @@ static unsigned int dev_playback_frames(struct cras_iodev* odev)
 
 	DL_FOREACH(odev->streams, curr) {
 		int dev_frames;
+
+		/* Skip stream which hasn't started running yet. */
+		if (!dev_stream_is_running(curr))
+			continue;
 
 		/* If this is a single output dev stream, updates the latest
 		 * number of frames for playback. */
@@ -384,25 +406,19 @@ static inline void adjust_dev_channel_for_dsp(const struct cras_iodev *iodev)
 	if (!ctx || !cras_dsp_get_pipeline(ctx))
 		return;
 
-	if (iodev->direction == CRAS_STREAM_OUTPUT) {
+	if (iodev->direction == CRAS_STREAM_OUTPUT)
 		iodev->format->num_channels =
 			cras_dsp_num_output_channels(ctx);
-		iodev->ext_format->num_channels =
-			cras_dsp_num_input_channels(ctx);
-	} else {
+	else
 		iodev->format->num_channels =
 			cras_dsp_num_input_channels(ctx);
-		iodev->ext_format->num_channels =
-			cras_dsp_num_output_channels(ctx);
-	}
 
 	cras_dsp_put_pipeline(ctx);
 }
 
 /* Updates channel layout based on the number of channels set by a
- * client stream. When successful we need to update the new channel
- * layout to ext_format, otherwise we should set a default value
- * to both format and ext_format.
+ * client stream. Set a default value to format if the update call
+ * fails.
  */
 static void update_channel_layout(struct cras_iodev *iodev)
 {
@@ -412,14 +428,8 @@ static void update_channel_layout(struct cras_iodev *iodev)
 		return;
 
 	rc = iodev->update_channel_layout(iodev);
-	if (rc < 0) {
+	if (rc < 0)
 		cras_audio_format_set_default_channel_layout(iodev->format);
-		cras_audio_format_set_default_channel_layout(iodev->ext_format);
-	} else {
-		cras_audio_format_set_channel_layout(
-				iodev->ext_format,
-				iodev->format->channel_layout);
-	}
 }
 
 /*
@@ -445,11 +455,9 @@ int cras_iodev_set_format(struct cras_iodev *iodev,
 	 * requested in "fmt". */
 	if (iodev->format == NULL) {
 		iodev->format = malloc(sizeof(struct cras_audio_format));
-		iodev->ext_format = malloc(sizeof(struct cras_audio_format));
-		if (!iodev->format || !iodev->ext_format)
+		if (!iodev->format)
 			return -ENOMEM;
 		*iodev->format = *fmt;
-		*iodev->ext_format = *fmt;
 
 		if (iodev->update_supported_formats) {
 			rc = iodev->update_supported_formats(iodev);
@@ -464,7 +472,6 @@ int cras_iodev_set_format(struct cras_iodev *iodev,
 		 * stream. */
 		actual_rate = get_best_rate(iodev, fmt->frame_rate);
 		iodev->format->frame_rate = actual_rate;
-		iodev->ext_format->frame_rate = actual_rate;
 
 		cras_iodev_alloc_dsp(iodev);
 		cras_iodev_update_dsp(iodev);
@@ -481,13 +488,10 @@ int cras_iodev_set_format(struct cras_iodev *iodev,
 			goto error;
 		}
 		iodev->format->format = actual_format;
-		iodev->ext_format->format = actual_format;
 		if (iodev->format->num_channels != actual_num_channels) {
 			/* If the DSP for this device doesn't match, drop it. */
 			iodev->format->num_channels = actual_num_channels;
 			trim_channel_layout(iodev->format);
-			iodev->ext_format->num_channels = actual_num_channels;
-			trim_channel_layout(iodev->ext_format);
 			cras_iodev_free_dsp(iodev);
 		}
 
@@ -506,9 +510,7 @@ int cras_iodev_set_format(struct cras_iodev *iodev,
 
 error:
 	free(iodev->format);
-	free(iodev->ext_format);
 	iodev->format = NULL;
-	iodev->ext_format = NULL;
 	return rc;
 }
 
@@ -518,15 +520,6 @@ error:
 static void add_ext_dsp_module_to_pipeline(struct cras_iodev *iodev)
 {
 	struct pipeline *pipeline;
-
-	if (!iodev->ext_dsp_module)
-		return;
-
-	iodev->ext_dsp_module->configure(
-			iodev->ext_dsp_module,
-			iodev->buffer_size,
-			iodev->ext_format->num_channels,
-			iodev->ext_format->frame_rate);
 
 	pipeline = iodev->dsp_context
 			? cras_dsp_get_pipeline(iodev->dsp_context)
@@ -539,11 +532,42 @@ static void add_ext_dsp_module_to_pipeline(struct cras_iodev *iodev)
 			iodev->format->num_channels);
 		pipeline = cras_dsp_get_pipeline(iodev->dsp_context);
 	}
+	/* dsp_context mutex locked. Now it's safe to modify dsp
+	 * pipeline resources. */
+
+	if (iodev->ext_dsp_module)
+		iodev->ext_dsp_module->configure(
+				iodev->ext_dsp_module,
+				iodev->buffer_size,
+				iodev->format->num_channels,
+				iodev->format->frame_rate);
 
 	cras_dsp_pipeline_set_sink_ext_module(
 			pipeline,
 			iodev->ext_dsp_module);
 
+	/* Unlock dsp_context mutex. */
+	cras_dsp_put_pipeline(iodev->dsp_context);
+}
+
+/*
+ * Releases the ext_dsp_module if it ever added to iodev's dsp pipeline.
+ */
+static void release_ext_dsp_module_from_pipeline(struct cras_iodev *iodev)
+{
+	struct pipeline *pipeline;
+
+	if (iodev->dsp_context == NULL)
+		return;
+
+	pipeline = cras_dsp_get_pipeline(iodev->dsp_context);
+	if (pipeline == NULL)
+		return;
+	/* dsp_context mutex locked. */
+
+	cras_dsp_pipeline_set_sink_ext_module(pipeline, NULL);
+
+	/* Unlock dsp_context mutex. */
 	cras_dsp_put_pipeline(iodev->dsp_context);
 }
 
@@ -552,9 +576,13 @@ void cras_iodev_set_ext_dsp_module(struct cras_iodev *iodev,
 {
 	iodev->ext_dsp_module = ext;
 
-	if (!ext || !cras_iodev_is_open(iodev))
+	if (!cras_iodev_is_open(iodev))
 		return;
-	add_ext_dsp_module_to_pipeline(iodev);
+
+	if (iodev->ext_dsp_module)
+		add_ext_dsp_module_to_pipeline(iodev);
+	else
+		release_ext_dsp_module_from_pipeline(iodev);
 }
 
 void cras_iodev_update_dsp(struct cras_iodev *iodev)
@@ -598,9 +626,7 @@ int cras_iodev_dsp_set_swap_mode_for_node(struct cras_iodev *iodev,
 void cras_iodev_free_format(struct cras_iodev *iodev)
 {
 	free(iodev->format);
-	free(iodev->ext_format);
 	iodev->format = NULL;
-	iodev->ext_format = NULL;
 }
 
 
@@ -663,7 +689,7 @@ void cras_iodev_fill_time_from_frames(size_t frames,
 }
 
 /* This is called when a node is plugged/unplugged */
-static void plug_node(struct cras_ionode *node, int plugged)
+void cras_iodev_set_node_plugged(struct cras_ionode *node, int plugged)
 {
 	if (node->plugged == plugged)
 		return;
@@ -674,78 +700,6 @@ static void plug_node(struct cras_ionode *node, int plugged)
 		cras_iodev_list_disable_dev(node->dev, false);
 	}
 	cras_iodev_list_notify_nodes_changed();
-}
-
-static void set_node_volume(struct cras_ionode *node, int value)
-{
-	struct cras_iodev *dev = node->dev;
-	unsigned int volume;
-
-	if (dev->direction != CRAS_STREAM_OUTPUT)
-		return;
-
-	volume = (unsigned int)MIN(value, 100);
-	node->volume = volume;
-	if (dev->set_volume)
-		dev->set_volume(dev);
-
-	cras_iodev_list_notify_node_volume(node);
-}
-
-static void set_node_capture_gain(struct cras_ionode *node, int value)
-{
-	struct cras_iodev *dev = node->dev;
-
-	if (dev->direction != CRAS_STREAM_INPUT)
-		return;
-
-	node->capture_gain = (long)value;
-	if (dev->set_capture_gain)
-		dev->set_capture_gain(dev);
-
-	cras_iodev_list_notify_node_capture_gain(node);
-}
-
-static void set_node_left_right_swapped(struct cras_ionode *node, int value)
-{
-	struct cras_iodev *dev = node->dev;
-	int rc;
-
-	if (!dev->set_swap_mode_for_node)
-		return;
-	rc = dev->set_swap_mode_for_node(dev, node, value);
-	if (rc) {
-		syslog(LOG_ERR,
-		       "Failed to set swap mode on node %s to %d; error %d",
-		       node->name, value, rc);
-		return;
-	}
-	node->left_right_swapped = value;
-	cras_iodev_list_notify_node_left_right_swapped(node);
-	return;
-}
-
-int cras_iodev_set_node_attr(struct cras_ionode *ionode,
-			     enum ionode_attr attr, int value)
-{
-	switch (attr) {
-	case IONODE_ATTR_PLUGGED:
-		plug_node(ionode, value);
-		break;
-	case IONODE_ATTR_VOLUME:
-		set_node_volume(ionode, value);
-		break;
-	case IONODE_ATTR_CAPTURE_GAIN:
-		set_node_capture_gain(ionode, value);
-		break;
-	case IONODE_ATTR_SWAP_LEFT_RIGHT:
-		set_node_left_right_swapped(ionode, value);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
 }
 
 void cras_iodev_add_node(struct cras_iodev *iodev, struct cras_ionode *node)
@@ -789,14 +743,51 @@ float cras_iodev_get_software_gain_scaler(const struct cras_iodev *iodev) {
 	return scaler;
 }
 
+int cras_iodev_get_valid_frames(struct cras_iodev *odev,
+				struct timespec *hw_tstamp)
+{
+	int rc;
+
+	if (odev->direction != CRAS_STREAM_OUTPUT)
+		return -EINVAL;
+
+	if (odev->get_valid_frames) {
+		rc = odev->get_valid_frames(odev, hw_tstamp);
+		if (rc < 0)
+			return rc;
+
+		if (rc < odev->min_buffer_level)
+			return 0;
+
+		return rc - odev->min_buffer_level;
+	} else {
+		return cras_iodev_frames_queued(odev, hw_tstamp);
+	}
+}
+
 int cras_iodev_add_stream(struct cras_iodev *iodev,
 			  struct dev_stream *stream)
 {
-	unsigned int cb_threshold = dev_stream_cb_threshold(stream);
+	/*
+	 * For input stream, start stream right after adding stream.
+	 * For output stream, start stream after its first fetch such that it does not
+	 * block other existing streams.
+	 */
 	DL_APPEND(iodev->streams, stream);
-
 	if (!iodev->buf_state)
 		iodev->buf_state = buffer_share_create(iodev->buffer_size);
+	if (stream->stream->direction == CRAS_STREAM_INPUT)
+		cras_iodev_start_stream(iodev, stream);
+	return 0;
+}
+
+void cras_iodev_start_stream(struct cras_iodev *iodev,
+			    struct dev_stream *stream)
+{
+	unsigned int cb_threshold = dev_stream_cb_threshold(stream);
+
+	if (dev_stream_is_running(stream))
+		return;
 	/*
 	 * TRIGGER_ONLY streams do not want to receive data, so do not add them
 	 * to buffer_share, otherwise they'll affect other streams to receive.
@@ -804,10 +795,10 @@ int cras_iodev_add_stream(struct cras_iodev *iodev,
 	if (!(stream->stream->flags & TRIGGER_ONLY))
 		buffer_share_add_id(iodev->buf_state, stream->stream->stream_id,
 				    NULL);
-
 	iodev->min_cb_level = MIN(iodev->min_cb_level, cb_threshold);
 	iodev->max_cb_level = MAX(iodev->max_cb_level, cb_threshold);
-	return 0;
+	iodev->largest_cb_level = MAX(iodev->largest_cb_level, cb_threshold);
+	dev_stream_set_running(stream);
 }
 
 struct dev_stream *cras_iodev_rm_stream(struct cras_iodev *iodev,
@@ -816,6 +807,8 @@ struct dev_stream *cras_iodev_rm_stream(struct cras_iodev *iodev,
 	struct dev_stream *out;
 	struct dev_stream *ret = NULL;
 	unsigned int cb_threshold;
+	struct timespec earliest_next_cb_ts;
+	int set_earliest = 0;
 
 	iodev->min_cb_level = iodev->buffer_size / 2;
 	iodev->max_cb_level = 0;
@@ -827,9 +820,17 @@ struct dev_stream *cras_iodev_rm_stream(struct cras_iodev *iodev,
 			DL_DELETE(iodev->streams, out);
 			continue;
 		}
+		if (!dev_stream_is_running(out))
+			continue;
 		cb_threshold = dev_stream_cb_threshold(out);
 		iodev->min_cb_level = MIN(iodev->min_cb_level, cb_threshold);
 		iodev->max_cb_level = MAX(iodev->max_cb_level, cb_threshold);
+		if (!set_earliest) {
+			set_earliest = 1;
+			earliest_next_cb_ts = out->stream->next_cb_ts;
+		}
+		if (timespec_after(&earliest_next_cb_ts, &out->stream->next_cb_ts))
+			earliest_next_cb_ts = out->stream->next_cb_ts;
 	}
 
 	if (!iodev->streams) {
@@ -843,6 +844,15 @@ struct dev_stream *cras_iodev_rm_stream(struct cras_iodev *iodev,
 		    (iodev->state == CRAS_IODEV_STATE_NORMAL_RUN))
 			cras_iodev_no_stream_playback_transition(iodev, 1);
 	}
+
+	if (!set_earliest)
+		return ret;
+
+	DL_FOREACH(iodev->streams, out) {
+		if (!dev_stream_is_running(out))
+			out->stream->next_cb_ts = earliest_next_cb_ts;
+	}
+
 	return ret;
 }
 
@@ -874,6 +884,10 @@ unsigned int cras_iodev_max_stream_offset(const struct cras_iodev *iodev)
 	struct dev_stream *curr;
 
 	DL_FOREACH(iodev->streams, curr) {
+		/* Skip stream which hasn't started running yet. */
+		if (!dev_stream_is_running(curr))
+			continue;
+
 		max = MAX(max,
 			  buffer_share_id_offset(iodev->buf_state,
 						 curr->stream->stream_id));
@@ -885,10 +899,16 @@ unsigned int cras_iodev_max_stream_offset(const struct cras_iodev *iodev)
 int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 		    const struct cras_audio_format *fmt)
 {
+	struct cras_loopback *loopback;
 	int rc;
 
 	if (iodev->pre_open_iodev_hook)
 		iodev->pre_open_iodev_hook();
+
+	DL_FOREACH(iodev->loopbacks, loopback) {
+		if (loopback->hook_control)
+			loopback->hook_control(true, loopback->cb_data);
+	}
 
 	if (iodev->open_dev) {
 		rc = iodev->open_dev(iodev);
@@ -896,7 +916,7 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 			return rc;
 	}
 
-	if (iodev->ext_format == NULL) {
+	if (iodev->format == NULL) {
 		rc = cras_iodev_set_format(iodev, fmt);
 		if (rc) {
 			iodev->close_dev(iodev);
@@ -915,14 +935,16 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 	 */
 	cb_level = cras_frames_at_rate(fmt->frame_rate,
 				       cb_level,
-				       iodev->ext_format->frame_rate);
+				       iodev->format->frame_rate);
 	/* Make sure the min_cb_level doesn't get too large. */
 	iodev->min_cb_level = MIN(iodev->buffer_size / 2, cb_level);
 	iodev->max_cb_level = 0;
+	iodev->largest_cb_level = 0;
 
 	iodev->reset_request_pending = 0;
 	iodev->state = CRAS_IODEV_STATE_OPEN;
 	iodev->highest_hw_level = 0;
+	iodev->input_dsp_offset = 0;
 
 	if (iodev->direction == CRAS_STREAM_OUTPUT) {
 		/* If device supports start ops, device can be in open state.
@@ -945,9 +967,19 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 		iodev->state = CRAS_IODEV_STATE_NORMAL_RUN;
 		/* Initialize the input_streaming flag to zero.*/
 		iodev->input_streaming = 0;
+
+		/*
+		 * The device specific gain scaler to be used in audio thread.
+		 * It's expected to stick to 1.0f if device has hardware gain
+		 * control. For alsa device, this gain value can be configured
+		 * through UCM labels DefaultNodeGain.
+		 */
+		iodev->software_gain_scaler =
+				cras_iodev_get_software_gain_scaler(iodev);
 	}
 
 	add_ext_dsp_module_to_pipeline(iodev);
+	clock_gettime(CLOCK_MONOTONIC_RAW, &iodev->open_ts);
 
 	return 0;
 }
@@ -959,10 +991,13 @@ enum CRAS_IODEV_STATE cras_iodev_state(const struct cras_iodev *iodev)
 
 int cras_iodev_close(struct cras_iodev *iodev)
 {
+	struct cras_loopback *loopback;
 	int rc;
 
 	if (!cras_iodev_is_open(iodev))
 		return 0;
+
+	cras_server_metrics_device_runtime(iodev);
 
 	if (iodev->input_data) {
 		if (iodev->ext_dsp_module == &iodev->input_data->ext)
@@ -979,6 +1014,12 @@ int cras_iodev_close(struct cras_iodev *iodev)
 
 	if (iodev->post_close_iodev_hook)
 		iodev->post_close_iodev_hook();
+
+	DL_FOREACH(iodev->loopbacks, loopback) {
+		if (loopback->hook_control)
+			loopback->hook_control(false, loopback->cb_data);
+	}
+
 	return 0;
 }
 
@@ -1011,26 +1052,32 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 		.type = CRAS_RAMP_ACTION_NONE,
 		.scaler = 0.0f,
 		.increment = 0.0f,
+		.target = 1.0f,
 	};
 	float software_volume_scaler = 1.0;
 	int software_volume_needed = cras_iodev_software_volume_needed(iodev);
 	int rc;
+	struct cras_loopback *loopback;
 
-	if (iodev->pre_dsp_hook)
-		iodev->pre_dsp_hook(frames, nframes, iodev->ext_format,
-				    iodev->pre_dsp_hook_cb_data);
-
-	if (iodev->ramp) {
-		ramp_action = cras_ramp_get_current_action(iodev->ramp);
+	DL_FOREACH(iodev->loopbacks, loopback) {
+		if (loopback->type == LOOPBACK_POST_MIX_PRE_DSP)
+			loopback->hook_data(frames, nframes, iodev->format,
+					    loopback->cb_data);
 	}
 
 	rc = apply_dsp(iodev, frames, nframes);
 	if (rc)
 		return rc;
 
-	if (iodev->post_dsp_hook)
-		iodev->post_dsp_hook(frames, nframes, fmt,
-				     iodev->post_dsp_hook_cb_data);
+	DL_FOREACH(iodev->loopbacks, loopback) {
+		if (loopback->type == LOOPBACK_POST_DSP)
+			loopback->hook_data(frames, nframes, iodev->format,
+					    loopback->cb_data);
+	}
+
+	if (iodev->ramp) {
+		ramp_action = cras_ramp_get_current_action(iodev->ramp);
+	}
 
 	/* Mute samples if adjusted volume is 0 or system is muted, plus
 	 * that this device is not ramping. */
@@ -1054,16 +1101,18 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 		 * software volume using cras_scale_buffer_increment.*/
 		float starting_scaler = ramp_action.scaler;
 		float increment = ramp_action.increment;
+		float target = ramp_action.target;
 
 		if (software_volume_needed) {
 			starting_scaler *= software_volume_scaler;
 			increment *= software_volume_scaler;
+			target *= software_volume_scaler;
 		}
 
 		cras_scale_buffer_increment(
 				fmt->format, frames, nframes,
 				starting_scaler, increment,
-				fmt->num_channels);
+				target, fmt->num_channels);
 		cras_ramp_update_ramped_frames(iodev->ramp, nframes);
 	} else if (!output_should_mute(iodev) && software_volume_needed) {
 		/* Just scale for software volume using
@@ -1078,7 +1127,8 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 				   iodev->format,
 				   frames,
 				   nframes);
-	rate_estimator_add_frames(iodev->rate_est, nframes);
+	if (iodev->rate_est)
+		rate_estimator_add_frames(iodev->rate_est, nframes);
 
 	// Calculate whether the final output was non-empty, if requested.
 	if (is_non_empty) {
@@ -1165,7 +1215,7 @@ int cras_iodev_update_rate(struct cras_iodev *iodev, unsigned int level,
 	/* If output underruns, reset to avoid incorrect estimated rate. */
 	if ((iodev->direction == CRAS_STREAM_OUTPUT) && !level)
 		rate_estimator_reset_rate(iodev->rate_est,
-					  iodev->ext_format->frame_rate);
+					  iodev->format->frame_rate);
 
 	return rate_estimator_check(iodev->rate_est, level, level_tstamp);
 }
@@ -1173,14 +1223,14 @@ int cras_iodev_update_rate(struct cras_iodev *iodev, unsigned int level,
 int cras_iodev_reset_rate_estimator(const struct cras_iodev *iodev)
 {
 	rate_estimator_reset_rate(iodev->rate_est,
-				  iodev->ext_format->frame_rate);
+				  iodev->format->frame_rate);
 	return 0;
 }
 
 double cras_iodev_get_est_rate_ratio(const struct cras_iodev *iodev)
 {
 	return rate_estimator_get_rate(iodev->rate_est) /
-			iodev->ext_format->frame_rate;
+			iodev->format->frame_rate;
 }
 
 int cras_iodev_get_dsp_delay(const struct cras_iodev *iodev)
@@ -1238,22 +1288,6 @@ int cras_iodev_buffer_avail(struct cras_iodev *iodev, unsigned hw_level)
 	return iodev->buffer_size - iodev->min_buffer_level - hw_level;
 }
 
-void cras_iodev_register_pre_dsp_hook(struct cras_iodev *iodev,
-				      loopback_hook_t loop_cb,
-				      void *cb_data)
-{
-	iodev->pre_dsp_hook = loop_cb;
-	iodev->pre_dsp_hook_cb_data = cb_data;
-}
-
-void cras_iodev_register_post_dsp_hook(struct cras_iodev *iodev,
-				       loopback_hook_t loop_cb,
-				       void *cb_data)
-{
-	iodev->post_dsp_hook = loop_cb;
-	iodev->post_dsp_hook_cb_data = cb_data;
-}
-
 int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 {
 	struct cras_audio_area *area = NULL;
@@ -1266,7 +1300,7 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 
 	ATLOG(atlog, AUDIO_THREAD_FILL_ODEV_ZEROS, odev->info.idx, frames, 0);
 
-	frame_bytes = cras_get_format_bytes(odev->ext_format);
+	frame_bytes = cras_get_format_bytes(odev->format);
 	while (frames > 0) {
 		frames_written = frames;
 		rc = cras_iodev_get_output_buffer(odev, &area, &frames_written);
@@ -1299,8 +1333,8 @@ int cras_iodev_odev_should_wake(const struct cras_iodev *odev)
 	if (odev->direction != CRAS_STREAM_OUTPUT)
 		return 0;
 
-	if (odev->output_should_wake)
-		return odev->output_should_wake(odev);
+	if (odev->is_free_running && odev->is_free_running(odev))
+		return 0;
 
 	/* Do not wake up for device not started yet. */
 	return (odev->state == CRAS_IODEV_STATE_NORMAL_RUN ||
@@ -1313,25 +1347,41 @@ unsigned int cras_iodev_frames_to_play_in_sleep(struct cras_iodev *odev,
 {
 	int rc = cras_iodev_frames_queued(odev, hw_tstamp);
 	unsigned int level = (rc < 0) ? 0 : rc;
+	unsigned int wakeup_frames;
 	*hw_level = level;
 
 	if (odev->streams) {
-		/* Schedule that audio thread will wake up when hw_level drops to
-		 * 1ms. Normally, this isn't hit because the client will wake us
-		 * up before then. This helps with cases where the hardware
-		 * buffer is smaller than the client stream buffer. */
-		unsigned int one_ms_frames = odev->format->frame_rate / 1000;
-		if (level > one_ms_frames)
-			return level - one_ms_frames;
+		/*
+		 * We have two cases in this scope. The first one is if there are frames
+		 * waiting to be played, audio thread will wake up when hw_level drops
+		 * to min_cb_level. This situation only happens when hardware buffer is
+		 * smaller than the client stream buffer. The second one is waking up
+		 * when hw_level drops to dev_normal_run_wake_up_time. It is a default
+		 * behavior. This wake up time is the bottom line to avoid underrun.
+		 * Normally, the audio thread does not wake up at that time because the
+		 * streams should wake it up before then.
+		 */
+		if (*hw_level > odev->min_cb_level && dev_playback_frames(odev))
+			return *hw_level - odev->min_cb_level;
+
+		wakeup_frames = cras_time_to_frames(&dev_normal_run_wake_up_time,
+						    odev->format->frame_rate);
+		if (level > wakeup_frames)
+			return level - wakeup_frames;
 		else
 			return level;
 	}
 
-	/* When this device has no stream, schedule audio thread to wake up
-	 * when hw_level drops to min_cb_level so audio thread can fill
-	 * zeros to it. */
-	if (*hw_level > odev->min_cb_level)
-		return *hw_level - odev->min_cb_level;
+	/*
+	 * When this device has no stream, schedule audio thread to wake up when
+	 * hw_level drops to dev_no_stream_wake_up_time so audio thread can
+	 * fill zeros to it. We also need to consider min_cb_level in order to avoid
+	 * busyloop when device buffer size is smaller than wake up time.
+	 */
+	wakeup_frames = cras_time_to_frames(&dev_no_stream_wake_up_time,
+					    odev->format->frame_rate);
+	if (level > MIN(odev->min_cb_level, wakeup_frames))
+		return level - MIN(odev->min_cb_level, wakeup_frames);
 	else
 		return 0;
 }
@@ -1395,13 +1445,13 @@ int cras_iodev_reset_request(struct cras_iodev* iodev)
 	if (iodev->reset_request_pending)
 		return 0;
 	iodev->reset_request_pending = 1;
-	return cras_device_monitor_reset_device(iodev);
+	return cras_device_monitor_reset_device(iodev->info.idx);
 }
 
 static void ramp_mute_callback(void *data)
 {
 	struct cras_iodev *odev = (struct cras_iodev *)data;
-	cras_device_monitor_set_device_mute_state(odev);
+	cras_device_monitor_set_device_mute_state(odev->info.idx);
 }
 
 /* Used in audio thread. Check the docstrings of CRAS_IODEV_RAMP_REQUEST. */
@@ -1410,8 +1460,8 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 {
 	cras_ramp_cb cb = NULL;
 	void *cb_data = NULL;
-	int rc, up;
-	float duration_secs;
+	int rc;
+	float from, to, duration_secs;
 
 	/* Ignores request if device is closed. */
 	if (!cras_iodev_is_open(odev))
@@ -1419,17 +1469,20 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 
 	switch (request) {
 	case CRAS_IODEV_RAMP_REQUEST_UP_UNMUTE:
-		up = 1;
+		from = 0.0;
+		to = 1.0;
 		duration_secs = RAMP_UNMUTE_DURATION_SECS;
 		break;
 	case CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK:
-		up = 1;
+		from = 0.0;
+		to = 1.0;
 		duration_secs = RAMP_NEW_STREAM_DURATION_SECS;
 		break;
 	/* Unmute -> mute. Callback to set mute state should be called after
 	 * ramping is done. */
 	case CRAS_IODEV_RAMP_REQUEST_DOWN_MUTE:
-		up = 0;
+		from = 1.0;
+		to = 0.0;
 		duration_secs = RAMP_MUTE_DURATION_SECS;
 		cb = ramp_mute_callback;
 		cb_data = (void*)odev;
@@ -1439,8 +1492,8 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 	}
 
 	/* Starts ramping. */
-	rc = cras_ramp_start(
-			odev->ramp, up,
+	rc = cras_mute_ramp_start(
+			odev->ramp, from, to,
 			duration_secs * odev->format->frame_rate,
 			cb, cb_data);
 
@@ -1450,9 +1503,45 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 	/* Mute -> unmute case, unmute state should be set after ramping is
 	 * started so device can start playing with samples close to 0. */
 	if (request == CRAS_IODEV_RAMP_REQUEST_UP_UNMUTE)
-		cras_device_monitor_set_device_mute_state(odev);
+		cras_device_monitor_set_device_mute_state(odev->info.idx);
 
 	return 0;
+}
+
+int cras_iodev_start_volume_ramp(struct cras_iodev *odev,
+				 unsigned int old_volume,
+				 unsigned int new_volume)
+{
+	float old_scaler, new_scaler;
+	float from, to;
+
+	if (old_volume == new_volume)
+		return 0;
+	if (!cras_iodev_is_open(odev))
+		return 0;
+	if (!odev->format)
+		return -EINVAL;
+	if (odev->active_node && odev->active_node->softvol_scalers) {
+		old_scaler = odev->active_node->softvol_scalers[old_volume];
+		new_scaler = odev->active_node->softvol_scalers[new_volume];
+	} else {
+		old_scaler = softvol_get_scaler(old_volume);
+		new_scaler = softvol_get_scaler(new_volume);
+	}
+	if (new_scaler == 0.0) {
+		return -EINVAL;
+	}
+	/* We will soon set odev's volume to new_volume from old_volume.
+	 * Because we're using softvol, we were previously scaling our volume by
+	 * old_scaler. If we want to avoid a jump in volume, we need to start
+	 * our ramp so that (from * new_scaler) = old_scaler. */
+	from = old_scaler / new_scaler;
+	to = 1.0;
+
+	return cras_volume_ramp_start(
+			odev->ramp, from, to,
+			RAMP_VOLUME_CHANGE_DURATION_SECS * odev->format->frame_rate,
+			NULL, NULL);
 }
 
 int cras_iodev_set_mute(struct cras_iodev* iodev)
@@ -1465,19 +1554,8 @@ int cras_iodev_set_mute(struct cras_iodev* iodev)
 	return 0;
 }
 
-int cras_iodev_has_pinned_stream(const struct cras_iodev *dev)
-{
-	const struct dev_stream *out;
-	DL_FOREACH(dev->streams, out) {
-		if (out->stream->is_pinned)
-			return 1;
-	}
-	return 0;
-}
-
 void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
 		unsigned int hw_level)
 {
 	iodev->highest_hw_level = MAX(iodev->highest_hw_level, hw_level);
 }
-

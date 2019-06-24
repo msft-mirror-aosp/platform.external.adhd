@@ -29,7 +29,7 @@ static unsigned int webrtc_apm_process_reverse_stream_f_called;
 static device_enabled_callback_t device_enabled_callback_val;
 static struct ext_dsp_module *ext_dsp_module_value;
 static struct cras_iodev fake_iodev;
-
+static int webrtc_apm_create_called;
 
 TEST(ApmList, ApmListCreate) {
   list = cras_apm_list_create(stream_ptr, 0);
@@ -169,7 +169,31 @@ TEST(ApmList, ApmProcessReverseData) {
   EXPECT_EQ(1, webrtc_apm_process_reverse_stream_f_called);
 
   float_buffer_destroy(&buf);
+  cras_apm_list_destroy(list);
   cras_apm_list_deinit();
+}
+
+TEST(ApmList, StreamAddToAlreadyOpenedDev) {
+  struct cras_audio_format fmt;
+  struct cras_apm *apm1, *apm2;
+
+  fmt.num_channels = 2;
+  fmt.frame_rate = 48000;
+  fmt.format = SND_PCM_FORMAT_S16_LE;
+
+  webrtc_apm_create_called = 0;
+  list = cras_apm_list_create(stream_ptr, APM_ECHO_CANCELLATION);
+  EXPECT_NE((void*)NULL, list);
+
+  apm1 = cras_apm_list_add(list, dev_ptr, &fmt);
+  EXPECT_EQ(1, webrtc_apm_create_called);
+  EXPECT_NE((void*)NULL, apm1);
+
+  apm2 = cras_apm_list_add(list, dev_ptr, &fmt);
+  EXPECT_EQ(1, webrtc_apm_create_called);
+  EXPECT_EQ(apm1, apm2);
+
+  cras_apm_list_destroy(list);
 }
 
 extern "C" {
@@ -229,10 +253,15 @@ void apm_config_dump(struct apm_config *config)
 }
 webrtc_apm webrtc_apm_create(unsigned int num_channels,
 			     unsigned int frame_rate,
-			     struct aec_config *aec_config,
-                             struct apm_config *apm_config)
+			     dictionary *aec_ini,
+                             dictionary *apm_ini)
 {
+  webrtc_apm_create_called++;
   return reinterpret_cast<webrtc_apm>(0x11);
+}
+void webrtc_apm_dump_configs(dictionary *aec_ini,
+			     dictionary *apm_ini)
+{
 }
 void webrtc_apm_destroy(webrtc_apm apm)
 {

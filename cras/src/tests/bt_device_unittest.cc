@@ -7,6 +7,7 @@
 extern "C" {
 #include "cras_bt_io.h"
 #include "cras_bt_device.h"
+#include "cras_bt_log.h"
 #include "cras_iodev.h"
 #include "cras_main_message.h"
 
@@ -54,11 +55,13 @@ class BtDeviceTestSuite : public testing::Test {
       d2_.update_active_node = update_active_node;
       d3_.direction = CRAS_STREAM_INPUT;
       d3_.update_active_node = update_active_node;
+      btlog = cras_bt_event_log_init();
     }
 
     virtual void TearDown() {
       if(cras_main_message_send_msg)
         free(cras_main_message_send_msg);
+      cras_bt_event_log_deinit(btlog);
     }
 
     static void update_active_node(struct cras_iodev *iodev,
@@ -82,7 +85,7 @@ TEST(BtDeviceSuite, CreateBtDevice) {
   device = cras_bt_device_get(FAKE_OBJ_PATH);
   EXPECT_NE((void *)NULL, device);
 
-  cras_bt_device_destroy(device);
+  cras_bt_device_remove(device);
   device = cras_bt_device_get(FAKE_OBJ_PATH);
   EXPECT_EQ((void *)NULL, device);
 }
@@ -123,7 +126,7 @@ TEST_F(BtDeviceTestSuite, AppendRmIodev) {
   EXPECT_EQ(1, cras_bt_io_remove_called);
   EXPECT_EQ(1, cras_bt_io_destroy_called);
   EXPECT_EQ(0, cras_bt_device_get_active_profile(device));
-  cras_bt_device_destroy(device);
+  cras_bt_device_remove(device);
 }
 
 TEST_F(BtDeviceTestSuite, SwitchProfile) {
@@ -157,11 +160,13 @@ TEST_F(BtDeviceTestSuite, SwitchProfile) {
   cras_main_message_add_handler_callback(
       cras_main_message_send_msg,
       cras_main_message_add_handler_callback_data);
-  cras_bt_device_destroy(device);
+  cras_bt_device_remove(device);
 }
 
 /* Stubs */
 extern "C" {
+
+struct cras_bt_event_log *btlog;
 
 /* From bt_io */
 struct cras_iodev *cras_bt_io_create(
@@ -194,10 +199,6 @@ int cras_bt_io_append(struct cras_iodev *bt_iodev,
 }
 int cras_bt_io_on_profile(struct cras_iodev *bt_iodev,
                           enum cras_bt_device_profile profile)
-{
-  return 0;
-}
-int cras_bt_io_update_buffer_size(struct cras_iodev *bt_iodev)
 {
   return 0;
 }
@@ -283,11 +284,11 @@ int cras_iodev_list_dev_is_enabled(const struct cras_iodev *dev)
   return 0;
 }
 
-void cras_iodev_list_disable_dev(struct cras_iodev *dev)
+void cras_iodev_list_suspend_dev(struct cras_iodev *dev)
 {
 }
 
-void cras_iodev_list_enable_dev(struct cras_iodev *dev)
+void cras_iodev_list_resume_dev(struct cras_iodev *dev)
 {
 }
 
