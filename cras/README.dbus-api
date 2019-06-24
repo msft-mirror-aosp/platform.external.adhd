@@ -58,6 +58,10 @@ Methods		void SetOutputVolume(int32 volume)
 				boolean input_mute
 				boolean output_user_mute
 
+		void GetDefaultOutputBufferSize()
+
+			Returns the default output buffer size in frames.
+
 		{dict},{dict},... GetNodes()
 
 			Returns information about nodes. A node can be either
@@ -111,12 +115,21 @@ Methods		void SetOutputVolume(int32 volume)
 				string MicPositions
 					The string formed by floating numbers
 					describing the position of mic array.
+				unit64 NodeVolume
+					The node volume indexed from 0 to 100.
+				unit64 NodeCaptureGain
+					The capture gain of node in dBFS * 100.
 				string HotwordModels
 					A string of comma-separated hotword
 					language model locales supported by this
 					node. e.g. "en_au,en_gb,en_us"
 					The string is empty if the node type is
 					not HOTWORD.
+
+		void GetSystemAecSupported();
+
+			Returns 1 if system echo cancellation is supported,
+			otherwise return 0.
 
 		void SetActiveOutputNode(uint64 node_id);
 
@@ -144,6 +157,13 @@ Methods		void SetOutputVolume(int32 volume)
 		int32 GetNumberOfActiveOutputStreams()
 
 			Returns the number of streams currently using output hardware.
+
+		int32 IsAudioOutputActive()
+
+			Returns 1 if there are currently any active output streams,
+			excluding 'dummy' streams that are not actually outputting any
+			audio. Returns 0 if there are no active streams, or all active
+			streams are 'dummy' streams.
 
 		void SetGlobalOutputChannelRemix(int32 num_channels,
 						 array:double coefficient)
@@ -217,3 +237,12 @@ Signals		OutputVolumeChanged(int32 volume)
 		NumberOfActiveStreamsChanged(int32 num_active_streams)
 
 			Indicates the number of active streams has changed.
+
+		AudioOutputActiveStateChanged(boolean active)
+
+			Indicates active output state has changed.
+			See IsAudioOutputActive for details.
+
+		HotwordTriggered(int64 tv_sec, int64 tv_nsec)
+
+			Indicates that hotword was triggered at the given timestamp.

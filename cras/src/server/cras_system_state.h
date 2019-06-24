@@ -13,6 +13,7 @@
 #ifndef CRAS_SYSTEM_STATE_H_
 #define CRAS_SYSTEM_STATE_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "cras_types.h"
@@ -31,8 +32,18 @@ struct cras_tm;
  *
  * Args:
  *    device_config_dir - Directory for device configs where volume curves live.
+ *    shm_name - Name of the shared memory region used to store the state.
+ *    rw_shm_fd - FD of the shm region.
+ *    ro_shm_fd - FD of the shm region opened RO for sharing with clients.
+ *    exp_state - Shared memory region for storing state.
+ *    exp_state_size - Size of |exp_state|.
  */
-void cras_system_state_init(const char *device_config_dir);
+void cras_system_state_init(const char *device_config_dir,
+                            const char *shm_name,
+                            int rw_shm_fd,
+                            int ro_shm_fd,
+                            struct cras_server_state *exp_state,
+                            size_t exp_state_size);
 void cras_system_state_deinit();
 
 /* Sets the suffix string to control which UCM config fo load. */
@@ -107,6 +118,21 @@ long cras_system_get_min_capture_gain();
 /* Returns the min value allowed for capture gain in dB * 100. */
 long cras_system_get_max_capture_gain();
 
+/* Returns the default value of output buffer size in frames. */
+int cras_system_get_default_output_buffer_size();
+
+/* Returns if system aec is supported. */
+int cras_system_get_aec_supported();
+
+/* Returns the system aec group id is available. */
+int cras_system_get_aec_group_id();
+
+/* Sets the flag to enable or disable bluetooth wideband speech feature. */
+void cras_system_set_bt_wbs_enabled(bool enabled);
+
+/* Gets the elable flag of bluetooth wideband speech feature. */
+bool cras_system_get_bt_wbs_enabled();
+
 /* Adds a card at the given index to the system.  When a new card is found
  * (through a udev event notification) this will add the card to the system,
  * causing its devices to become available for playback/capture.
@@ -175,6 +201,30 @@ int cras_system_add_select_fd(int fd,
  */
 void cras_system_rm_select_fd(int fd);
 
+/*
+ * Register the function to use to add a task for main thread to execute.
+ * Args:
+ *    add_task - The function to call when new task is added.
+ *    task_data - Additional data to pass back to add_task.
+ * Returns:
+ *    0 on success, or -EEXIST if there's already a registered handler.
+ */
+int cras_system_set_add_task_handler(int (*add_task)(void (*cb)(void *data),
+						     void *callback_data,
+						     void *task_data),
+				     void *task_data);
+
+/*
+ * Adds a task callback and data pair, to be executed in the next main thread
+ * loop without additional wait time.
+ * Args:
+ *    callback - The function to execute.
+ *    callback_data - The data to be passed to callback when executed.
+ * Returns:
+ *    0 on success, or -EINVAL if there's no handler for adding task.
+ */
+int cras_system_add_task(void (*callback)(void *data), void *callback_data);
+
 /* Signals that an audio input or output stream has been added to the system.
  * This allows the count of active streams can be used to notice when the audio
  * subsystem is idle.
@@ -238,6 +288,16 @@ int cras_system_state_get_output_nodes(const struct cras_ionode_info **nodes);
  */
 int cras_system_state_get_input_nodes(const struct cras_ionode_info **nodes);
 
+/*
+ * Sets the non-empty audio status.
+ */
+void cras_system_state_set_non_empty_status(int non_empty);
+
+/*
+ * Returns the non-empty audio status.
+ */
+int cras_system_state_get_non_empty_status();
+
 /* Returns a pointer to the current system state that is shared with clients.
  * This also 'locks' the structure by incrementing the update count to an odd
  * value.
@@ -258,5 +318,20 @@ key_t cras_sys_state_shm_fd();
 
 /* Returns the timer manager. */
 struct cras_tm *cras_system_state_get_tm();
+
+/*
+ * Add snapshot to snapshot buffer in system state
+ */
+void cras_system_state_add_snapshot(struct cras_audio_thread_snapshot *);
+
+/*
+ * Dump snapshots from system state to shared memory with client
+ */
+void cras_system_state_dump_snapshots();
+
+/*
+ * Returns true if in the main thread.
+ */
+int cras_system_state_in_main_thread();
 
 #endif /* CRAS_SYSTEM_STATE_H_ */

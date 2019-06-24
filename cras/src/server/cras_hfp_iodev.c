@@ -3,10 +3,14 @@
  * found in the LICENSE file.
  */
 
+#include <stdbool.h>
+#include <sys/param.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <syslog.h>
 
 #include "cras_audio_area.h"
+#include "cras_hfp_ag_profile.h"
 #include "cras_hfp_iodev.h"
 #include "cras_hfp_info.h"
 #include "cras_hfp_slc.h"
@@ -16,22 +20,39 @@
 #include "sfh.h"
 #include "utlist.h"
 
-
+/* Implementation of bluetooth hands-free profile iodev.
+ * Members:
+ *    base - The cras_iodev structure base class.
+ *    device - The assciated bt_device.
+ *    slc - Handle to the HFP service level connection.
+ *    info - hfp_info taking care of SCO data read/write.
+ *    drain_complete - Flag to indicate if valid samples are drained
+ *        in no stream state. Only used for output.
+ *    filled_zeros - Number of zero data in frames have been filled
+ *        to buffer of hfp_info in no stream state. Only used for output
+ */
 struct hfp_io {
 	struct cras_iodev base;
 	struct cras_bt_device *device;
 	struct hfp_slc_handle *slc;
 	struct hfp_info *info;
+	bool drain_complete;
+	unsigned int filled_zeros;
 };
 
 static int update_supported_formats(struct cras_iodev *iodev)
 {
-	// 16 bit, mono, 8kHz
+	struct hfp_io *hfpio = (struct hfp_io *)iodev;
+
+	/* 16 bit, mono, 8kHz for narrowband and 16KHz for wideband */
 	iodev->format->format = SND_PCM_FORMAT_S16_LE;
 
 	free(iodev->supported_rates);
 	iodev->supported_rates = (size_t *)malloc(2 * sizeof(size_t));
-	iodev->supported_rates[0] = 8000;
+
+	iodev->supported_rates[0] =
+		(hfp_slc_get_selected_codec(hfpio->slc) == HFP_CODEC_ID_MSBC)
+			? 16000 : 8000;
 	iodev->supported_rates[1] = 0;
 
 	free(iodev->supported_channel_counts);
@@ -44,6 +65,50 @@ static int update_supported_formats(struct cras_iodev *iodev)
 		(snd_pcm_format_t *)malloc(2 * sizeof(snd_pcm_format_t));
 	iodev->supported_formats[0] = SND_PCM_FORMAT_S16_LE;
 	iodev->supported_formats[1] = 0;
+
+	return 0;
+}
+
+static int no_stream(struct cras_iodev *iodev, int enable)
+{
+	struct hfp_io *hfpio = (struct hfp_io *)iodev;
+	struct timespec hw_tstamp;
+	unsigned int hw_level;
+	unsigned int level_target;
+
+	if (iodev->direction != CRAS_STREAM_OUTPUT)
+		return 0;
+
+	hw_level = iodev->frames_queued(iodev, &hw_tstamp);
+	if (enable) {
+		if (!hfpio->drain_complete &&
+		    (hw_level <= hfpio->filled_zeros))
+			hfpio->drain_complete = 1;
+		hfpio->filled_zeros +=
+			hfp_fill_output_with_zeros(hfpio->info, iodev,
+						   iodev->buffer_size);
+		return 0;
+	}
+
+	/* Leave no stream state.*/
+	level_target = iodev->min_cb_level;
+	if (hfpio->drain_complete) {
+		hfp_force_output_level(hfpio->info, iodev, level_target);
+	} else {
+		unsigned int valid_samples = 0;
+		if (hw_level > hfpio->filled_zeros)
+			valid_samples = hw_level - hfpio->filled_zeros;
+		level_target = MAX(level_target, valid_samples);
+
+		if (level_target > hw_level)
+			hfp_fill_output_with_zeros(hfpio->info, iodev,
+						   level_target - hw_level);
+		else
+			hfp_force_output_level(hfpio->info, iodev,
+					       level_target);
+	}
+	hfpio->drain_complete = 0;
+	hfpio->filled_zeros = 0;
 
 	return 0;
 }
@@ -62,19 +127,7 @@ static int frames_queued(const struct cras_iodev *iodev,
 	return hfp_buf_queued(hfpio->info, iodev);
 }
 
-/* Modify the hfpio's buffer_size when the SCO packet size has changed. */
-static void hfp_packet_size_changed(void *data)
-{
-	struct hfp_io *hfpio = (struct hfp_io *)data;
-	struct cras_iodev *iodev = &hfpio->base;
-
-	if (!cras_iodev_is_open(iodev))
-		return;
-	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev);
-	cras_bt_device_iodev_buffer_size_changed(hfpio->device);
-}
-
-static int open_dev(struct cras_iodev *iodev)
+static int configure_dev(struct cras_iodev *iodev)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 	int sk, err, mtu;
@@ -88,17 +141,22 @@ static int open_dev(struct cras_iodev *iodev)
 	if (hfp_info_running(hfpio->info))
 		goto add_dev;
 
-	sk = cras_bt_device_sco_connect(hfpio->device);
+	sk = cras_bt_device_sco_connect(
+			hfpio->device,
+			hfp_slc_get_selected_codec(hfpio->slc));
 	if (sk < 0)
 		goto error;
 
-	mtu = cras_bt_device_sco_mtu(hfpio->device, sk);
+	mtu = cras_bt_device_sco_packet_size(hfpio->device, sk,
+			hfp_slc_get_selected_codec(hfpio->slc));
 
 	/* Start hfp_info */
 	err = hfp_info_start(sk, mtu, hfpio->info);
 	if (err)
 		goto error;
 
+	hfpio->drain_complete = 0;
+	hfpio->filled_zeros = 0;
 add_dev:
 	hfp_info_add_iodev(hfpio->info, iodev);
 	hfp_set_call_status(hfpio->slc, 1);
@@ -205,6 +263,8 @@ void hfp_free_resources(struct hfp_io *hfpio)
 	}
 	free(hfpio->base.supported_channel_counts);
 	free(hfpio->base.supported_rates);
+	free(hfpio->base.supported_formats);
+	cras_iodev_free_resources(&hfpio->base);
 }
 
 struct cras_iodev *hfp_iodev_create(
@@ -242,12 +302,13 @@ struct cras_iodev *hfp_iodev_create(
 			strlen(cras_bt_device_object_path(device)));
 	iodev->info.stable_id_new = iodev->info.stable_id;
 
-	iodev->open_dev= open_dev;
+	iodev->configure_dev= configure_dev;
 	iodev->frames_queued = frames_queued;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
 	iodev->put_buffer = put_buffer;
 	iodev->flush_buffer = flush_buffer;
+	iodev->no_stream = no_stream;
 	iodev->close_dev = close_dev;
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
@@ -267,9 +328,6 @@ struct cras_iodev *hfp_iodev_create(
 	cras_iodev_set_active_node(iodev, node);
 
 	hfpio->info = info;
-	hfp_register_packet_size_changed_callback(info,
-						  hfp_packet_size_changed,
-						  hfpio);
 
 	return iodev;
 
@@ -286,7 +344,6 @@ void hfp_iodev_destroy(struct cras_iodev *iodev)
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
 	cras_bt_device_rm_iodev(hfpio->device, iodev);
-	hfp_unregister_packet_size_changed_callback(hfpio->info, hfpio);
 	hfp_free_resources(hfpio);
 	free(hfpio);
 }

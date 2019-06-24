@@ -6,11 +6,17 @@
 #include <sys/socket.h>
 #include <syslog.h>
 
+#include "stdbool.h"
+
 #include "cras_bt_device.h"
+#include "cras_bt_log.h"
 #include "cras_telephony.h"
-#include "cras_hfp_ag_profile.h"
 #include "cras_hfp_slc.h"
 #include "cras_system_state.h"
+#include "cras_tm.h"
+
+#define STR(s) #s
+#define VSTR(id) STR(id)
 
 #define SLC_BUF_SIZE_BYTES 256
 
@@ -45,13 +51,17 @@
  *    buf_write_idx - Write index for buf.
  *    rfcomm_fd - File descriptor for the established RFCOMM connection.
  *    init_cb - Callback to be triggered when an SLC is initialized.
- *    initialized - The service level connection is fully initilized of not.
  *    cli_active - Calling line identification notification is enabled or not.
  *    battery - Current battery level of AG stored in SLC.
  *    signal - Current signal strength of AG stored in SLC.
  *    service - Current service availability of AG stored in SLC.
  *    callheld - Current callheld status of AG stored in SLC.
  *    ind_event_report - Activate status of indicator events reporting.
+ *    ag_supported_features - Supported AG features bitmap.
+ *    hf_codec_supported - Flags to indicate if codec is supported in HF.
+ *    hf_supports_codec_negotiation - If the connected HF supports codec
+ *        negotiation.
+ *    selected_codec - The selected codec id to use, default to CVSD.
  *    telephony - A reference of current telephony handle.
  *    device - The associated bt device.
  */
@@ -59,19 +69,22 @@ struct hfp_slc_handle {
 	char buf[SLC_BUF_SIZE_BYTES];
 	int buf_read_idx;
 	int buf_write_idx;
-
 	int is_hsp;
 	int rfcomm_fd;
 	hfp_slc_init_cb init_cb;
 	hfp_slc_disconnect_cb disconnect_cb;
-	int initialized;
 	int cli_active;
 	int battery;
 	int signal;
 	int service;
 	int callheld;
 	int ind_event_report;
+	int ag_supported_features;
+	bool hf_codec_supported[HFP_MAX_CODECS];
+	int hf_supports_codec_negotiation;
+	int selected_codec;
 	struct cras_bt_device *device;
+	struct cras_timer *timer;
 
 	struct cras_telephony_handle *telephony;
 };
@@ -209,6 +222,88 @@ static int dtmf_tone(struct hfp_slc_handle *handle, const char *buf)
 	return hfp_send(handle, "OK");
 }
 
+/* Marks SLC handle as initialized and trigger HFP AG's init_cb. */
+static void initialize_slc_handle(struct cras_timer *timer, void *arg)
+{
+	struct hfp_slc_handle *handle = (struct hfp_slc_handle *)arg;
+	if (timer)
+		handle->timer = NULL;
+	if (handle->init_cb) {
+		handle->init_cb(handle);
+		handle->init_cb = NULL;
+	}
+}
+
+/* Handles the event that headset request to select specific codec. */
+static int bluetooth_codec_selection(struct hfp_slc_handle *handle,
+				     const char *cmd)
+{
+	char *tokens = strdup(cmd);
+	char *codec;
+
+	strtok(tokens, "=");
+	codec = strtok(NULL, ",");
+
+	if (codec) {
+		BTLOG(btlog, BT_CODEC_SELECTION, 1, atoi(codec));
+		handle->selected_codec = atoi(codec);
+	}
+
+	initialize_slc_handle(NULL, (void *)handle);
+
+	free(tokens);
+	return 0;
+}
+
+/*
+ * Possibly choose mSBC code from the supported codecs. Otherwise just
+ * initialize the SLC so the default CVSD codec is used.
+ */
+static void choose_codec_and_init_slc(struct hfp_slc_handle *handle)
+{
+
+	if (handle->hf_supports_codec_negotiation &&
+	    handle->hf_codec_supported[HFP_CODEC_ID_MSBC]) {
+		hfp_send(handle, "+BCS:" VSTR(HFP_CODEC_ID_MSBC));
+		BTLOG(btlog, BT_CODEC_SELECTION, 0, HFP_CODEC_ID_MSBC);
+
+		/* Delay init to give headset some time to confirm
+		 * codec selection. */
+		handle->timer = cras_tm_create_timer(
+				cras_system_state_get_tm(),
+				150,
+				initialize_slc_handle,
+				handle);
+	} else {
+		initialize_slc_handle(NULL, (void *)handle);
+	}
+}
+
+/* Handles the event when headset reports its available codecs list. */
+static int available_codecs(struct hfp_slc_handle *handle, const char *cmd)
+{
+	char *tokens, *id_str;
+	int id;
+
+	for (id = 0; id < HFP_MAX_CODECS; id++)
+		handle->hf_codec_supported[id] = false;
+
+	tokens = strdup(cmd);
+	strtok(tokens, "=");
+	id_str = strtok(NULL, ",");
+	while (id_str) {
+		id = atoi(id_str);
+		if ((id > HFP_CODEC_UNUSED) && (id < HFP_MAX_CODECS)) {
+			handle->hf_codec_supported[id] = true;
+			BTLOG(btlog, BT_AVAILABLE_CODECS, 0, id);
+		}
+		id_str = strtok(NULL, ",");
+	}
+
+	free(tokens);
+	return hfp_send(handle, "OK");
+}
+
 /* AT+CMER command enables the registration status update function in AG.
  * The service level connection is consider initialized when successfully
  * responded OK to the AT+CMER command. Mandatory support per spec 4.4.
@@ -238,7 +333,7 @@ static int event_reporting(struct hfp_slc_handle *handle, const char *cmd)
 	if (!mode || !tmp) {
 		syslog(LOG_ERR, "Invalid event reporting” cmd %s", cmd);
 		err = -EINVAL;
-		goto event_reporting_err;
+		goto event_reporting_done;
 	}
 	if (atoi(mode) == FORWARD_UNSOLICIT_RESULT_CODE)
 		handle->ind_event_report = atoi(tmp);
@@ -246,19 +341,19 @@ static int event_reporting(struct hfp_slc_handle *handle, const char *cmd)
 	err = hfp_send(handle, "OK");
 	if (err) {
 		syslog(LOG_ERR, "Error sending response for command %s", cmd);
-		goto event_reporting_err;
+		goto event_reporting_done;
 	}
 
-	/* Consider the Service Level Connection to be fully initialized,
+	/*
+	 * Consider the Service Level Connection to be fully initialized,
 	 * and thereby established, after successfully responded with OK.
+	 * However we should postpone the initialize call after codec selection,
+	 * otherwise iodev could be open immediately while the headset is still
+	 * communicating about which of CVSD or mSBC codec to use.
 	 */
-	if (!handle->initialized) {
-		handle->initialized = 1;
-		if (handle->init_cb)
-			handle->init_cb(handle);
-	}
+	choose_codec_and_init_slc(handle);
 
-event_reporting_err:
+event_reporting_done:
 	free(tokens);
 	return err;
 }
@@ -446,16 +541,32 @@ static int subscriber_number(struct hfp_slc_handle *handle, const char *buf)
  */
 static int supported_features(struct hfp_slc_handle *handle, const char *cmd)
 {
-	int err;
+	int err, hf_features;
 	char response[128];
+	char *tokens, *features;
+
 	if (strlen(cmd) < 9)
 		return -EINVAL;
+
+	handle->hf_supports_codec_negotiation = 0;
+
+	tokens = strdup(cmd);
+	strtok(tokens, "=");
+	features = strtok(NULL, ",");
+
+	hf_features = atoi(features);
+	BTLOG(btlog, BT_HFP_SUPPORTED_FEATURES, 0, hf_features);
+	if (hf_features & HF_CODEC_NEGOTIATION)
+		handle->hf_supports_codec_negotiation = 1;
+	free(tokens);
 
 	/* AT+BRSF=<feature> command received, ignore the HF supported feature
 	 * for now. Respond with +BRSF:<feature> to notify mandatory supported
 	 * features in AG(audio gateway).
 	 */
-	snprintf(response, 128, "+BRSF: %u", HFP_SUPPORTED_FEATURE);
+	BTLOG(btlog, BT_HFP_SUPPORTED_FEATURES, 1,
+	      handle->ag_supported_features);
+	snprintf(response, 128, "+BRSF: %u", handle->ag_supported_features);
 	err = hfp_send(handle, response);
 	if (err < 0)
 		return err;
@@ -526,6 +637,8 @@ static int terminate_call(struct hfp_slc_handle *handle, const char *cmd)
 static struct at_command at_commands[] = {
 	{ "ATA", answer_call },
 	{ "ATD", dial_number },
+	{ "AT+BAC", available_codecs },
+	{ "AT+BCS", bluetooth_codec_selection },
 	{ "AT+BIA", indicator_activation },
 	{ "AT+BLDN", last_dialed_number },
 	{ "AT+BRSF", supported_features },
@@ -552,7 +665,7 @@ static int handle_at_command(struct hfp_slc_handle *slc_handle,
 		if (!strncmp(cmd, atc->cmd, strlen(atc->cmd)))
 			return atc->callback(slc_handle, cmd);
 
-	syslog(LOG_ERR, "AT command %s not supported", cmd);
+	syslog(LOG_DEBUG, "AT command %s not supported", cmd);
 	return hfp_send(slc_handle, "ERROR");
 }
 
@@ -616,6 +729,7 @@ static void slc_watch_callback(void *arg)
 
 struct hfp_slc_handle *hfp_slc_create(int fd,
 				      int is_hsp,
+				      int ag_supported_features,
 				      struct cras_bt_device *device,
 				      hfp_slc_init_cb init_cb,
 				      hfp_slc_disconnect_cb disconnect_cb)
@@ -628,6 +742,7 @@ struct hfp_slc_handle *hfp_slc_create(int fd,
 
 	handle->rfcomm_fd = fd;
 	handle->is_hsp = is_hsp;
+	handle->ag_supported_features = ag_supported_features;
 	handle->device = device;
 	handle->init_cb = init_cb;
 	handle->disconnect_cb = disconnect_cb;
@@ -637,6 +752,7 @@ struct hfp_slc_handle *hfp_slc_create(int fd,
 	handle->service = 1;
 	handle->ind_event_report = 0;
 	handle->telephony = cras_telephony_get();
+	handle->selected_codec = HFP_CODEC_ID_CVSD;
 
 	cras_system_add_select_fd(handle->rfcomm_fd,
 				  slc_watch_callback, handle);
@@ -647,8 +763,16 @@ struct hfp_slc_handle *hfp_slc_create(int fd,
 void hfp_slc_destroy(struct hfp_slc_handle *slc_handle)
 {
 	cras_system_rm_select_fd(slc_handle->rfcomm_fd);
+	if (slc_handle->timer)
+		cras_tm_cancel_timer(cras_system_state_get_tm(),
+				     slc_handle->timer);
 	close(slc_handle->rfcomm_fd);
 	free(slc_handle);
+}
+
+int hfp_slc_get_selected_codec(struct hfp_slc_handle *handle)
+{
+	return handle->selected_codec;
 }
 
 int hfp_set_call_status(struct hfp_slc_handle *handle, int call)
@@ -727,3 +851,9 @@ int hfp_event_set_service(struct hfp_slc_handle *handle, int avail)
 	handle->service = !!avail;
 	return hfp_send_ind_event_report(handle, SERVICE_IND_INDEX, avail);
 }
+
+int hfp_slc_get_hf_codec_negotiation_supported(struct hfp_slc_handle *handle)
+{
+	return handle->hf_supports_codec_negotiation;
+}
+

@@ -24,8 +24,11 @@ struct hfp_packet_size_changed_callback {
  */
 struct hfp_info;
 
-/* Creates an hfp_info instance. */
-struct hfp_info *hfp_info_create();
+/* Creates an hfp_info instance.
+ * Args:
+ *    codec - 1 for CVSD, 2 for mSBC per HFP 1.7 specification.
+ */
+struct hfp_info *hfp_info_create(int codec);
 
 /* Destroys given hfp_info instance. */
 void hfp_info_destroy(struct hfp_info *info);
@@ -34,12 +37,12 @@ void hfp_info_destroy(struct hfp_info *info);
 int hfp_info_running(struct hfp_info *info);
 
 /* Starts the hfp_info to transmit and reveice samples to and from the file
- * descriptor of a SCO socket.
+ * descriptor of a SCO socket. This should be called from main thread.
  */
 int hfp_info_start(int fd, unsigned int mtu, struct hfp_info *info);
 
 /* Stops given hfp_info. This implies sample transmission will
- * stop and socket be closed.
+ * stop and socket be closed. This should be called from main thread.
  */
 int hfp_info_stop(struct hfp_info *info);
 
@@ -51,6 +54,30 @@ int hfp_info_stop(struct hfp_info *info);
  */
 int hfp_buf_queued(struct hfp_info *info, const struct cras_iodev *dev);
 
+/* Fill output buffer with zero frames.
+ * Args:
+ *    info - The hfp_info holding the output buffer.
+ *    dev - The associated output device.
+ *    nframes - How many zero frames to fill.
+ * Returns:
+ *    The actual number of zero frames filled.
+ */
+int hfp_fill_output_with_zeros(struct hfp_info *info,
+			       struct cras_iodev *dev,
+			       unsigned int nframes);
+
+/* Force output buffer level to given value. Calling this may override
+ * existing data so use it only when buffer has been filled by zeros.
+ * Args:
+ *    info - The hfp_info holding output buffer.
+ *    dev - The associated output device.
+ *    level - Value of the target output level.
+ * Returns:
+ *    0 for success, otherwise failure.
+ */
+int hfp_force_output_level(struct hfp_info *info,
+			   struct cras_iodev *dev,
+			   unsigned int level);
 
 /* Gets how many bytes of the buffer are used.
  * Args:
@@ -95,23 +122,5 @@ int hfp_info_rm_iodev(struct hfp_info *info, struct cras_iodev *dev);
 
 /* Checks if there's any iodev added to the given hfp_info. */
 int hfp_info_has_iodev(struct hfp_info *info);
-
-/* Registers a callback function for the SCO packet size changed event.
- * Args:
- *    info - The hfp_info to register callback to.
- *    cb - The callback function to call.
- *    data - The data which will be passed to callback function.
- */
-void hfp_register_packet_size_changed_callback(struct hfp_info *info,
-					       void (*cb)(void *data),
-					       void *data);
-
-/* Unregisters a callback function for the SCO packet size changed event.
- * Args:
- *    info - The hfp_info to unregister callback from.
- *    data - The data used as key to unregister callback.
- */
-void hfp_unregister_packet_size_changed_callback(struct hfp_info *info,
-						 void *data);
 
 #endif /* CRAS_HFP_INFO_H_ */
