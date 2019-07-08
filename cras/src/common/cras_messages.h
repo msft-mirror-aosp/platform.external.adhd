@@ -16,7 +16,7 @@
 
 /* Rev when message format changes. If new messages are added, or message ID
  * values change. */
-#define CRAS_PROTO_VER 2
+#define CRAS_PROTO_VER 3
 #define CRAS_SERV_MAX_MSG_SIZE 256
 #define CRAS_CLIENT_MAX_MSG_SIZE 256
 #define CRAS_HOTWORD_NAME_MAX_SIZE 8
@@ -110,25 +110,6 @@ struct __attribute__ ((__packed__)) cras_connect_message {
 	struct cras_audio_format_packed format; /* rate, channel, sample size */
 	uint32_t dev_idx; /* device to attach stream, 0 if none */
 	uint64_t effects; /* Bit map of requested effects. */
-};
-
-/*
- * Old version of connect message without 'effects' member defined.
- * Used to check against when receiving invalid size of connect message.
- * Expected to have proto_version set to 1.
- * TODO(hychao): remove when all clients migrate to latest libcras.
- */
-struct __attribute__ ((__packed__)) cras_connect_message_old {
-	struct cras_server_message header;
-	uint32_t proto_version;
-	enum CRAS_STREAM_DIRECTION direction; /* input/output/loopback */
-	cras_stream_id_t stream_id; /* unique id for this stream */
-	enum CRAS_STREAM_TYPE stream_type; /* media, or call, etc. */
-	uint32_t buffer_frames; /* Buffer size in frames. */
-	uint32_t cb_threshold; /* callback client when this much is left */
-	uint32_t flags;
-	struct cras_audio_format_packed format; /* rate, channel, sample size */
-	uint32_t dev_idx; /* device to attach stream, 0 if none */
 };
 
 static inline void cras_fill_connect_message(struct cras_connect_message *m,
@@ -559,55 +540,32 @@ static inline void cras_fill_client_connected(
 /*
  * Reply from server that a stream has been successfully added.
  * Two file descriptors are added, input shm followed by out shm.
+ *
+ * samples_shm_size is shm_max_size for old clients.
+ * TODO(fletcherw) remove comment once all clients are on CRAS_PROTO_VER >= 3.
  */
 struct __attribute__ ((__packed__)) cras_client_stream_connected {
 	struct cras_client_message header;
 	int32_t err;
 	cras_stream_id_t stream_id;
 	struct cras_audio_format_packed format;
-	uint32_t shm_max_size;
+	uint32_t samples_shm_size;
 	uint64_t effects;
 };
-/*
- * Old version of stream connected message without effects defined.
- * TODO(hychao): remove when all clients migrate to latest libcras.
- */
-struct __attribute__ ((__packed__)) cras_client_stream_connected_old {
-	struct cras_client_message header;
-	int32_t err;
-	cras_stream_id_t stream_id;
-	struct cras_audio_format_packed format;
-	uint32_t shm_max_size;
-};
-static inline void cras_fill_client_stream_connected(
-		struct cras_client_stream_connected *m,
-		int err,
-		cras_stream_id_t stream_id,
-		struct cras_audio_format *format,
-		size_t shm_max_size,
-		uint64_t effects)
+
+static inline void
+cras_fill_client_stream_connected(struct cras_client_stream_connected *m,
+				  int err, cras_stream_id_t stream_id,
+				  struct cras_audio_format *format,
+				  size_t samples_shm_size, uint64_t effects)
 {
 	m->err = err;
 	m->stream_id = stream_id;
 	pack_cras_audio_format(&m->format, format);
-	m->shm_max_size = shm_max_size;
+	m->samples_shm_size = samples_shm_size;
 	m->effects = effects;
 	m->header.id = CRAS_CLIENT_STREAM_CONNECTED;
 	m->header.length = sizeof(struct cras_client_stream_connected);
-}
-static inline void cras_fill_client_stream_connected_old(
-		struct cras_client_stream_connected_old *m,
-		int err,
-		cras_stream_id_t stream_id,
-		struct cras_audio_format *format,
-		size_t shm_max_size)
-{
-	m->err = err;
-	m->stream_id = stream_id;
-	pack_cras_audio_format(&m->format, format);
-	m->shm_max_size = shm_max_size;
-	m->header.id = CRAS_CLIENT_STREAM_CONNECTED;
-	m->header.length = sizeof(struct cras_client_stream_connected_old);
 }
 
 /* Sent from server to client when audio debug information is requested. */
