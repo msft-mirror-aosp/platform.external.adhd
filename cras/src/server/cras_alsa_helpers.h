@@ -16,7 +16,6 @@
 
 struct cras_audio_format;
 
-
 /* Sets the channel layout from given format to the pcm handle.
  * Args:
  *    handle - Pointer to the opened pcm to set channel map to.
@@ -24,8 +23,7 @@ struct cras_audio_format;
  * Returns:
  *    0 if a matched channel map is set to HW, -1 otherwise.
  */
-int cras_alsa_set_channel_map(snd_pcm_t *handle,
-			      struct cras_audio_format *fmt);
+int cras_alsa_set_channel_map(snd_pcm_t *handle, struct cras_audio_format *fmt);
 
 /*  Gets the supported channel mapping of the pcm handle which matches
  *  the channel layout in the format.
@@ -35,8 +33,7 @@ int cras_alsa_set_channel_map(snd_pcm_t *handle,
  *  Returns:
  *     0 if an exactly matched channel map is found, -1 otherwise.
  */
-int cras_alsa_get_channel_map(snd_pcm_t *handle,
-			      struct cras_audio_format *fmt);
+int cras_alsa_get_channel_map(snd_pcm_t *handle, struct cras_audio_format *fmt);
 
 /* Opens an alsa device, thin wrapper to snd_pcm_open.
  * Args:
@@ -105,8 +102,7 @@ int cras_alsa_resume_appl_ptr(snd_pcm_t *handle, snd_pcm_uframes_t ahead);
 
 /* Probes properties of the alsa device.
  * Args:
- *    dev - Path to the alsa device to test.
- *    stream - Alsa stream type, input or output.
+ *    handle - The open PCM to configure.
  *    rates - Pointer that will be set to the arrary of valid samples rates.
  *            Must be freed by the caller.
  *    channel_counts - Pointer that will be set to the array of valid channel
@@ -116,8 +112,8 @@ int cras_alsa_resume_appl_ptr(snd_pcm_t *handle, snd_pcm_uframes_t ahead);
  * Returns:
  *   0 on success.  On failure an error code from alsa or -ENOMEM.
  */
-int cras_alsa_fill_properties(const char *dev, snd_pcm_stream_t stream,
-			      size_t **rates, size_t **channel_counts,
+int cras_alsa_fill_properties(snd_pcm_t *handle, size_t **rates,
+			      size_t **channel_counts,
 			      snd_pcm_format_t **formats);
 
 /* Sets up the hwparams to alsa.
@@ -162,18 +158,14 @@ int cras_alsa_set_swparams(snd_pcm_t *handle, int *enable_htimestamp);
  *    tstamp[out] - Filled with the hardware timestamp for the available frames.
  *                  This value is {0, 0} when the device hasn't actually started
  *                  reading or writing frames.
- *    underruns[in,out] - Pointer to the underrun counter updated if there was
- *                        an underrun.
  * Returns:
  *    0 on success, negative error on failure. -EPIPE if severe underrun
  *    happens.
  */
 int cras_alsa_get_avail_frames(snd_pcm_t *handle, snd_pcm_uframes_t buf_size,
 			       snd_pcm_uframes_t severe_underrun_frames,
-			       const char *dev_name,
-			       snd_pcm_uframes_t *avail,
-			       struct timespec *tstamp,
-			       unsigned int *underruns);
+			       const char *dev_name, snd_pcm_uframes_t *avail,
+			       struct timespec *tstamp);
 
 /* Get the current alsa delay, make sure it's no bigger than the buffer size.
  * Args:
@@ -191,12 +183,10 @@ int cras_alsa_get_delay_frames(snd_pcm_t *handle, snd_pcm_uframes_t buf_size,
  * Args:
  *    handle - The open PCM to configure.
  *    dst - Pointer set to the area for reading/writing the audio.
- *    underruns - counter to increment if an under-run occurs.
  * Returns:
  *    zero on success, negative error code for fatal errors.
  */
-int cras_alsa_mmap_get_whole_buffer(snd_pcm_t *handle, uint8_t **dst,
-				    unsigned int *underrun);
+int cras_alsa_mmap_get_whole_buffer(snd_pcm_t *handle, uint8_t **dst);
 
 /* Wrapper for snd_pcm_mmap_begin
  * Args:
@@ -206,27 +196,25 @@ int cras_alsa_mmap_get_whole_buffer(snd_pcm_t *handle, uint8_t **dst,
  *    offset - Filled with the offset to pass back to commit.
  *    frames - Passed with the max number of frames to request. Filled with the
  *        max number to use.
- *    underruns - counter to increment if an under-run occurs.
  * Returns:
  *    zero on success, negative error code for fatal
  *    errors.
  */
 int cras_alsa_mmap_begin(snd_pcm_t *handle, unsigned int format_bytes,
 			 uint8_t **dst, snd_pcm_uframes_t *offset,
-			 snd_pcm_uframes_t *frames, unsigned int *underruns);
+			 snd_pcm_uframes_t *frames);
 
 /* Wrapper for snd_pcm_mmap_commit
  * Args:
  *    handle - The open PCM to configure.
  *    offset - offset from call to mmap_begin.
  *    frames - # of frames written/read.
- *    underruns - counter to increment if an under-run occurs.
  * Returns:
  *    zero on success, negative error code for fatal
  *    errors.
  */
 int cras_alsa_mmap_commit(snd_pcm_t *handle, snd_pcm_uframes_t offset,
-			  snd_pcm_uframes_t frames, unsigned int *underruns);
+			  snd_pcm_uframes_t frames);
 
 /* When the stream is suspended, due to a system suspend, loop until we can
  * resume it. Won't actually loop very much because the system will be

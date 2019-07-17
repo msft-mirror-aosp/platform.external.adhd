@@ -26,6 +26,7 @@ enum CRAS_SPECIAL_DEVICE {
 	NO_DEVICE,
 	SILENT_RECORD_DEVICE,
 	SILENT_PLAYBACK_DEVICE,
+	SILENT_HOTWORD_DEVICE,
 	MAX_SPECIAL_DEVICE_IDX
 };
 
@@ -66,11 +67,17 @@ enum CRAS_STREAM_DIRECTION {
  *      device is ready. Input streams only.
  *  HOTWORD_STREAM - This stream is used only to listen for hotwords such as "OK
  *      Google".  Hardware will wake the device when this phrase is heard.
+ *  TRIGGER_ONLY - This stream only wants to receive when the data is available
+ *      and does not want to receive data. Used with HOTWORD_STREAM.
+ *  SERVER_ONLY - This stream doesn't associate to a client. It's used mainly
+ *      for audio data to flow from hardware through iodev's dsp pipeline.
  */
 enum CRAS_INPUT_STREAM_FLAG {
 	BULK_AUDIO_OK = 0x01,
 	USE_DEV_TIMING = 0x02,
 	HOTWORD_STREAM = BULK_AUDIO_OK | USE_DEV_TIMING,
+	TRIGGER_ONLY = 0x04,
+	SERVER_ONLY = 0x08,
 };
 
 /*
@@ -109,6 +116,7 @@ enum CRAS_STREAM_TYPE {
 	CRAS_STREAM_TYPE_VOICE_COMMUNICATION,
 	CRAS_STREAM_TYPE_SPEECH_RECOGNITION,
 	CRAS_STREAM_TYPE_PRO_AUDIO,
+	CRAS_STREAM_TYPE_ACCESSIBILITY,
 	CRAS_STREAM_NUM_TYPES,
 };
 
@@ -123,10 +131,19 @@ static inline const char *cras_stream_type_str(
 	ENUM_STR(CRAS_STREAM_TYPE_VOICE_COMMUNICATION)
 	ENUM_STR(CRAS_STREAM_TYPE_SPEECH_RECOGNITION)
 	ENUM_STR(CRAS_STREAM_TYPE_PRO_AUDIO)
+	ENUM_STR(CRAS_STREAM_TYPE_ACCESSIBILITY)
 	default:
 		return "INVALID_STREAM_TYPE";
 	}
 }
+
+/* Effects that can be enabled for a CRAS stream. */
+enum CRAS_STREAM_EFFECT {
+	APM_ECHO_CANCELLATION = (1 << 0),
+	APM_NOISE_SUPRESSION = (1 << 1),
+	APM_GAIN_CONTROL = (1 << 2),
+	APM_VOICE_DETECTION = (1 << 3),
+};
 
 /* Information about a client attached to the server. */
 struct __attribute__ ((__packed__)) cras_attached_client_info {
@@ -160,10 +177,12 @@ static inline uint32_t node_index_of(cras_node_id_t id)
 #define CRAS_MAX_IODEVS 20
 #define CRAS_MAX_IONODES 20
 #define CRAS_MAX_ATTACHED_CLIENTS 20
-#define CRAS_HOTWORD_STRING_SIZE 256
+#define CRAS_MAX_AUDIO_THREAD_SNAPSHOTS 10
+#define CRAS_MAX_HOTWORD_MODEL_NAME_SIZE 8
 #define MAX_DEBUG_DEVS 4
 #define MAX_DEBUG_STREAMS 8
 #define AUDIO_THREAD_EVENT_LOG_SIZE (1024*6)
+#define CRAS_BT_EVENT_LOG_SIZE 1024
 
 /* There are 8 bits of space for events. */
 enum AUDIO_THREAD_LOG_EVENTS {
@@ -190,6 +209,8 @@ enum AUDIO_THREAD_LOG_EVENTS {
 	AUDIO_THREAD_CAPTURE_POST,
 	AUDIO_THREAD_CAPTURE_WRITE,
 	AUDIO_THREAD_CONV_COPY,
+	AUDIO_THREAD_STREAM_FETCH_PENDING,
+	AUDIO_THREAD_STREAM_RESCHEDULE,
 	AUDIO_THREAD_STREAM_SLEEP_TIME,
 	AUDIO_THREAD_STREAM_SLEEP_ADJUST,
 	AUDIO_THREAD_STREAM_SKIP_CB,
@@ -204,7 +225,34 @@ enum AUDIO_THREAD_LOG_EVENTS {
 	AUDIO_THREAD_ODEV_LEAVE_NO_STREAMS,
 	AUDIO_THREAD_ODEV_DEFAULT_NO_STREAMS,
 	AUDIO_THREAD_FILL_ODEV_ZEROS,
+	AUDIO_THREAD_UNDERRUN,
 	AUDIO_THREAD_SEVERE_UNDERRUN,
+};
+
+/* There are 8 bits of space for events. */
+enum CRAS_BT_LOG_EVENTS {
+	BT_ADAPTER_ADDED,
+	BT_ADAPTER_REMOVED,
+	BT_AUDIO_GATEWAY_INIT,
+	BT_AUDIO_GATEWAY_START,
+	BT_AVAILABLE_CODECS,
+	BT_A2DP_CONFIGURED,
+	BT_A2DP_START,
+	BT_A2DP_SUSPENDED,
+	BT_CODEC_SELECTION,
+	BT_DEV_CONNECTED_CHANGE,
+	BT_DEV_CONN_WATCH_CB,
+	BT_DEV_SUSPEND_CB,
+	BT_HFP_NEW_CONNECTION,
+	BT_HFP_REQUEST_DISCONNECT,
+	BT_HFP_SUPPORTED_FEATURES,
+	BT_HSP_NEW_CONNECTION,
+	BT_HSP_REQUEST_DISCONNECT,
+	BT_NEW_AUDIO_PROFILE_AFTER_CONNECT,
+	BT_RESET,
+	BT_SCO_CONNECT,
+	BT_TRANSPORT_ACQUIRE,
+	BT_TRANSPORT_RELEASE,
 };
 
 struct __attribute__ ((__packed__)) audio_thread_event {
@@ -234,6 +282,10 @@ struct __attribute__ ((__packed__)) audio_dev_debug_info {
 	uint8_t direction;
 	uint32_t num_underruns;
 	uint32_t num_severe_underruns;
+	uint32_t highest_hw_level;
+	uint32_t runtime_sec;
+	uint32_t runtime_nsec;
+	double software_gain_scaler;
 };
 
 struct __attribute__ ((__packed__)) audio_stream_debug_info {
@@ -243,12 +295,19 @@ struct __attribute__ ((__packed__)) audio_stream_debug_info {
 	uint32_t stream_type;
 	uint32_t buffer_frames;
 	uint32_t cb_threshold;
+	uint64_t effects;
 	uint32_t flags;
 	uint32_t frame_rate;
 	uint32_t num_channels;
 	uint32_t longest_fetch_sec;
 	uint32_t longest_fetch_nsec;
+	uint32_t num_missed_cb;
 	uint32_t num_overruns;
+	uint32_t is_pinned;
+	uint32_t pinned_dev_idx;
+	uint32_t runtime_sec;
+	uint32_t runtime_nsec;
+	double stream_volume;
 	int8_t channel_layout[CRAS_CH_MAX];
 };
 
@@ -261,6 +320,52 @@ struct __attribute__ ((__packed__)) audio_debug_info {
 	struct audio_thread_event_log log;
 };
 
+struct __attribute__ ((__packed__)) cras_bt_event {
+	uint32_t tag_sec;
+	uint32_t nsec;
+	uint32_t data1;
+	uint32_t data2;
+};
+
+struct __attribute__ ((__packed__)) cras_bt_event_log {
+	uint32_t write_pos;
+	uint32_t len;
+	struct cras_bt_event log[CRAS_BT_EVENT_LOG_SIZE];
+};
+
+struct __attribute__ ((__packed__)) cras_bt_debug_info {
+	struct cras_bt_event_log bt_log;
+};
+
+/*
+ * All event enums should be less then AUDIO_THREAD_EVENT_TYPE_COUNT,
+ * or they will be ignored by the handler.
+ */
+enum CRAS_AUDIO_THREAD_EVENT_TYPE {
+	AUDIO_THREAD_EVENT_BUSYLOOP,
+	AUDIO_THREAD_EVENT_DEBUG,
+	AUDIO_THREAD_EVENT_SEVERE_UNDERRUN,
+	AUDIO_THREAD_EVENT_UNDERRUN,
+	AUDIO_THREAD_EVENT_TYPE_COUNT,
+};
+
+/*
+ * Structure of snapshot for audio thread.
+ */
+struct __attribute__ ((__packed__)) cras_audio_thread_snapshot {
+	struct timespec timestamp;
+	enum CRAS_AUDIO_THREAD_EVENT_TYPE event_type;
+	struct audio_debug_info audio_debug_info;
+};
+
+/*
+ * Ring buffer for storing snapshots.
+ */
+struct __attribute__ ((__packed__)) cras_audio_thread_snapshot_buffer{
+	struct cras_audio_thread_snapshot snapshots[
+			CRAS_MAX_AUDIO_THREAD_SNAPSHOTS];
+	int pos;
+};
 
 /* The server state that is shared with clients.
  *    state_version - Version of this structure.
@@ -302,6 +407,15 @@ struct __attribute__ ((__packed__)) audio_debug_info {
  *    audio_debug_info - Debug data filled in when a client requests it. This
  *        isn't protected against concurrent updating, only one client should
  *        use it.
+ *    default_output_buffer_size - Default output buffer size in frames.
+ *    non_empty_status - Whether any non-empty audio is being
+ *        played/captured.
+ *    aec_supported - Flag to indicate if system aec is supported.
+ *    aec_group_id  - Group ID for the system aec to use for separating aec
+ *        tunings.
+ *    snapshot_buffer - ring buffer for storing audio thread snapshots.
+ *    bt_debug_info - ring buffer for storing bluetooth event logs.
+ *    bt_wbs_enabled - Whether or not bluetooth wideband speech is enabled.
  */
 #define CRAS_SERVER_STATE_VERSION 2
 struct __attribute__ ((packed, aligned(4))) cras_server_state {
@@ -334,6 +448,13 @@ struct __attribute__ ((packed, aligned(4))) cras_server_state {
 	uint32_t num_active_streams[CRAS_NUM_DIRECTIONS];
 	struct cras_timespec last_active_stream_time;
 	struct audio_debug_info audio_debug_info;
+	int32_t default_output_buffer_size;
+	int32_t non_empty_status;
+	int32_t aec_supported;
+  	int32_t aec_group_id;
+	struct cras_audio_thread_snapshot_buffer snapshot_buffer;
+	struct cras_bt_debug_info bt_debug_info;
+	int32_t bt_wbs_enabled;
 };
 
 /* Actions for card add/remove/change. */

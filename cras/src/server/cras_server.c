@@ -34,14 +34,18 @@
 #include "cras_telephony.h"
 #endif
 #include "cras_alert.h"
+#include "cras_audio_thread_monitor.h"
 #include "cras_config.h"
 #include "cras_device_monitor.h"
+#include "cras_hotword_handler.h"
 #include "cras_iodev_list.h"
 #include "cras_main_message.h"
 #include "cras_messages.h"
 #include "cras_metrics.h"
+#include "cras_non_empty_audio_handler.h"
 #include "cras_observer.h"
 #include "cras_rclient.h"
+#include "cras_control_rclient.h"
 #include "cras_server.h"
 #include "cras_server_metrics.h"
 #include "cras_system_state.h"
@@ -88,11 +92,19 @@ struct client_callback {
 	struct client_callback *prev, *next;
 };
 
+/* Stores callback function and argument data to be executed later. */
+struct system_task {
+	void (*callback)(void *);
+	void *callback_data;
+	struct system_task *next, *prev;
+};
+
 /* Local server data. */
 struct server_data {
 	struct attached_client *clients_head;
 	size_t num_clients;
 	struct client_callback *client_callbacks;
+	struct system_task *system_tasks;
 	size_t num_client_callbacks;
 	size_t next_client_id;
 } server_instance;
@@ -114,18 +126,15 @@ static void remove_client(struct attached_client *client)
 static void handle_message_from_client(struct attached_client *client)
 {
 	uint8_t buf[CRAS_SERV_MAX_MSG_SIZE];
-	struct cras_server_message *msg;
 	int nread;
 	int fd;
 	unsigned int num_fds = 1;
 
-	msg = (struct cras_server_message *)buf;
 	nread = cras_recv_with_fds(client->fd, buf, sizeof(buf), &fd, &num_fds);
-	if (nread < sizeof(msg->length))
+	if (nread < 0)
 		goto read_error;
-	if (msg->length != nread)
+	if (cras_rclient_buffer_from_client(client->client, buf, nread, fd) < 0)
 		goto read_error;
-	cras_rclient_message_from_client(client->client, msg, fd);
 	return;
 
 read_error:
@@ -148,8 +157,8 @@ static void fill_client_info(struct attached_client *client)
 {
 	socklen_t ucred_length = sizeof(client->ucred);
 
-	if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED,
-		       &client->ucred, &ucred_length))
+	if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED, &client->ucred,
+		       &ucred_length))
 		syslog(LOG_INFO, "Failed to get client socket info\n");
 }
 
@@ -170,7 +179,7 @@ static void send_client_list_to_clients(struct server_data *serv)
 
 	info = state->client_info;
 	i = 0;
-	DL_FOREACH(serv->clients_head, c) {
+	DL_FOREACH (serv->clients_head, c) {
 		info->id = c->id;
 		info->pid = c->ucred.pid;
 		info->uid = c->ucred.uid;
@@ -198,8 +207,7 @@ static void handle_new_connection(struct sockaddr_un *address, int fd)
 	}
 
 	memset(&address_length, 0, sizeof(address_length));
-	connection_fd = accept(fd, (struct sockaddr *) address,
-			       &address_length);
+	connection_fd = accept(fd, (struct sockaddr *)address, &address_length);
 	if (connection_fd < 0) {
 		syslog(LOG_ERR, "connecting");
 		free(poll_client);
@@ -224,8 +232,8 @@ static void handle_new_connection(struct sockaddr_un *address, int fd)
 	poll_client->next = NULL;
 	poll_client->pollfd = NULL;
 	fill_client_info(poll_client);
-	poll_client->client = cras_rclient_create(connection_fd,
-						  poll_client->id);
+	poll_client->client =
+		cras_control_rclient_create(connection_fd, poll_client->id);
 	if (poll_client->client == NULL) {
 		syslog(LOG_ERR, "failed to create client");
 		close(connection_fd);
@@ -243,8 +251,8 @@ static void handle_new_connection(struct sockaddr_un *address, int fd)
 /* Add a file descriptor to be passed to select in the main loop. This is
  * registered with system state so that it is called when any client asks to
  * have a callback triggered based on an fd being readable. */
-static int add_select_fd(int fd, void (*cb)(void *data),
-			 void *callback_data, void *server_data)
+static int add_select_fd(int fd, void (*cb)(void *data), void *callback_data,
+			 void *server_data)
 {
 	struct client_callback *new_cb;
 	struct client_callback *client_cb;
@@ -255,11 +263,11 @@ static int add_select_fd(int fd, void (*cb)(void *data),
 		return -EINVAL;
 
 	/* Check if fd already exists. */
-	DL_FOREACH(serv->client_callbacks, client_cb)
+	DL_FOREACH (serv->client_callbacks, client_cb)
 		if (client_cb->select_fd == fd && !client_cb->deleted)
 			return -EEXIST;
 
-	new_cb = (struct  client_callback *)calloc(1, sizeof(*new_cb));
+	new_cb = (struct client_callback *)calloc(1, sizeof(*new_cb));
 	if (new_cb == NULL)
 		return -ENOMEM;
 
@@ -286,9 +294,33 @@ static void rm_select_fd(int fd, void *server_data)
 	if (serv == NULL)
 		return;
 
-	DL_FOREACH(serv->client_callbacks, client_cb)
+	DL_FOREACH (serv->client_callbacks, client_cb)
 		if (client_cb->select_fd == fd)
 			client_cb->deleted = 1;
+}
+
+/* Creates a new task entry and append to system_tasks list, which will be
+ * executed in main loop later without wait time.
+ */
+static int add_task(void (*cb)(void *data), void *callback_data,
+		    void *server_data)
+{
+	struct server_data *serv;
+	struct system_task *new_task;
+
+	serv = (struct server_data *)server_data;
+	if (serv == NULL)
+		return -EINVAL;
+
+	new_task = (struct system_task *)calloc(1, sizeof(*new_task));
+	if (new_task == NULL)
+		return -ENOMEM;
+
+	new_task->callback = cb;
+	new_task->callback_data = callback_data;
+
+	DL_APPEND(serv->system_tasks, new_task);
+	return 0;
 }
 
 /* Cleans up the file descriptor list removing items deleted during the main
@@ -302,7 +334,7 @@ static void cleanup_select_fds(void *server_data)
 	if (serv == NULL)
 		return;
 
-	DL_FOREACH(serv->client_callbacks, client_cb)
+	DL_FOREACH (serv->client_callbacks, client_cb)
 		if (client_cb->deleted) {
 			DL_DELETE(serv->client_callbacks, client_cb);
 			server_instance.num_client_callbacks--;
@@ -321,8 +353,9 @@ void check_output_exists(struct cras_timer *t, void *data)
 #if defined(__amd64__)
 /* CPU detection - probaby best to move this elsewhere */
 static void cpuid(unsigned int *eax, unsigned int *ebx, unsigned int *ecx,
-	          unsigned int *edx, unsigned int op)
+		  unsigned int *edx, unsigned int op)
 {
+	// clang-format off
 	__asm__ __volatile__ (
 		"cpuid"
 		: "=a" (*eax),
@@ -330,7 +363,8 @@ static void cpuid(unsigned int *eax, unsigned int *ebx, unsigned int *ecx,
 		  "=c" (*ecx),
 		  "=d" (*edx)
 		: "a" (op), "c" (0)
-    );
+	);
+	// clang-format on
 }
 
 static unsigned int cpu_x86_flags(void)
@@ -381,6 +415,8 @@ int cras_server_init()
 	/* Log to syslog. */
 	openlog("cras_server", LOG_PID, LOG_USER);
 
+	server_instance.next_client_id = RESERVED_CLIENT_IDS;
+
 	/* Initialize global observer. */
 	cras_observer_server_init();
 
@@ -392,9 +428,81 @@ int cras_server_init()
 	 * from the list that are passed to select in the main loop below. */
 	cras_system_set_select_handler(add_select_fd, rm_select_fd,
 				       &server_instance);
+	cras_system_set_add_task_handler(add_task, &server_instance);
 	cras_main_message_init();
 
 	return 0;
+}
+
+/*
+ * Creates a server socket with a given socket_file name and listens on it.
+ * The socket_file will be created under cras_config_get_system_socket_file_dir
+ * with permission=0770. The socket_fd will be listened with parameter
+ * backlog=5.
+ *
+ * Returns the socket_fd and leaves the address information in addr.
+ * When error occurs, the created fd will be closed and the file path will be
+ * unlinked.
+ */
+static int create_and_listen_server_socket(const char *socket_file,
+					   struct sockaddr_un *addr)
+{
+	int socket_fd = -1;
+	int rc = 0;
+	const char *sockdir;
+
+	socket_fd = socket(PF_UNIX, SOCK_SEQPACKET, 0);
+	if (socket_fd < 0) {
+		syslog(LOG_ERR, "Main server socket failed.");
+		rc = socket_fd;
+		goto error;
+	}
+
+	sockdir = cras_config_get_system_socket_file_dir();
+	if (sockdir == NULL) {
+		rc = -ENOTDIR;
+		goto error;
+	}
+
+	memset(addr, 0, sizeof(*addr));
+	addr->sun_family = AF_UNIX;
+	snprintf(addr->sun_path, sizeof(addr->sun_path), "%s/%s", sockdir,
+		 socket_file);
+	unlink(addr->sun_path);
+
+	/* Linux quirk: calling fchmod before bind, sets the permissions of the
+	 * file created by bind, leaving no window for it to be modified. Start
+	 * with very restricted permissions. */
+	rc = fchmod(socket_fd, 0700);
+	if (rc < 0)
+		goto error;
+
+	rc = bind(socket_fd, (struct sockaddr *)addr,
+		  sizeof(struct sockaddr_un));
+	if (rc < 0) {
+		syslog(LOG_ERR, "Bind to server socket failed.");
+		rc = errno;
+		goto error;
+	}
+
+	/* Let other members in our group play audio through this socket. */
+	rc = chmod(addr->sun_path, 0770);
+	if (rc < 0)
+		goto error;
+
+	if (listen(socket_fd, 5) != 0) {
+		syslog(LOG_ERR, "Listen on server socket failed.");
+		rc = errno;
+		goto error;
+	}
+
+	return socket_fd;
+error:
+	if (socket_fd >= 0) {
+		close(socket_fd);
+		unlink(addr->sun_path);
+	}
+	return rc;
 }
 
 int cras_server_run(unsigned int profile_disable_mask)
@@ -403,14 +511,15 @@ int cras_server_run(unsigned int profile_disable_mask)
 #ifdef CRAS_DBUS
 	DBusConnection *dbus_conn;
 #endif
-	int socket_fd = -1;
+	int control_fd = -1;
 	int rc = 0;
-	const char *sockdir;
-	struct sockaddr_un addr;
+	struct sockaddr_un control_addr;
 	struct attached_client *elm;
 	struct client_callback *client_cb;
+	struct system_task *tasks;
+	struct system_task *system_task;
 	struct cras_tm *tm;
-	struct timespec ts;
+	struct timespec ts, *poll_timeout;
 	int timers_active;
 	struct pollfd *pollfds;
 	unsigned int pollfds_size = 32;
@@ -426,6 +535,12 @@ int cras_server_run(unsigned int profile_disable_mask)
 	cras_server_metrics_init();
 
 	cras_device_monitor_init();
+
+	cras_hotword_handler_init();
+
+	cras_non_empty_audio_handler_init();
+
+	cras_audio_thread_monitor_init();
 
 #ifdef CRAS_DBUS
 	dbus_threads_init_default();
@@ -444,49 +559,10 @@ int cras_server_run(unsigned int profile_disable_mask)
 	}
 #endif
 
-	socket_fd = socket(PF_UNIX, SOCK_SEQPACKET, 0);
-	if (socket_fd < 0) {
-		syslog(LOG_ERR, "Main server socket failed.");
-		rc = socket_fd;
+	control_fd = create_and_listen_server_socket(CRAS_SOCKET_FILE,
+						     &control_addr);
+	if (control_fd < 0)
 		goto bail;
-	}
-
-	sockdir = cras_config_get_system_socket_file_dir();
-	if (sockdir == NULL) {
-		rc = -ENOTDIR;
-		goto bail;
-	}
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	snprintf(addr.sun_path, sizeof(addr.sun_path),
-		 "%s/%s", sockdir, CRAS_SOCKET_FILE);
-	unlink(addr.sun_path);
-
-	/* Linux quirk: calling fchmod before bind, sets the permissions of the
-	 * file created by bind, leaving no window for it to be modified. Start
-	 * with very restricted permissions. */
-	rc = fchmod(socket_fd, 0700);
-	if (rc < 0)
-		goto bail;
-
-	if (bind(socket_fd, (struct sockaddr *) &addr,
-		 sizeof(struct sockaddr_un)) != 0) {
-		syslog(LOG_ERR, "Bind to server socket failed.");
-		rc = errno;
-		goto bail;
-	}
-
-	/* Let other members in our group play audio through this socket. */
-	rc = chmod(addr.sun_path, 0770);
-	if (rc < 0)
-		goto bail;
-
-	if (listen(socket_fd, 5) != 0) {
-		syslog(LOG_ERR, "Listen on server socket failed.");
-		rc = errno;
-		goto bail;
-	}
 
 	tm = cras_system_state_get_tm();
 	if (!tm) {
@@ -501,24 +577,24 @@ int cras_server_run(unsigned int profile_disable_mask)
 	/* Main server loop - client callbacks are run from this context. */
 	while (1) {
 		poll_size_needed = 1 + server_instance.num_clients +
-					server_instance.num_client_callbacks;
+				   server_instance.num_client_callbacks;
 		if (poll_size_needed > pollfds_size) {
 			pollfds_size = 2 * poll_size_needed;
 			pollfds = realloc(pollfds,
-					sizeof(*pollfds) * pollfds_size);
+					  sizeof(*pollfds) * pollfds_size);
 		}
 
-		pollfds[0].fd = socket_fd;
+		pollfds[0].fd = control_fd;
 		pollfds[0].events = POLLIN;
 		num_pollfds = 1;
 
-		DL_FOREACH(server_instance.clients_head, elm) {
+		DL_FOREACH (server_instance.clients_head, elm) {
 			pollfds[num_pollfds].fd = elm->fd;
 			pollfds[num_pollfds].events = POLLIN;
 			elm->pollfd = &pollfds[num_pollfds];
 			num_pollfds++;
 		}
-		DL_FOREACH(server_instance.client_callbacks, client_cb) {
+		DL_FOREACH (server_instance.client_callbacks, client_cb) {
 			if (client_cb->deleted)
 				continue;
 			pollfds[num_pollfds].fd = client_cb->select_fd;
@@ -527,26 +603,41 @@ int cras_server_run(unsigned int profile_disable_mask)
 			num_pollfds++;
 		}
 
+		tasks = server_instance.system_tasks;
+		server_instance.system_tasks = NULL;
+		DL_FOREACH (tasks, system_task) {
+			system_task->callback(system_task->callback_data);
+			DL_DELETE(tasks, system_task);
+			free(system_task);
+		}
+
 		timers_active = cras_tm_get_next_timeout(tm, &ts);
 
-		rc = ppoll(pollfds, num_pollfds,
-			   timers_active ? &ts : NULL, NULL);
-		if  (rc < 0)
+		/*
+		 * If new client task has been scheduled, no need to wait
+		 * for timeout, just do another loop to execute them.
+		 */
+		if (server_instance.system_tasks)
+			poll_timeout = NULL;
+		else
+			poll_timeout = timers_active ? &ts : NULL;
+
+		rc = ppoll(pollfds, num_pollfds, poll_timeout, NULL);
+		if (rc < 0)
 			continue;
 
 		cras_tm_call_callbacks(tm);
 
 		/* Check for new connections. */
 		if (pollfds[0].revents & POLLIN)
-			handle_new_connection(&addr, socket_fd);
+			handle_new_connection(&control_addr, control_fd);
 		/* Check if there are messages pending for any clients. */
-		DL_FOREACH(server_instance.clients_head, elm)
+		DL_FOREACH (server_instance.clients_head, elm)
 			if (elm->pollfd && elm->pollfd->revents & POLLIN)
 				handle_message_from_client(elm);
 		/* Check any client-registered fd/callback pairs. */
-		DL_FOREACH(server_instance.client_callbacks, client_cb)
-			if (!client_cb->deleted &&
-			    client_cb->pollfd &&
+		DL_FOREACH (server_instance.client_callbacks, client_cb)
+			if (!client_cb->deleted && client_cb->pollfd &&
 			    (client_cb->pollfd->revents & POLLIN))
 				client_cb->callback(client_cb->callback_data);
 
@@ -561,9 +652,9 @@ int cras_server_run(unsigned int profile_disable_mask)
 	}
 
 bail:
-	if (socket_fd >= 0) {
-		close(socket_fd);
-		unlink(addr.sun_path);
+	if (control_fd >= 0) {
+		close(control_fd);
+		unlink(control_addr.sun_path);
 	}
 	free(pollfds);
 	cras_observer_server_free();
@@ -574,6 +665,6 @@ void cras_server_send_to_all_clients(const struct cras_client_message *msg)
 {
 	struct attached_client *client;
 
-	DL_FOREACH(server_instance.clients_head, client)
+	DL_FOREACH (server_instance.clients_head, client)
 		cras_rclient_send_message(client->client, msg, NULL, 0);
 }

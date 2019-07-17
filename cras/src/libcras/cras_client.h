@@ -59,6 +59,7 @@ extern "C" {
 #include "cras_util.h"
 
 struct cras_client;
+struct cras_hotword_handle;
 struct cras_stream_params;
 
 /* Callback for audio received or transmitted.
@@ -75,8 +76,7 @@ struct cras_stream_params;
  *    stream is reached.
  */
 typedef int (*cras_playback_cb_t)(struct cras_client *client,
-				  cras_stream_id_t stream_id,
-				  uint8_t *samples,
+				  cras_stream_id_t stream_id, uint8_t *samples,
 				  size_t frames,
 				  const struct timespec *sample_time,
 				  void *user_arg);
@@ -99,8 +99,7 @@ typedef int (*cras_playback_cb_t)(struct cras_client *client,
 typedef int (*cras_unified_cb_t)(struct cras_client *client,
 				 cras_stream_id_t stream_id,
 				 uint8_t *captured_samples,
-				 uint8_t *playback_samples,
-				 unsigned int frames,
+				 uint8_t *playback_samples, unsigned int frames,
 				 const struct timespec *captured_time,
 				 const struct timespec *playback_time,
 				 void *user_arg);
@@ -113,8 +112,7 @@ typedef int (*cras_unified_cb_t)(struct cras_client *client,
  *    user_arg - The argument defined in cras_client_*_params_create().
  */
 typedef int (*cras_error_cb_t)(struct cras_client *client,
-			       cras_stream_id_t stream_id,
-			       int error,
+			       cras_stream_id_t stream_id, int error,
 			       void *user_arg);
 
 /* Callback for handling server error. DEPRECATED
@@ -138,20 +136,20 @@ typedef void (*cras_server_error_cb_t)(struct cras_client *client,
 /* Server connection status. */
 typedef enum cras_connection_status {
 	CRAS_CONN_STATUS_FAILED,
-		/* Resource allocation problem. Free resources, and retry the
-		 * connection with cras_client_connect_async(), or (blocking)
-		 * cras_client_connect(). Do not call cras_client_connect(),
-		 * cras_client_connect_timeout(), or cras_client_destroy()
-		 * from the callback. */
+	/* Resource allocation problem. Free resources, and retry the
+	 * connection with cras_client_connect_async(), or (blocking)
+	 * cras_client_connect(). Do not call cras_client_connect(),
+	 * cras_client_connect_timeout(), or cras_client_destroy()
+	 * from the callback. */
 	CRAS_CONN_STATUS_DISCONNECTED,
-		/* The control thread is attempting to reconnect to the
-		 * server in the background. Any attempt to access the
-		 * server will fail or block (see
-		 * cras_client_set_server_message_blocking(). */
+	/* The control thread is attempting to reconnect to the
+	 * server in the background. Any attempt to access the
+	 * server will fail or block (see
+	 * cras_client_set_server_message_blocking(). */
 	CRAS_CONN_STATUS_CONNECTED,
-		/* Connection is established. All state change callbacks
-		 * have been re-registered, but audio streams must be
-		 * restarted, and node state data must be updated. */
+	/* Connection is established. All state change callbacks
+	 * have been re-registered, but audio streams must be
+	 * restarted, and node state data must be updated. */
 } cras_connection_status_t;
 
 /* Callback for handling server connection status.
@@ -176,6 +174,16 @@ typedef void (*cras_thread_priority_cb_t)(struct cras_client *client);
 /* Callback for handling get hotword models reply. */
 typedef void (*get_hotword_models_cb_t)(struct cras_client *client,
 					const char *hotword_models);
+
+/* Callback to wait for a hotword trigger. */
+typedef void (*cras_hotword_trigger_cb_t)(struct cras_client *client,
+					  struct cras_hotword_handle *handle,
+					  void *user_data);
+
+/* Callback for handling hotword errors. */
+typedef int (*cras_hotword_error_cb_t)(struct cras_client *client,
+				       struct cras_hotword_handle *handle,
+				       int error, void *user_data);
 
 /*
  * Client handling.
@@ -292,9 +300,8 @@ void cras_client_set_server_error_cb(struct cras_client *client,
  *    user_arg - Pointer that will be passed to the callback.
  */
 void cras_client_set_connection_status_cb(
-		struct cras_client *client,
-		cras_connection_status_cb_t connection_cb,
-		void *user_arg);
+	struct cras_client *client, cras_connection_status_cb_t connection_cb,
+	void *user_arg);
 
 /* Sets callback for setting thread priority.
  * Args:
@@ -385,10 +392,9 @@ int cras_client_get_attached_clients(const struct cras_client *client,
  * Returns:
  *    0 if successful, negative on error; -ENOENT if the node cannot be found.
  */
-int cras_client_get_node_by_id(const struct cras_client *client,
-			       int input,
+int cras_client_get_node_by_id(const struct cras_client *client, int input,
 			       const cras_node_id_t node_id,
-			       struct cras_ionode_info* node_info);
+			       struct cras_ionode_info *node_info);
 
 /* Checks if the output device with the given name is currently plugged in.
  *
@@ -422,8 +428,7 @@ int cras_client_output_dev_plugged(const struct cras_client *client,
  *    Returns 0 for success, negative on error (from errno.h).
  */
 int cras_client_set_node_attr(struct cras_client *client,
-			      cras_node_id_t node_id,
-			      enum ionode_attr attr,
+			      cras_node_id_t node_id, enum ionode_attr attr,
 			      int value);
 
 /* Select the preferred node for playback/capture.
@@ -462,7 +467,6 @@ int cras_client_rm_active_node(struct cras_client *client,
 			       enum CRAS_STREAM_DIRECTION direction,
 			       cras_node_id_t node_id);
 
-
 /* Asks the server to reload dsp plugin configuration from the ini file.
  *
  * Args:
@@ -489,8 +493,29 @@ int cras_client_dump_dsp_info(struct cras_client *client);
  * Returns:
  *    0 on success, -EINVAL if the client isn't valid or isn't running.
  */
-int cras_client_update_audio_debug_info(
-	struct cras_client *client, void (*cb)(struct cras_client *));
+int cras_client_update_audio_debug_info(struct cras_client *client,
+					void (*cb)(struct cras_client *));
+
+/* Asks the server to dump bluetooth debug information.
+ * Args:
+ *    client - The client from cras_client_create.
+ *    cb - Function to call when debug info is ready.
+ * Returns:
+ *    0 on sucess, -EINVAL if the client isn't valid or isn't running.
+ */
+int cras_client_update_bt_debug_info(struct cras_client *client,
+				     void (*cb)(struct cras_client *));
+
+/* Asks the server to dump current audio thread snapshots.
+ *
+ * Args:
+ *    client - The client from cras_client_create.
+ *    cb - A function to call when the data is received.
+ * Returns:
+ *    0 on success, -EINVAL if the client isn't valid or isn't running.
+ */
+int cras_client_update_audio_thread_snapshots(struct cras_client *client,
+					      void (*cb)(struct cras_client *));
 
 /*
  * Stream handling.
@@ -514,18 +539,27 @@ int cras_client_update_audio_debug_info(
  *        number of channels, and sample rate.
  */
 struct cras_stream_params *cras_client_stream_params_create(
-		enum CRAS_STREAM_DIRECTION direction,
-		size_t buffer_frames,
-		size_t cb_threshold,
-		size_t unused,
-		enum CRAS_STREAM_TYPE stream_type,
-		uint32_t flags,
-		void *user_data,
-		cras_playback_cb_t aud_cb,
-		cras_error_cb_t err_cb,
-		struct cras_audio_format *format);
+	enum CRAS_STREAM_DIRECTION direction, size_t buffer_frames,
+	size_t cb_threshold, size_t unused, enum CRAS_STREAM_TYPE stream_type,
+	uint32_t flags, void *user_data, cras_playback_cb_t aud_cb,
+	cras_error_cb_t err_cb, struct cras_audio_format *format);
 
-/* Setup stream configuration parameters.
+/* Functions to enable or disable specific effect on given stream parameter.
+ * Args:
+ *    params - Stream configuration parameters.
+ */
+void cras_client_stream_params_enable_aec(struct cras_stream_params *params);
+void cras_client_stream_params_disable_aec(struct cras_stream_params *params);
+void cras_client_stream_params_enable_ns(struct cras_stream_params *params);
+void cras_client_stream_params_disable_ns(struct cras_stream_params *params);
+void cras_client_stream_params_enable_agc(struct cras_stream_params *params);
+void cras_client_stream_params_disable_agc(struct cras_stream_params *params);
+void cras_client_stream_params_enable_vad(struct cras_stream_params *params);
+void cras_client_stream_params_disable_vad(struct cras_stream_params *params);
+
+/* Setup stream configuration parameters. DEPRECATED.
+ * TODO(crbug.com/972928): remove this
+ * Use cras_client_stream_params_create instead.
  * Args:
  *    direction - playback(CRAS_STREAM_OUTPUT) or capture(CRAS_STREAM_INPUT) or
  *        loopback(CRAS_STREAM_POST_MIX_PRE_DSP).
@@ -533,20 +567,19 @@ struct cras_stream_params *cras_client_stream_params_create(
  *    stream_type - media or talk (currently only support "default").
  *    flags - None currently used.
  *    user_data - Pointer that will be passed to the callback.
- *    unified_cb - Called for streams that do simultaneous input/output.
+ *    unified_cb - Called to request audio data or to notify the client when
+ *                 captured audio is available. Though this is a unified_cb,
+ *                 only one direction will be used for a stream, depending
+ *                 on the 'direction' parameter.
  *    err_cb - Called when there is an error with the stream.
  *    format - The format of the audio stream.  Specifies bits per sample,
  *        number of channels, and sample rate.
  */
 struct cras_stream_params *cras_client_unified_params_create(
-		enum CRAS_STREAM_DIRECTION direction,
-		unsigned int block_size,
-		enum CRAS_STREAM_TYPE stream_type,
-		uint32_t flags,
-		void *user_data,
-		cras_unified_cb_t unified_cb,
-		cras_error_cb_t err_cb,
-		struct cras_audio_format *format);
+	enum CRAS_STREAM_DIRECTION direction, unsigned int block_size,
+	enum CRAS_STREAM_TYPE stream_type, uint32_t flags, void *user_data,
+	cras_unified_cb_t unified_cb, cras_error_cb_t err_cb,
+	struct cras_audio_format *format);
 
 /* Destroy stream params created with cras_client_stream_params_create. */
 void cras_client_stream_params_destroy(struct cras_stream_params *params);
@@ -584,8 +617,7 @@ int cras_client_add_stream(struct cras_client *client,
  * Returns:
  *    0 on success, negative error code on failure (from errno.h).
  */
-int cras_client_add_pinned_stream(struct cras_client *client,
-				  uint32_t dev_idx,
+int cras_client_add_pinned_stream(struct cras_client *client, uint32_t dev_idx,
 				  cras_stream_id_t *stream_id_out,
 				  struct cras_stream_params *config);
 
@@ -818,8 +850,35 @@ long cras_client_get_system_max_capture_gain(const struct cras_client *client);
  *    A pointer to the debug info.  This info is only updated when requested by
  *    calling cras_client_update_audio_debug_info.
  */
-const struct audio_debug_info *cras_client_get_audio_debug_info(
-		const struct cras_client *client);
+const struct audio_debug_info *
+cras_client_get_audio_debug_info(const struct cras_client *client);
+
+/* Gets bluetooth debug info.
+ *
+ * Requires that the connection to the server has been established.
+ *
+ * Args:
+ *    client - The client from cras_client_create.
+ * Returns:
+ *    A pointer to the debug info. This info is updated and requested by
+ *    calling cras_client_update_bt_debug_info.
+ */
+const struct cras_bt_debug_info *
+cras_client_get_bt_debug_info(const struct cras_client *client);
+
+/* Gets audio thread snapshot buffer.
+ *
+ * Requires that the connection to the server has been established.
+ * Access to the resulting pointer is not thread-safe.
+ *
+ * Args:
+ *    client - The client from cras_client_create.
+ * Returns:
+ *    A pointer to the snapshot buffer.  This info is only updated when
+ *    requested by calling cras_client_update_audio_thread_snapshots.
+ */
+const struct cras_audio_thread_snapshot_buffer *
+cras_client_get_audio_thread_snapshot_buffer(const struct cras_client *client);
 
 /* Gets the number of streams currently attached to the server.
  *
@@ -838,7 +897,6 @@ const struct audio_debug_info *cras_client_get_audio_debug_info(
  */
 unsigned cras_client_get_num_active_streams(const struct cras_client *client,
 					    struct timespec *ts);
-
 
 /*
  * Utility functions.
@@ -886,8 +944,7 @@ int cras_client_calc_capture_latency(const struct timespec *sample_time,
  *    volume - New value for node volume.
  */
 int cras_client_set_node_volume(struct cras_client *client,
-				cras_node_id_t node_id,
-				uint8_t volume);
+				cras_node_id_t node_id, uint8_t volume);
 
 /* Swap the left and right channel of the given node.
  *
@@ -897,7 +954,7 @@ int cras_client_set_node_volume(struct cras_client *client,
  *    enable - 1 to enable swap mode, 0 to disable.
  */
 int cras_client_swap_node_left_right(struct cras_client *client,
-					cras_node_id_t node_id, int enable);
+				     cras_node_id_t node_id, int enable);
 
 /* Set the capture gain of the given input node.  Only for input nodes.
  *
@@ -907,8 +964,7 @@ int cras_client_swap_node_left_right(struct cras_client *client,
  *    gain - New capture gain for the node.
  */
 int cras_client_set_node_capture_gain(struct cras_client *client,
-				      cras_node_id_t node_id,
-				      long gain);
+				      cras_node_id_t node_id, long gain);
 
 /* Add a test iodev to the iodev list.
  *
@@ -931,8 +987,26 @@ int cras_client_add_test_iodev(struct cras_client *client,
 int cras_client_test_iodev_command(struct cras_client *client,
 				   unsigned int iodev_idx,
 				   enum CRAS_TEST_IODEV_CMD command,
-				   unsigned int data_len,
-				   const uint8_t *data);
+				   unsigned int data_len, const uint8_t *data);
+
+/* Finds the first node of the given type.
+ *
+ * This is used for finding a special hotword node.
+ *
+ * Requires that the connection to the server has been established.
+ *
+ * Args:
+ *    client - The client from cras_client_create.
+ *    type - The type of device to find.
+ *    direction - Search input or output devices.
+ *    node_id - The found node on success.
+ * Returns:
+ *    0 on success, a negative error on failure.
+ */
+int cras_client_get_first_node_type_idx(const struct cras_client *client,
+					enum CRAS_NODE_TYPE type,
+					enum CRAS_STREAM_DIRECTION direction,
+					cras_node_id_t *node_id);
 
 /* Finds the first device that contains a node of the given type.
  *
@@ -970,8 +1044,7 @@ int cras_client_set_suspend(struct cras_client *client, int suspend);
  *        multiplying this matrix.
  */
 int cras_client_config_global_remix(struct cras_client *client,
-				    unsigned num_channels,
-				    float *coefficient);
+				    unsigned num_channels, float *coefficient);
 
 /* Gets the set of supported hotword language models on a node. The supported
  * models may differ on different nodes.
@@ -984,8 +1057,8 @@ int cras_client_config_global_remix(struct cras_client *client,
  *    0 on success.
  */
 int cras_client_get_hotword_models(struct cras_client *client,
-				     cras_node_id_t node_id,
-				     get_hotword_models_cb_t cb);
+				   cras_node_id_t node_id,
+				   get_hotword_models_cb_t cb);
 
 /* Sets the hotword language model on a node. If there are existing streams on
  * the hotword input node when this function is called, they need to be closed
@@ -1003,13 +1076,71 @@ int cras_client_set_hotword_model(struct cras_client *client,
 				  cras_node_id_t node_id,
 				  const char *model_name);
 
+/*
+ * Creates a hotword stream and waits for the hotword to trigger.
+ *
+ * Args:
+ *    client - The client to add the stream to (from cras_client_create).
+ *    user_data - Pointer that will be passed to the callback.
+ *    trigger_cb - Called when a hotword is triggered.
+ *    err_cb - Called when there is an error with the stream.
+ *    handle_out - On success will be filled with a cras_hotword_handle.
+ * Returns:
+ *    0 on success, negative error code on failure (from errno.h).
+ */
+int cras_client_enable_hotword_callback(
+	struct cras_client *client, void *user_data,
+	cras_hotword_trigger_cb_t trigger_cb, cras_hotword_error_cb_t err_cb,
+	struct cras_hotword_handle **handle_out);
+
+/*
+ * Closes a hotword stream that was created by cras_client_wait_for_hotword.
+ *
+ * Args:
+ *    client - Client to remove the stream (returned from cras_client_create).
+ *    handle - cras_hotword_handle returned from cras_client_wait_for_hotword.
+ * Returns:
+ *    0 on success negative error code on failure (from errno.h).
+ */
+int cras_client_disable_hotword_callback(struct cras_client *client,
+					 struct cras_hotword_handle *handle);
+
+/* Starts or stops the aec dump task on server side.
+ * Args:
+ *    client - The client from cras_client_create.
+ *    stream_id - The id of the input stream running with aec effect.
+ *    start - True to start APM debugging, otherwise to stop it.
+ *    fd - File descriptor of the file to store aec dump result.
+ */
+int cras_client_set_aec_dump(struct cras_client *client,
+			     cras_stream_id_t stream_id, int start, int fd);
+/*
+ * Reloads the aec.ini config file on server side.
+ */
+int cras_client_reload_aec_config(struct cras_client *client);
+
+/*
+ * Returns if AEC is supported.
+ */
+int cras_client_get_aec_supported(struct cras_client *client);
+
+/*
+ * Returns the AEC group ID if available.
+ */
+int cras_client_get_aec_group_id(struct cras_client *client);
+
+/*
+ * Sets the flag to enable bluetooth wideband speech in server.
+ */
+int cras_client_set_bt_wbs_enabled(struct cras_client * client, bool enabled);
+
 /* Set the context pointer for system state change callbacks.
  * Args:
  *    client - The client from cras_client_create.
  *    context - The context pointer passed to all callbacks.
  */
-void cras_client_set_state_change_callback_context(
-		struct cras_client *client, void *context);
+void cras_client_set_state_change_callback_context(struct cras_client *client,
+						   void *context);
 
 /* Output volume change callback.
  *
@@ -1018,8 +1149,8 @@ void cras_client_set_state_change_callback_context(
  *              cras_client_set_state_change_callback_context().
  *    volume - The system output volume, ranging from 0 to 100.
  */
-typedef void (*cras_client_output_volume_changed_callback)(
-		void* context, int32_t volume);
+typedef void (*cras_client_output_volume_changed_callback)(void *context,
+							   int32_t volume);
 
 /* Output mute change callback.
  *
@@ -1032,8 +1163,10 @@ typedef void (*cras_client_output_volume_changed_callback)(
  *    mute_locked - Non-zero when the mute funcion is locked,
  *                  zero otherwise.
  */
-typedef void (*cras_client_output_mute_changed_callback)(
-		void* context, int muted, int user_muted, int mute_locked);
+typedef void (*cras_client_output_mute_changed_callback)(void *context,
+							 int muted,
+							 int user_muted,
+							 int mute_locked);
 
 /* Capture gain change callback.
  *
@@ -1042,8 +1175,8 @@ typedef void (*cras_client_output_mute_changed_callback)(
  *              cras_client_set_state_change_callback_context().
  *    gain - The system capture gain, in centi-decibels.
  */
-typedef void (*cras_client_capture_gain_changed_callback)(
-		void* context, int32_t gain);
+typedef void (*cras_client_capture_gain_changed_callback)(void *context,
+							  int32_t gain);
 
 /* Capture mute change callback.
  *
@@ -1054,8 +1187,9 @@ typedef void (*cras_client_capture_gain_changed_callback)(
  *    mute_locked - Non-zero when the mute funcion is locked,
  *                  zero otherwise.
  */
-typedef void (*cras_client_capture_mute_changed_callback)(
-		void* context, int muted, int mute_locked);
+typedef void (*cras_client_capture_mute_changed_callback)(void *context,
+							  int muted,
+							  int mute_locked);
 
 /* Nodes change callback.
  *
@@ -1063,7 +1197,7 @@ typedef void (*cras_client_capture_mute_changed_callback)(
  *    context - Context pointer set with
  *              cras_client_set_state_change_callback_context().
  */
-typedef void (*cras_client_nodes_changed_callback)(void* context);
+typedef void (*cras_client_nodes_changed_callback)(void *context);
 
 /* Active node change callback.
  *
@@ -1076,8 +1210,8 @@ typedef void (*cras_client_nodes_changed_callback)(void* context);
  *              device or node is selected or between selections.
  */
 typedef void (*cras_client_active_node_changed_callback)(
-    void* context, enum CRAS_STREAM_DIRECTION direction,
-    cras_node_id_t node_id);
+	void *context, enum CRAS_STREAM_DIRECTION direction,
+	cras_node_id_t node_id);
 
 /* Output node volume change callback.
  *
@@ -1088,7 +1222,7 @@ typedef void (*cras_client_active_node_changed_callback)(
  *    volume - The volume for this node with range 0 to 100.
  */
 typedef void (*cras_client_output_node_volume_changed_callback)(
-		void* context, cras_node_id_t node_id, int32_t volume);
+	void *context, cras_node_id_t node_id, int32_t volume);
 
 /* Node left right swapped change callback.
  *
@@ -1099,7 +1233,7 @@ typedef void (*cras_client_output_node_volume_changed_callback)(
  *    swapped - Non-zero if the node is left-right swapped, zero otherwise.
  */
 typedef void (*cras_client_node_left_right_swapped_changed_callback)(
-		void* context, cras_node_id_t node_id, int swapped);
+	void *context, cras_node_id_t node_id, int swapped);
 
 /* Input node gain change callback.
  * Args:
@@ -1109,7 +1243,7 @@ typedef void (*cras_client_node_left_right_swapped_changed_callback)(
  *    gain - The gain for this node in centi-decibels.
  */
 typedef void (*cras_client_input_node_gain_changed_callback)(
-		void* context, cras_node_id_t node_id, int32_t gain);
+	void *context, cras_node_id_t node_id, int32_t gain);
 
 /* Number of active streams change callback.
  *
@@ -1120,8 +1254,8 @@ typedef void (*cras_client_input_node_gain_changed_callback)(
  *    num_active_streams - The number of active streams.
  */
 typedef void (*cras_client_num_active_streams_changed_callback)(
-		void* context, enum CRAS_STREAM_DIRECTION direction,
-		uint32_t num_active_streams);
+	void *context, enum CRAS_STREAM_DIRECTION direction,
+	uint32_t num_active_streams);
 
 /* Set system state information callbacks.
  * NOTE: These callbacks are executed from the client control thread.
@@ -1135,35 +1269,34 @@ typedef void (*cras_client_num_active_streams_changed_callback)(
  *    0 for success or negative errno error code on error.
  */
 int cras_client_set_output_volume_changed_callback(
-		struct cras_client *client,
-		cras_client_output_volume_changed_callback cb);
+	struct cras_client *client,
+	cras_client_output_volume_changed_callback cb);
 int cras_client_set_output_mute_changed_callback(
-		struct cras_client *client,
-		cras_client_output_mute_changed_callback cb);
+	struct cras_client *client,
+	cras_client_output_mute_changed_callback cb);
 int cras_client_set_capture_gain_changed_callback(
-		struct cras_client *client,
-		cras_client_capture_gain_changed_callback cb);
+	struct cras_client *client,
+	cras_client_capture_gain_changed_callback cb);
 int cras_client_set_capture_mute_changed_callback(
-		struct cras_client *client,
-		cras_client_capture_mute_changed_callback cb);
+	struct cras_client *client,
+	cras_client_capture_mute_changed_callback cb);
 int cras_client_set_nodes_changed_callback(
-		struct cras_client *client,
-		cras_client_nodes_changed_callback cb);
+	struct cras_client *client, cras_client_nodes_changed_callback cb);
 int cras_client_set_active_node_changed_callback(
-		struct cras_client *client,
-		cras_client_active_node_changed_callback cb);
+	struct cras_client *client,
+	cras_client_active_node_changed_callback cb);
 int cras_client_set_output_node_volume_changed_callback(
-		struct cras_client *client,
-		cras_client_output_node_volume_changed_callback cb);
+	struct cras_client *client,
+	cras_client_output_node_volume_changed_callback cb);
 int cras_client_set_node_left_right_swapped_changed_callback(
-		struct cras_client *client,
-		cras_client_node_left_right_swapped_changed_callback cb);
+	struct cras_client *client,
+	cras_client_node_left_right_swapped_changed_callback cb);
 int cras_client_set_input_node_gain_changed_callback(
-		struct cras_client *client,
-		cras_client_input_node_gain_changed_callback cb);
+	struct cras_client *client,
+	cras_client_input_node_gain_changed_callback cb);
 int cras_client_set_num_active_streams_changed_callback(
-		struct cras_client *client,
-		cras_client_num_active_streams_changed_callback cb);
+	struct cras_client *client,
+	cras_client_num_active_streams_changed_callback cb);
 
 #ifdef __cplusplus
 }

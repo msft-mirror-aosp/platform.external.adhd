@@ -31,7 +31,6 @@ struct cras_use_case_mgr;
  */
 struct cras_use_case_mgr *ucm_create(const char *name);
 
-
 /* Destroys a cras_use_case_mgr that was returned from ucm_create.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
@@ -156,18 +155,6 @@ char *ucm_get_dev_for_mixer(struct cras_use_case_mgr *mgr, const char *mixer,
 const char *ucm_get_edid_file_for_dev(struct cras_use_case_mgr *mgr,
 				      const char *dev);
 
-/* Gets the dsp name which is associated with the given ucm device.
- * Args:
- *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
- *    ucm_dev - The ucm device to get dsp name for.
- *    direction - playback(CRAS_STREAM_OUTPUT) or capture(CRAS_STREAM_INPUT).
- * Returns:
- *    A pointer to the allocated string containing the dsp name, or NULL if no
- *    dsp name is found.
- */
-const char *ucm_get_dsp_name(struct cras_use_case_mgr *mgr, const char *ucm_dev,
-			     int direction);
-
 /* Gets the default dsp name.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
@@ -179,19 +166,46 @@ const char *ucm_get_dsp_name(struct cras_use_case_mgr *mgr, const char *ucm_dev,
 const char *ucm_get_dsp_name_default(struct cras_use_case_mgr *mgr,
 				     int direction);
 
+/* Gets the dsp name which is associated with the given ucm device.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to get dsp name for.
+ * Returns:
+ *    A pointer to the allocated string containing the dsp name, or NULL if no
+ *    dsp name is found.
+ */
+const char *ucm_get_dsp_name_for_dev(struct cras_use_case_mgr *mgr,
+				     const char *dev);
+
 /* Gets the minimum buffer level for an output.  This level will add latency to
  * all streams playing on the output, but can be used to work around an
  * unreliable dma residue.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    level - The pointer to the returned value.
+ *
  */
-unsigned int ucm_get_min_buffer_level(struct cras_use_case_mgr *mgr);
+int ucm_get_min_buffer_level(struct cras_use_case_mgr *mgr,
+			     unsigned int *level);
 
 /* Gets the flag for disabling software volume.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ * Returns:
+ *    0 on success, -ENOENT on failure.
  */
 unsigned int ucm_get_disable_software_volume(struct cras_use_case_mgr *mgr);
+
+/* Gets the value for minimum software gain.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for minimum software gain.
+ *    gain - The pointer to the returned value;
+ * Returns:
+ *    0 on success, other error codes on failure.
+ */
+int ucm_get_min_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
+			      long *gain);
 
 /* Gets the value for maximum software gain.
  * Args:
@@ -215,6 +229,16 @@ int ucm_get_max_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
 int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
 			      long *gain);
 
+/* Gets the flag if an input device can preempt hotword recording.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for preempt hotword flag.
+ * Returns:
+ *    Non-zero value means input can preempt hotword recording, otherwise
+ *    return zero.
+ */
+int ucm_get_preempt_hotword(struct cras_use_case_mgr *mgr, const char *dev);
+
 /* Gets the device name of this device on the card..
  *
  * Args:
@@ -226,9 +250,22 @@ int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
  *    if no device name is found. The device name is of format
  *    "card_name:device_index".
  */
-const char *ucm_get_device_name_for_dev(
-		struct cras_use_case_mgr *mgr, const char *dev,
-		enum CRAS_STREAM_DIRECTION direction);
+const char *ucm_get_device_name_for_dev(struct cras_use_case_mgr *mgr,
+					const char *dev,
+					enum CRAS_STREAM_DIRECTION direction);
+
+/* Gets the node name of the echo reference device on the card.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check echo reference for.
+ * Returns:
+ *    String containing the node name of the echo reference to this
+ *    dev, caller is responsible to free it later. NULL if echo reference
+ *    doesn't exist.
+ */
+const char *
+ucm_get_echo_reference_dev_name_for_dev(struct cras_use_case_mgr *mgr,
+					const char *dev);
 
 /* Gets the sample rate at which to run this device.
  *
@@ -249,8 +286,7 @@ int ucm_get_sample_rate_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
  *    channel_layout - The channel layout to fill.
  */
 int ucm_get_capture_chmap_for_dev(struct cras_use_case_mgr *mgr,
-				  const char *dev,
-				  int8_t *channel_layout);
+				  const char *dev, int8_t *channel_layout);
 
 /* Gets the mixer names for the coupled mixer controls of this device
  * on the card.
@@ -261,8 +297,8 @@ int ucm_get_capture_chmap_for_dev(struct cras_use_case_mgr *mgr,
  * Returns:
  *    A list of cras_alsa_control.
  */
-struct mixer_name *ucm_get_coupled_mixer_names(
-		struct cras_use_case_mgr *mgr, const char *dev);
+struct mixer_name *ucm_get_coupled_mixer_names(struct cras_use_case_mgr *mgr,
+					       const char *dev);
 
 /* Gets a list of UCM sections
  *
@@ -336,8 +372,8 @@ struct mixer_name *ucm_get_main_volume_names(struct cras_use_case_mgr *mgr);
  *    section_name: The name of a SectionDevice in UCM.
  *    arg - Argument to pass to this callback.
  */
-typedef void (*ucm_list_section_devices_callback)(
-		const char *section_name, void *arg);
+typedef void (*ucm_list_section_devices_callback)(const char *section_name,
+						  void *arg);
 
 /* Invokes the provided callback once for each section with matched device name.
  *
@@ -354,11 +390,9 @@ typedef void (*ucm_list_section_devices_callback)(
  *    Number of sections listed.
  */
 int ucm_list_section_devices_by_device_name(
-		struct cras_use_case_mgr *mgr,
-		enum CRAS_STREAM_DIRECTION direction,
-		const char *device_name,
-		ucm_list_section_devices_callback cb,
-		void *cb_arg);
+	struct cras_use_case_mgr *mgr, enum CRAS_STREAM_DIRECTION direction,
+	const char *device_name, ucm_list_section_devices_callback cb,
+	void *cb_arg);
 
 /* Gets the jack name of this device on the card.
  *

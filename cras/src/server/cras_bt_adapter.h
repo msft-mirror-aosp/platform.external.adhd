@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium Authors. All rights reserved.
+/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -22,7 +22,6 @@ const char *cras_bt_adapter_address(const struct cras_bt_adapter *adapter);
 const char *cras_bt_adapter_name(const struct cras_bt_adapter *adapter);
 
 int cras_bt_adapter_powered(const struct cras_bt_adapter *adapter);
-
 
 void cras_bt_adapter_update_properties(struct cras_bt_adapter *adapter,
 				       DBusMessageIter *properties_array_iter,

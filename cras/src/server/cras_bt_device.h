@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium Authors. All rights reserved.
+/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -14,13 +14,13 @@ struct cras_iodev;
 struct cras_timer;
 
 enum cras_bt_device_profile {
-	CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE	= (1 << 0),
-	CRAS_BT_DEVICE_PROFILE_A2DP_SINK	= (1 << 1),
-	CRAS_BT_DEVICE_PROFILE_AVRCP_REMOTE	= (1 << 2),
-	CRAS_BT_DEVICE_PROFILE_AVRCP_TARGET	= (1 << 3),
-	CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE	= (1 << 4),
-	CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY	= (1 << 5),
-	CRAS_BT_DEVICE_PROFILE_HSP_HEADSET	= (1 << 6),
+	CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE = (1 << 0),
+	CRAS_BT_DEVICE_PROFILE_A2DP_SINK = (1 << 1),
+	CRAS_BT_DEVICE_PROFILE_AVRCP_REMOTE = (1 << 2),
+	CRAS_BT_DEVICE_PROFILE_AVRCP_TARGET = (1 << 3),
+	CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE = (1 << 4),
+	CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY = (1 << 5),
+	CRAS_BT_DEVICE_PROFILE_HSP_HEADSET = (1 << 6),
 	CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY = (1 << 7)
 };
 
@@ -28,15 +28,20 @@ enum cras_bt_device_profile cras_bt_device_profile_from_uuid(const char *uuid);
 
 struct cras_bt_device *cras_bt_device_create(DBusConnection *conn,
 					     const char *object_path);
-void cras_bt_device_destroy(struct cras_bt_device *device);
+
+/*
+ * Removes a BT device from record. If this device is connected state,
+ * ensure the associated A2DP and HFP AG be removed cleanly.
+ */
+void cras_bt_device_remove(struct cras_bt_device *device);
+
 void cras_bt_device_reset();
 
 struct cras_bt_device *cras_bt_device_get(const char *object_path);
-size_t cras_bt_device_get_list(struct cras_bt_device ***device_list_out);
 
 const char *cras_bt_device_object_path(const struct cras_bt_device *device);
-struct cras_bt_adapter *cras_bt_device_adapter(
-	const struct cras_bt_device *device);
+struct cras_bt_adapter *
+cras_bt_device_adapter(const struct cras_bt_device *device);
 const char *cras_bt_device_address(const struct cras_bt_device *device);
 const char *cras_bt_device_name(const struct cras_bt_device *device);
 int cras_bt_device_paired(const struct cras_bt_device *device);
@@ -80,11 +85,21 @@ int cras_bt_device_disconnect(DBusConnection *conn,
 /* Gets the SCO socket for the device.
  * Args:
  *     device - The device object to get SCO socket for.
+ *     codec - 1 for CVSD, 2 for mSBC
  */
-int cras_bt_device_sco_connect(struct cras_bt_device *device);
+int cras_bt_device_sco_connect(struct cras_bt_device *device, int codec);
 
-/* Queries the preffered mtu value for SCO socket. */
-int cras_bt_device_sco_mtu(struct cras_bt_device *device, int sco_socket);
+/* Gets the SCO packet size in bytes, used by HFP iodev for audio I/O.
+ * The logic is built base on experience: for USB bus, respect BT Core spec
+ * that has clear recommendation of packet size of codecs (CVSD, mSBC).
+ * As for other buses, use the MTU value of SCO socket filled by driver.
+ * Args:
+ *    device - The bt device to query mtu.
+ *    sco_socket - The SCO socket.
+ *    codec - 1 for CVSD, 2 for mSBC per HFP 1.7 specification.
+ */
+int cras_bt_device_sco_packet_size(struct cras_bt_device *device,
+				   int sco_socket, int codec);
 
 /* Appends an iodev to bt device.
  * Args:
@@ -131,10 +146,6 @@ int cras_bt_device_switch_profile_enable_dev(struct cras_bt_device *device,
 int cras_bt_device_switch_profile(struct cras_bt_device *device,
 				  struct cras_iodev *bt_iodev);
 
-/* Calls this function when the buffer size of an underlying profile iodev
- * has changed and update it for the virtual bt iodev. */
-void cras_bt_device_iodev_buffer_size_changed(struct cras_bt_device *device);
-
 void cras_bt_device_start_monitor();
 
 /* Checks if the device has an iodev for A2DP. */
@@ -166,5 +177,25 @@ int cras_bt_device_schedule_suspend(struct cras_bt_device *device,
  *   0 on success, error code otherwise.
  */
 int cras_bt_device_audio_gateway_initialized(struct cras_bt_device *device);
+
+/*
+ * Establishes SCO connection if it has not been established on the BT device.
+ * Note: this function should be only used for hfp_alsa_io.
+ * Args:
+ *    device - The bluetooth device.
+ *    codec - 1 for CVSD, 2 for mSBC
+ * Returns:
+ *   0 on success, error code otherwise.
+ */
+int cras_bt_device_get_sco(struct cras_bt_device *device, int codec);
+
+/*
+ * Closes SCO connection if the caller is the last user for the connection on
+ * the BT device.
+ * Note: this function should be only used for hfp_alsa_io.
+ * Args:
+ *   device - The bluetooth device.
+ */
+void cras_bt_device_put_sco(struct cras_bt_device *device);
 
 #endif /* CRAS_BT_DEVICE_H_ */
