@@ -3,6 +3,7 @@
  * found in the LICENSE file.
  */
 
+#include <sys/time.h>
 #include <syslog.h>
 
 #include "cras_bt_io.h"
@@ -90,13 +91,14 @@ static void bt_switch_to_profile(struct cras_bt_device *device,
 	switch (profile) {
 	case CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY:
 	case CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY:
-		cras_bt_device_set_active_profile(device,
-				CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY |
+		cras_bt_device_set_active_profile(
+			device,
+			CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY |
 				CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY);
 		break;
 	case CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE:
-		cras_bt_device_set_active_profile(device,
-				CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
+		cras_bt_device_set_active_profile(
+			device, CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
 		break;
 	default:
 		syslog(LOG_ERR, "Unexpect profile %u", profile);
@@ -112,20 +114,18 @@ static int device_using_profile(struct cras_bt_device *device,
 	return cras_bt_device_get_active_profile(device) & profile;
 }
 
-/* Checks if the condition is met to switch to a different profile
- * when trying to set the format to btio before open it. Base on two
- * rules:
+/* Checks if the condition is met to switch to a different profile based
+ * on two rules:
  * (1) Prefer to use A2DP for output since the audio quality is better.
  * (2) Must use HFP/HSP for input since A2DP doesn't support audio input.
  *
  * If the profile switch happens, return non-zero error code, otherwise
  * return zero.
  */
-static int update_supported_formats(struct cras_iodev *iodev)
+static int open_dev(struct cras_iodev *iodev)
 {
 	struct bt_io *btio = (struct bt_io *)iodev;
 	struct cras_iodev *dev = active_profile_dev(iodev);
-	int rc, length, i;
 
 	/* Force to use HFP if opening input dev. */
 	if (device_using_profile(btio->device,
@@ -137,9 +137,23 @@ static int update_supported_formats(struct cras_iodev *iodev)
 		return -EAGAIN;
 	}
 
+	if (dev && dev->open_dev)
+		return dev->open_dev(dev);
+
+	return 0;
+}
+
+static int update_supported_formats(struct cras_iodev *iodev)
+{
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	int rc, length, i;
+
+	if (!dev)
+		return -EINVAL;
+
 	if (dev->format == NULL) {
-		dev->format = (struct cras_audio_format *)
-				malloc(sizeof(*dev->format));
+		dev->format = (struct cras_audio_format *)malloc(
+			sizeof(*dev->format));
 		*dev->format = *iodev->format;
 	}
 
@@ -150,30 +164,33 @@ static int update_supported_formats(struct cras_iodev *iodev)
 	}
 
 	/* Fill in the supported rates and channel counts. */
-	for (length = 0; dev->supported_rates[length]; length++);
+	for (length = 0; dev->supported_rates[length]; length++)
+		;
 	free(iodev->supported_rates);
 	iodev->supported_rates = (size_t *)malloc(
-			(length + 1) * sizeof(*iodev->supported_rates));
+		(length + 1) * sizeof(*iodev->supported_rates));
 	for (i = 0; i < length + 1; i++)
 		iodev->supported_rates[i] = dev->supported_rates[i];
 
-	for (length = 0; dev->supported_channel_counts[length]; length++);
+	for (length = 0; dev->supported_channel_counts[length]; length++)
+		;
 	iodev->supported_channel_counts = (size_t *)malloc(
 		(length + 1) * sizeof(*iodev->supported_channel_counts));
 	for (i = 0; i < length + 1; i++)
 		iodev->supported_channel_counts[i] =
 			dev->supported_channel_counts[i];
 
-	for (length = 0; dev->supported_formats[length]; length++);
+	for (length = 0; dev->supported_formats[length]; length++)
+		;
+
 	iodev->supported_formats = (snd_pcm_format_t *)malloc(
 		(length + 1) * sizeof(*iodev->supported_formats));
 	for (i = 0; i < length + 1; i++)
-		iodev->supported_formats[i] =
-			dev->supported_formats[i];
+		iodev->supported_formats[i] = dev->supported_formats[i];
 	return 0;
 }
 
-static int open_dev(struct cras_iodev *iodev)
+static int configure_dev(struct cras_iodev *iodev)
 {
 	int rc;
 	struct cras_iodev *dev = active_profile_dev(iodev);
@@ -183,13 +200,9 @@ static int open_dev(struct cras_iodev *iodev)
 	/* Fill back the format iodev is using. */
 	*dev->format = *iodev->format;
 
-	rc = dev->open_dev(dev);
-	if (rc) {
-		/* Free format here to assure the update_supported_format
-		 * callback will be called before any future open_dev call. */
-		cras_iodev_free_format(iodev);
+	rc = dev->configure_dev(dev);
+	if (rc)
 		return rc;
-	}
 
 	iodev->buffer_size = dev->buffer_size;
 	iodev->min_buffer_level = dev->min_buffer_level;
@@ -201,15 +214,18 @@ static int close_dev(struct cras_iodev *iodev)
 	struct bt_io *btio = (struct bt_io *)iodev;
 	int rc;
 	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return -EINVAL;
 
 	/* Force back to A2DP if closing HFP. */
-	if (device_using_profile(btio->device,
-			CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY |
-			CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY) &&
+	if (device_using_profile(
+		    btio->device,
+		    CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY |
+			    CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY) &&
 	    iodev->direction == CRAS_STREAM_INPUT &&
 	    cras_bt_device_has_a2dp(btio->device)) {
-		cras_bt_device_set_active_profile(btio->device,
-				CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
+		cras_bt_device_set_active_profile(
+			btio->device, CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
 		cras_bt_device_switch_profile(btio->device, iodev);
 	}
 
@@ -223,6 +239,8 @@ static int close_dev(struct cras_iodev *iodev)
 static void set_bt_volume(struct cras_iodev *iodev)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return;
 
 	if (dev->active_node)
 		dev->active_node->volume = iodev->active_node->volume;
@@ -252,8 +270,7 @@ static int delay_frames(const struct cras_iodev *iodev)
 	return dev->delay_frames(dev);
 }
 
-static int get_buffer(struct cras_iodev *iodev,
-		      struct cras_audio_area **area,
+static int get_buffer(struct cras_iodev *iodev, struct cras_audio_area **area,
 		      unsigned *frames)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
@@ -287,12 +304,13 @@ static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
 	struct bt_io *btio = (struct bt_io *)iodev;
 	struct cras_ionode *node;
 	struct bt_node *active = (struct bt_node *)iodev->active_node;
+	struct cras_iodev *dev;
 
 	if (device_using_profile(btio->device, active->profile))
-		return;
+		goto leave;
 
 	/* Switch to the correct dev using active_profile. */
-	DL_FOREACH(iodev->nodes, node) {
+	DL_FOREACH (iodev->nodes, node) {
 		struct bt_node *n = (struct bt_node *)node;
 		if (n == active)
 			continue;
@@ -305,6 +323,56 @@ static void update_active_node(struct cras_iodev *iodev, unsigned node_idx,
 			set_bt_volume(iodev);
 		}
 	}
+
+leave:
+	dev = active_profile_dev(iodev);
+	if (dev && dev->update_active_node)
+		dev->update_active_node(dev, node_idx, dev_enabled);
+}
+
+static int no_stream(struct cras_iodev *iodev, int enable)
+{
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return -EINVAL;
+
+	if (dev->no_stream) {
+		/*
+		 * Copy iodev->min_cb_level and iodev->max_cb_level from the
+		 * parent (i.e. bt_io).  no_stream() of hfp_alsa_iodev will
+		 * use them.
+		 * A2DP and HFP dev will use buffer and callback sizes to fill
+		 * zeros in no stream state.
+		 */
+		dev->min_cb_level = iodev->min_cb_level;
+		dev->max_cb_level = iodev->max_cb_level;
+		dev->buffer_size = iodev->buffer_size;
+		return dev->no_stream(dev, enable);
+	}
+	return 0;
+}
+
+static int is_free_running(const struct cras_iodev *iodev)
+{
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return -EINVAL;
+
+	if (dev->is_free_running)
+		return dev->is_free_running(dev);
+
+	return 0;
+}
+
+static int start(const struct cras_iodev *iodev)
+{
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return -EINVAL;
+
+	if (dev->start)
+		return dev->start(dev);
+	return 0;
 }
 
 struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
@@ -332,6 +400,7 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->info.stable_id_new = dev->info.stable_id_new;
 
 	iodev->open_dev = open_dev;
+	iodev->configure_dev = configure_dev;
 	iodev->frames_queued = frames_queued;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
@@ -340,9 +409,20 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->close_dev = close_dev;
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
-	iodev->software_volume_needed = 1;
-	iodev->set_volume = set_bt_volume;
-	iodev->no_stream = cras_iodev_default_no_stream_playback;
+	iodev->no_stream = no_stream;
+	iodev->is_free_running = is_free_running;
+	iodev->start = start;
+
+	/* Input also checks |software_volume_needed| flag for using software
+	 * gain. Keep it as false for BT input.
+	 * TODO(hychao): after wide band speech mode is supported, consider
+	 * enable software gain.
+	 */
+	if (dev->direction == CRAS_STREAM_OUTPUT) {
+		iodev->software_volume_needed =
+			!cras_bt_device_get_use_hardware_volume(device);
+		iodev->set_volume = set_bt_volume;
+	}
 
 	/* Create the dummy node set to plugged so it's the only node exposed
 	 * to UI, and point it to the first profile dev. */
@@ -354,10 +434,10 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	active->base.type = CRAS_NODE_TYPE_BLUETOOTH;
 	active->base.volume = 100;
 	active->base.plugged = 1;
-	active->base.stable_id = SuperFastHash(
-		cras_bt_device_object_path(device),
-		strlen(cras_bt_device_object_path(device)),
-		strlen(cras_bt_device_object_path(device)));
+	active->base.stable_id =
+		SuperFastHash(cras_bt_device_object_path(device),
+			      strlen(cras_bt_device_object_path(device)),
+			      strlen(cras_bt_device_object_path(device)));
 	active->base.stable_id_new = active->base.stable_id;
 	active->profile = profile;
 	active->profile_dev = dev;
@@ -394,12 +474,28 @@ error:
 	return NULL;
 }
 
+void cras_bt_io_free_resources(struct cras_iodev *bt_iodev)
+{
+	struct cras_ionode *node;
+	struct bt_node *n;
+
+	free(bt_iodev->supported_rates);
+	free(bt_iodev->supported_channel_counts);
+	free(bt_iodev->supported_formats);
+
+	DL_FOREACH (bt_iodev->nodes, node) {
+		n = (struct bt_node *)node;
+		cras_iodev_rm_node(bt_iodev, node);
+		free(n);
+	}
+
+	cras_iodev_free_resources(bt_iodev);
+}
+
 void cras_bt_io_destroy(struct cras_iodev *bt_iodev)
 {
 	int rc;
 	struct bt_io *btio = (struct bt_io *)bt_iodev;
-	struct cras_ionode *node;
-	struct bt_node *n;
 
 	if (bt_iodev->direction == CRAS_STREAM_OUTPUT)
 		rc = cras_iodev_list_rm_output(bt_iodev);
@@ -408,11 +504,7 @@ void cras_bt_io_destroy(struct cras_iodev *bt_iodev)
 	if (rc == -EBUSY)
 		return;
 
-	DL_FOREACH(bt_iodev->nodes, node) {
-		n = (struct bt_node *)node;
-		cras_iodev_rm_node(bt_iodev, node);
-		free(n);
-	}
+	cras_bt_io_free_resources(bt_iodev);
 	free(btio);
 }
 
@@ -420,7 +512,7 @@ struct cras_ionode *cras_bt_io_get_profile(struct cras_iodev *bt_iodev,
 					   enum cras_bt_device_profile profile)
 {
 	struct cras_ionode *node;
-	DL_FOREACH(bt_iodev->nodes, node) {
+	DL_FOREACH (bt_iodev->nodes, node) {
 		struct bt_node *n = (struct bt_node *)node;
 		if (n->profile & profile)
 			return node;
@@ -428,8 +520,7 @@ struct cras_ionode *cras_bt_io_get_profile(struct cras_iodev *bt_iodev,
 	return NULL;
 }
 
-int cras_bt_io_append(struct cras_iodev *bt_iodev,
-		      struct cras_iodev *dev,
+int cras_bt_io_append(struct cras_iodev *bt_iodev, struct cras_iodev *dev,
 		      enum cras_bt_device_profile profile)
 {
 	struct cras_ionode *node;
@@ -459,16 +550,6 @@ int cras_bt_io_on_profile(struct cras_iodev *bt_iodev,
 	return !!(profile & btnode->profile);
 }
 
-int cras_bt_io_update_buffer_size(struct cras_iodev *bt_iodev)
-{
-	struct cras_iodev *dev = active_profile_dev(bt_iodev);
-	if (!dev)
-		return -EINVAL;
-
-	bt_iodev->buffer_size = dev->buffer_size;
-	return 0;
-}
-
 unsigned int cras_bt_io_try_remove(struct cras_iodev *bt_iodev,
 				   struct cras_iodev *dev)
 {
@@ -479,7 +560,7 @@ unsigned int cras_bt_io_try_remove(struct cras_iodev *bt_iodev,
 	active = (struct bt_node *)bt_iodev->active_node;
 
 	if (active->profile_dev == dev) {
-		DL_FOREACH(bt_iodev->nodes, node) {
+		DL_FOREACH (bt_iodev->nodes, node) {
 			btnode = (struct bt_node *)node;
 			/* Skip the active node and the node we're trying
 			 * to remove. */
@@ -494,13 +575,12 @@ unsigned int cras_bt_io_try_remove(struct cras_iodev *bt_iodev,
 	return try_profile;
 }
 
-int cras_bt_io_remove(struct cras_iodev *bt_iodev,
-		      struct cras_iodev *dev)
+int cras_bt_io_remove(struct cras_iodev *bt_iodev, struct cras_iodev *dev)
 {
 	struct cras_ionode *node;
 	struct bt_node *btnode;
 
-	DL_FOREACH(bt_iodev->nodes, node) {
+	DL_FOREACH (bt_iodev->nodes, node) {
 		btnode = (struct bt_node *)node;
 		if (btnode->profile_dev != dev)
 			continue;

@@ -45,14 +45,20 @@ void cras_dsp_set_variable_string(struct cras_dsp_context *ctx, const char *key,
 				  const char *value);
 
 /* Sets a configuration boolean variable in the context. */
-void cras_dsp_set_variable_boolean(struct cras_dsp_context *ctx, const char *key,
-				   char value);
+void cras_dsp_set_variable_boolean(struct cras_dsp_context *ctx,
+				   const char *key, char value);
 
 /* Loads the pipeline to the context. This should be called again when
  * new values of configuration variables may change the plugin
  * graph. The actual loading happens in another thread to avoid
  * blocking the audio thread. */
 void cras_dsp_load_pipeline(struct cras_dsp_context *ctx);
+
+/* Loads a dummy pipeline of source directly connects to sink, of given
+ * number of channels.
+ */
+void cras_dsp_load_dummy_pipeline(struct cras_dsp_context *ctx,
+				  unsigned int num_channels);
 
 /* Locks the pipeline in the context for access. Returns NULL if the
  * pipeline is still being loaded or cannot be loaded. */

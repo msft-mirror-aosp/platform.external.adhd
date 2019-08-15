@@ -44,16 +44,16 @@ DECLARE_ARRAY_TYPE(struct port, port_array)
 
 struct plugin {
 	const char *title;
-	const char *library;  /* file name like "plugin.so" */
-	const char *label;    /* label like "Eq" */
-	const char *purpose;  /* like "playback" or "capture" */
-	struct cras_expr_expression *disable_expr;  /* the disable expression of
+	const char *library; /* file name like "plugin.so" */
+	const char *label; /* label like "Eq" */
+	const char *purpose; /* like "playback" or "capture" */
+	struct cras_expr_expression *disable_expr; /* the disable expression of
 					     this plugin */
 	port_array ports;
 };
 
 struct flow {
-	enum port_type type;  /* the type of the ports this flow connects to */
+	enum port_type type; /* the type of the ports this flow connects to */
 	const char *name;
 	struct plugin *from;
 	struct plugin *to;
@@ -69,6 +69,24 @@ struct ini {
 	plugin_array plugins;
 	flow_array flows;
 };
+
+/*
+ * Creates a dummy ini structure equivalent to:
+ *
+ * [src]
+ * out0={tmp:0}
+ * out1={tmp:1}
+ * ...
+ *
+ * [sink]
+ * in0={tmp:0}
+ * in1={tmp:1}
+ * ...
+ *
+ * The caller of this function is responsible to free the returned
+ * ini by calling cras_dsp_ini_free().
+ */
+struct ini *create_dummy_ini(const char *purpose, unsigned int num_channels);
 
 /* Reads the ini file into the ini structure */
 struct ini *cras_dsp_ini_create(const char *ini_filename);

@@ -57,15 +57,16 @@
 static const size_t MAX_CMD_MSG_LEN = 256;
 static const size_t SERVER_SHUTDOWN_TIMEOUT_US = 500000;
 static const size_t SERVER_CONNECT_TIMEOUT_MS = 1000;
+static const size_t HOTWORD_FRAME_RATE = 16000;
+static const size_t HOTWORD_BLOCK_SIZE = 320;
 
 /* Commands sent from the user to the running client. */
-enum {
-	CLIENT_STOP,
-	CLIENT_ADD_STREAM,
-	CLIENT_REMOVE_STREAM,
-	CLIENT_SET_STREAM_VOLUME_SCALER,
-	CLIENT_SERVER_CONNECT,
-	CLIENT_SERVER_CONNECT_ASYNC,
+enum { CLIENT_STOP,
+       CLIENT_ADD_STREAM,
+       CLIENT_REMOVE_STREAM,
+       CLIENT_SET_STREAM_VOLUME_SCALER,
+       CLIENT_SERVER_CONNECT,
+       CLIENT_SERVER_CONNECT_ASYNC,
 };
 
 struct command_msg {
@@ -93,8 +94,7 @@ struct add_stream_command_message {
 };
 
 /* Commands send from a running stream to the client. */
-enum {
-	CLIENT_STREAM_EOF,
+enum { CLIENT_STREAM_EOF,
 };
 
 struct stream_msg {
@@ -103,10 +103,13 @@ struct stream_msg {
 };
 
 enum CRAS_THREAD_STATE {
-	CRAS_THREAD_STOP,	/* Isn't (shouldn't be) running. */
-	CRAS_THREAD_WARMUP,	/* Is started, but not fully functional: waiting
-				 * for resources to be ready for example. */
-	CRAS_THREAD_RUNNING,	/* Is running and fully functional. */
+	CRAS_THREAD_STOP,
+	/* Isn't (shouldn't be) running. */
+	CRAS_THREAD_WARMUP,
+	/* Is started, but not fully functional: waiting
+	 * for resources to be ready for example. */
+	CRAS_THREAD_RUNNING,
+	/* Is running and fully functional. */
 };
 
 /* Manage information for a thread. */
@@ -123,6 +126,7 @@ struct cras_stream_params {
 	size_t cb_threshold;
 	enum CRAS_STREAM_TYPE stream_type;
 	uint32_t flags;
+	uint64_t effects;
 	void *user_data;
 	cras_playback_cb_t aud_cb;
 	cras_unified_cb_t unified_cb;
@@ -133,16 +137,17 @@ struct cras_stream_params {
 /* Represents an attached audio stream.
  * id - Unique stream identifier.
  * aud_fd - After server connects audio messages come in here.
- * direction - playback, capture, both, or loopback (see CRAS_STREAM_DIRECTION).
+ * direction - playback, capture, or loopback (see CRAS_STREAM_DIRECTION).
  * flags - Currently not used.
- * volume_scaler - Amount to scale the stream by, 0.0 to 1.0.
+ * volume_scaler - Amount to scale the stream by, 0.0 to 1.0. Client could
+ *    change this scaler value before stream actually connected, so we need
+ *    to cache it until shm is prepared and apply it.
  * tid - Thread id of the audio thread spawned for this stream.
  * running - Audio thread runs while this is non-zero.
  * wake_fds - Pipe to wake the audio thread.
  * client - The client this stream is attached to.
  * config - Audio stream configuration.
- * capture_shm - Shared memory used to exchange audio samples with the server.
- * play_shm - Shared memory used to exchange audio samples with the server.
+ * shm - Shared memory used to exchange audio samples with the server.
  * prev, next - Form a linked list of streams attached to a client.
  */
 struct client_stream {
@@ -155,33 +160,30 @@ struct client_stream {
 	int wake_fds[2]; /* Pipe to wake the thread */
 	struct cras_client *client;
 	struct cras_stream_params *config;
-	struct cras_audio_shm capture_shm;
-	int capture_shm_size;
-	struct cras_audio_shm play_shm;
-	int play_shm_size;
+	struct cras_audio_shm *shm;
 	struct client_stream *prev, *next;
 };
 
 /* State of the socket. */
 typedef enum cras_socket_state {
 	CRAS_SOCKET_STATE_DISCONNECTED,
-		/* Not connected. Also used to cleanup the current connection
-		 * before restarting the connection attempt. */
+	/* Not connected. Also used to cleanup the current connection
+	 * before restarting the connection attempt. */
 	CRAS_SOCKET_STATE_WAIT_FOR_SOCKET,
-		/* Waiting for the socket file to exist. Socket file existence
-		 * is monitored using cras_file_wait. */
+	/* Waiting for the socket file to exist. Socket file existence
+	 * is monitored using cras_file_wait. */
 	CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE,
-		/* Waiting for the socket to have something at the other end. */
+	/* Waiting for the socket to have something at the other end. */
 	CRAS_SOCKET_STATE_FIRST_MESSAGE,
-		/* Waiting for the first messages from the server and set our
-		 * client ID. */
+	/* Waiting for the first messages from the server and set our
+	 * client ID. */
 	CRAS_SOCKET_STATE_CONNECTED,
-		/* The socket is connected and working. */
+	/* The socket is connected and working. */
 	CRAS_SOCKET_STATE_ERROR_DELAY,
-		/* There was an error during one of the above states. Sleep for
-		 * a bit before continuing. If this state could not be initiated
-		 * then we move to the DISCONNECTED state and notify via the
-		 * connection callback. */
+	/* There was an error during one of the above states. Sleep for
+	 * a bit before continuing. If this state could not be initiated
+	 * then we move to the DISCONNECTED state and notify via the
+	 * connection callback. */
 } cras_socket_state_t;
 
 /* Represents a client used to communicate with the audio server.
@@ -252,8 +254,23 @@ struct client_int {
 	pthread_rwlock_t server_state_rwlock;
 };
 
-#define to_client_int(cptr) \
-((struct client_int *)((char *)cptr - offsetof(struct client_int, client)))
+#define to_client_int(cptr)                                                    \
+	((struct client_int *)((char *)cptr -                                  \
+			       offsetof(struct client_int, client)))
+
+/*
+ * Holds the hotword stream format, params, and ID used when waiting for a
+ * hotword. The structure is created by cras_client_enable_hotword_callback and
+ * destroyed by cras_client_disable_hotword_callback.
+ */
+struct cras_hotword_handle {
+	struct cras_audio_format *format;
+	struct cras_stream_params *params;
+	cras_stream_id_t stream_id;
+	cras_hotword_trigger_cb_t trigger_cb;
+	cras_hotword_error_cb_t err_cb;
+	void *user_data;
+};
 
 /*
  * Local Helpers
@@ -272,8 +289,7 @@ static int reregister_notifications(struct cras_client *client);
  *    lock_rc - The result of server_state_rdlock or
  *              server_state_wrlock.
  */
-static void server_state_unlock(const struct cras_client *client,
-				int lock_rc)
+static void server_state_unlock(const struct cras_client *client, int lock_rc)
 {
 	struct client_int *client_int;
 
@@ -390,16 +406,14 @@ static void server_fd_move_to_state(struct cras_client *client,
  * that the timer has expired, and restart the connection by moving to
  * WAIT_FOR_SOCKET state.
  */
-static int error_delay_next_action(struct cras_client *client,
-				   int poll_revents)
+static int error_delay_next_action(struct cras_client *client, int poll_revents)
 {
 	int rc;
 	struct itimerspec timeout;
 
 	if (client->server_fd == -1) {
-		client->server_fd = timerfd_create(
-					CLOCK_MONOTONIC,
-					TFD_NONBLOCK|TFD_CLOEXEC);
+		client->server_fd = timerfd_create(CLOCK_MONOTONIC,
+						   TFD_NONBLOCK | TFD_CLOEXEC);
 		if (client->server_fd == -1) {
 			rc = -errno;
 			syslog(LOG_ERR,
@@ -444,8 +458,8 @@ static int error_delay_next_action(struct cras_client *client,
 static void wait_for_socket_next_action(struct cras_client *client)
 {
 	if (client->sock_file_exists)
-		server_fd_move_to_state(
-			client, CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE);
+		server_fd_move_to_state(client,
+					CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE);
 }
 
 /*
@@ -473,8 +487,7 @@ static int wait_for_writable_next_action(struct cras_client *client,
 			       strerror(-rc));
 			return rc;
 		}
-	}
-	else if ((poll_revents & POLLOUT) == 0) {
+	} else if ((poll_revents & POLLOUT) == 0) {
 		return 0;
 	}
 
@@ -499,8 +512,7 @@ static int wait_for_writable_next_action(struct cras_client *client,
 			 * to move the state machine. */
 			close(client->server_fd);
 			client->server_fd = -1;
-		}
-		else if (rc != -EINPROGRESS) {
+		} else if (rc != -EINPROGRESS) {
 			syslog(LOG_ERR,
 			       "cras_client: server connect failed: %s",
 			       strerror(-rc));
@@ -533,8 +545,8 @@ static int connect_transition_action(struct cras_client *client)
 	eventfd_write(client->server_event_fd, 1);
 	if (client->server_connection_cb)
 		client->server_connection_cb(
-				client, CRAS_CONN_STATUS_CONNECTED,
-				client->server_connection_user_arg);
+			client, CRAS_CONN_STATUS_CONNECTED,
+			client->server_connection_user_arg);
 	return 0;
 }
 
@@ -607,7 +619,7 @@ static void disconnect_transition_action(struct cras_client *client, bool force)
 
 	/* Stop all playing streams.
 	 * TODO(muirj): Pause and resume streams. */
-	DL_FOREACH(client->streams, s) {
+	DL_FOREACH (client->streams, s) {
 		s->config->err_cb(client, s->id, -ENOTCONN,
 				  s->config->user_data);
 		client_thread_rm_stream(client, s->id);
@@ -646,12 +658,11 @@ static void disconnect_transition_action(struct cras_client *client, bool force)
 		/* We're disconnected and there was a failure to setup
 		 * automatic reconnection, so call the server error
 		 * callback now. */
-		server_fd_move_to_state(
-			client, CRAS_SOCKET_STATE_DISCONNECTED);
+		server_fd_move_to_state(client, CRAS_SOCKET_STATE_DISCONNECTED);
 		if (client->server_connection_cb)
 			client->server_connection_cb(
-					client, CRAS_CONN_STATUS_FAILED,
-					client->server_connection_user_arg);
+				client, CRAS_CONN_STATUS_FAILED,
+				client->server_connection_user_arg);
 		else if (client->server_err_cb)
 			client->server_err_cb(
 				client, client->server_connection_user_arg);
@@ -662,19 +673,18 @@ static void disconnect_transition_action(struct cras_client *client, bool force)
 		/* We are running this state transition while a connection is
 		 * in progress for an error case. When there is no error, we
 		 * come into this function in the DISCONNECTED state. */
-		server_fd_move_to_state(
-			client, CRAS_SOCKET_STATE_ERROR_DELAY);
+		server_fd_move_to_state(client, CRAS_SOCKET_STATE_ERROR_DELAY);
 		break;
 	case CRAS_SOCKET_STATE_CONNECTED:
 		/* Disconnected from CRAS (for an error), wait for the socket
 		 * file to be (re)created. */
-		server_fd_move_to_state(
-			client, CRAS_SOCKET_STATE_WAIT_FOR_SOCKET);
+		server_fd_move_to_state(client,
+					CRAS_SOCKET_STATE_WAIT_FOR_SOCKET);
 		/* Notify the caller that we aren't connected anymore. */
 		if (client->server_connection_cb)
 			client->server_connection_cb(
-					client, CRAS_CONN_STATUS_DISCONNECTED,
-					client->server_connection_user_arg);
+				client, CRAS_CONN_STATUS_DISCONNECTED,
+				client->server_connection_user_arg);
 		break;
 	}
 }
@@ -798,8 +808,7 @@ static void sock_file_wait_callback(void *context, cras_file_wait_event_t event,
  * If the socket file is deleted, then cause a disconnect from the server.
  * Otherwise, start a reconnect depending on the server_fd_state.
  */
-static int sock_file_wait_dispatch(struct cras_client *client,
-				   int poll_revents)
+static int sock_file_wait_dispatch(struct cras_client *client, int poll_revents)
 {
 	int rc;
 
@@ -858,8 +867,7 @@ static inline int thread_is_running(struct thread_state *thread)
  *    0 for success, negative error code on failure.
  */
 static int connect_to_server(struct cras_client *client,
-			     struct timespec *timeout,
-			     bool use_command_thread)
+			     struct timespec *timeout, bool use_command_thread)
 {
 	int rc;
 	struct pollfd poll_fd[2];
@@ -885,7 +893,7 @@ static int connect_to_server(struct cras_client *client,
 	poll_fd[0].events = POLLIN;
 
 	rc = server_connect(client);
-	while(rc == 0) {
+	while (rc == 0) {
 		// Wait until we've connected or until there is a timeout.
 		// Meanwhile handle incoming actions on our fds.
 
@@ -895,16 +903,15 @@ static int connect_to_server(struct cras_client *client,
 			continue;
 
 		if (poll_fd[0].revents) {
-			rc = sock_file_wait_dispatch(
-					client, poll_fd[0].revents);
+			rc = sock_file_wait_dispatch(client,
+						     poll_fd[0].revents);
 			continue;
 		}
 
 		if (poll_fd[1].revents) {
 			rc = server_fd_dispatch(client, poll_fd[1].revents);
-			if (rc == 0 &&
-			    client->server_fd_state ==
-					CRAS_SOCKET_STATE_CONNECTED)
+			if (rc == 0 && client->server_fd_state ==
+					       CRAS_SOCKET_STATE_CONNECTED)
 				break;
 		}
 	}
@@ -917,8 +924,7 @@ static int connect_to_server(struct cras_client *client,
 }
 
 static int connect_to_server_wait_retry(struct cras_client *client,
-					int timeout_ms,
-					bool use_command_thread)
+					int timeout_ms, bool use_command_thread)
 {
 	struct timespec timeout_value;
 	struct timespec *timeout;
@@ -943,8 +949,8 @@ static int connect_to_server_wait_retry(struct cras_client *client,
 static int connect_to_server_wait(struct cras_client *client,
 				  bool use_command_thread)
 {
-	return connect_to_server_wait_retry(
-			client, SERVER_CONNECT_TIMEOUT_MS, use_command_thread);
+	return connect_to_server_wait_retry(client, SERVER_CONNECT_TIMEOUT_MS,
+					    use_command_thread);
 }
 
 /*
@@ -1019,7 +1025,7 @@ static unsigned int config_capture_buf(struct client_stream *stream,
 {
 	/* Always return the beginning of the read buffer because Chrome expects
 	 * so. */
-	*captured_frames = cras_shm_get_read_buffer_base(&stream->capture_shm);
+	*captured_frames = cras_shm_get_read_buffer_base(stream->shm);
 
 	/* Don't ask for more frames than the client desires. */
 	if (stream->flags & BULK_AUDIO_OK)
@@ -1030,7 +1036,7 @@ static unsigned int config_capture_buf(struct client_stream *stream,
 	/* If shm readable frames is less than client requests, that means
 	 * overrun has happened in server side. Don't send partial corrupted
 	 * buffer to client. */
-	if (cras_shm_get_curr_read_frames(&stream->capture_shm) < num_frames)
+	if (cras_shm_get_curr_read_frames(stream->shm) < num_frames)
 		return 0;
 
 	return num_frames;
@@ -1039,7 +1045,27 @@ static unsigned int config_capture_buf(struct client_stream *stream,
 static void complete_capture_read_current(struct client_stream *stream,
 					  unsigned int num_frames)
 {
-	cras_shm_buffer_read_current(&stream->capture_shm, num_frames);
+	cras_shm_buffer_read_current(stream->shm, num_frames);
+}
+
+static int send_capture_reply(struct client_stream *stream, unsigned int frames,
+			      int err)
+{
+	struct audio_message aud_msg;
+	int rc;
+
+	if (!cras_stream_uses_input_hw(stream->direction))
+		return 0;
+
+	aud_msg.id = AUDIO_MESSAGE_DATA_CAPTURED;
+	aud_msg.frames = frames;
+	aud_msg.error = err;
+
+	rc = write(stream->aud_fd, &aud_msg, sizeof(aud_msg));
+	if (rc != sizeof(aud_msg))
+		return -EPIPE;
+
+	return 0;
 }
 
 /* For capture streams this handles the message signalling that data is ready to
@@ -1058,6 +1084,7 @@ static int handle_capture_data_ready(struct client_stream *stream,
 	struct cras_stream_params *config;
 	uint8_t *captured_frames;
 	struct timespec ts;
+	int rc = 0;
 
 	config = stream->config;
 	/* If this message is for an output stream, log error and drop it. */
@@ -1070,39 +1097,32 @@ static int handle_capture_data_ready(struct client_stream *stream,
 	if (num_frames == 0)
 		return 0;
 
-	cras_timespec_to_timespec(&ts, &stream->capture_shm.area->ts);
+	cras_timespec_to_timespec(&ts, &stream->shm->header->ts);
 
 	if (config->unified_cb)
-		frames = config->unified_cb(stream->client,
-					    stream->id,
-					    captured_frames,
-					    NULL,
-					    num_frames,
-					    &ts,
-					    NULL,
-					    config->user_data);
+		frames = config->unified_cb(stream->client, stream->id,
+					    captured_frames, NULL, num_frames,
+					    &ts, NULL, config->user_data);
 	else
-		frames = config->aud_cb(stream->client,
-					stream->id,
-					captured_frames,
-					num_frames,
-					&ts,
+		frames = config->aud_cb(stream->client, stream->id,
+					captured_frames, num_frames, &ts,
 					config->user_data);
-	if (frames == EOF) {
+	if (frames < 0) {
 		send_stream_message(stream, CLIENT_STREAM_EOF);
-		return EOF;
+		rc = frames;
+		goto reply_captured;
 	}
 	if (frames == 0)
 		return 0;
 
 	complete_capture_read_current(stream, frames);
-	return 0;
+reply_captured:
+	return send_capture_reply(stream, frames, rc);
 }
 
 /* Notifies the server that "frames" samples have been written. */
 static int send_playback_reply(struct client_stream *stream,
-			       unsigned int frames,
-			       int error)
+			       unsigned int frames, int error)
 {
 	struct audio_message aud_msg;
 	int rc;
@@ -1131,7 +1151,7 @@ static int handle_playback_request(struct client_stream *stream,
 	int frames;
 	int rc = 0;
 	struct cras_stream_params *config;
-	struct cras_audio_shm *shm = &stream->play_shm;
+	struct cras_audio_shm *shm = stream->shm;
 	struct timespec ts;
 
 	config = stream->config;
@@ -1142,30 +1162,21 @@ static int handle_playback_request(struct client_stream *stream,
 		return 0;
 	}
 
-	buf = cras_shm_get_write_buffer_base(&stream->play_shm);
+	buf = cras_shm_get_write_buffer_base(shm);
 
 	/* Limit the amount of frames to the configured amount. */
 	num_frames = MIN(num_frames, config->cb_threshold);
 
-	cras_timespec_to_timespec(&ts, &shm->area->ts);
+	cras_timespec_to_timespec(&ts, &shm->header->ts);
 
 	/* Get samples from the user */
 	if (config->unified_cb)
-		frames = config->unified_cb(stream->client,
-				stream->id,
-				NULL,
-				buf,
-				num_frames,
-				NULL,
-				&ts,
-				config->user_data);
+		frames = config->unified_cb(stream->client, stream->id, NULL,
+					    buf, num_frames, NULL, &ts,
+					    config->user_data);
 	else
-		frames = config->aud_cb(stream->client,
-				stream->id,
-				buf,
-				num_frames,
-				&ts,
-				config->user_data);
+		frames = config->aud_cb(stream->client, stream->id, buf,
+					num_frames, &ts, config->user_data);
 	if (frames < 0) {
 		send_stream_message(stream, CLIENT_STREAM_EOF);
 		rc = frames;
@@ -1218,11 +1229,11 @@ static void *audio_thread(void *arg)
 		/* While we are warming up, aud_fd may not be valid and some
 		 * shared memory resources may not yet be available. */
 		aud_fd = (stream->thread.state == CRAS_THREAD_WARMUP) ?
-			 -1 : stream->aud_fd;
-		num_read = read_with_wake_fd(stream->wake_fds[0],
-					     aud_fd,
-					     (uint8_t *)&aud_msg,
-					     sizeof(aud_msg));
+				 -1 :
+				 stream->aud_fd;
+		num_read =
+			read_with_wake_fd(stream->wake_fds[0], aud_fd,
+					  (uint8_t *)&aud_msg, sizeof(aud_msg));
 		if (num_read < 0)
 			return (void *)-EIO;
 		if (num_read == 0)
@@ -1231,13 +1242,11 @@ static void *audio_thread(void *arg)
 		switch (aud_msg.id) {
 		case AUDIO_MESSAGE_DATA_READY:
 			thread_terminated = handle_capture_data_ready(
-					stream,
-					aud_msg.frames);
+				stream, aud_msg.frames);
 			break;
 		case AUDIO_MESSAGE_REQUEST_DATA:
-			thread_terminated = handle_playback_request(
-					stream,
-					aud_msg.frames);
+			thread_terminated =
+				handle_playback_request(stream, aud_msg.frames);
 			break;
 		default:
 			break;
@@ -1305,18 +1314,18 @@ static int start_aud_thread(struct client_stream *stream)
 	rc = pthread_create(&stream->thread.tid, NULL, audio_thread, stream);
 	if (rc) {
 		pthread_mutex_unlock(&stream->client->stream_start_lock);
-		syslog(LOG_ERR,
-		       "cras_client: Couldn't create audio stream: %s",
+		syslog(LOG_ERR, "cras_client: Couldn't create audio stream: %s",
 		       strerror(rc));
 		stream->thread.state = CRAS_THREAD_STOP;
 		stop_aud_thread(stream, 0);
 		return -rc;
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &future);
+	clock_gettime(CLOCK_REALTIME, &future);
 	future.tv_sec += 2; /* Wait up to two seconds. */
 	rc = pthread_cond_timedwait(&stream->client->stream_start_cond,
-				    &stream->client->stream_start_lock, &future);
+				    &stream->client->stream_start_lock,
+				    &future);
 	pthread_mutex_unlock(&stream->client->stream_start_lock);
 	if (rc != 0) {
 		/* Something is very wrong: try to cancel the thread and don't
@@ -1334,8 +1343,8 @@ static int start_aud_thread(struct client_stream *stream)
  */
 
 /* Gets the update_count of the server state shm region. */
-static inline
-unsigned begin_server_state_read(const struct cras_server_state *state)
+static inline unsigned
+begin_server_state_read(const struct cras_server_state *state)
 {
 	unsigned count;
 
@@ -1349,44 +1358,20 @@ unsigned begin_server_state_read(const struct cras_server_state *state)
 /* Checks if the update count of the server state shm region has changed from
  * count.  Returns 0 if the count still matches.
  */
-static inline
-int end_server_state_read(const struct cras_server_state *state, unsigned count)
+static inline int end_server_state_read(const struct cras_server_state *state,
+					unsigned count)
 {
 	__sync_synchronize();
 	if (count != *(volatile unsigned *)&state->update_count)
 		return -EAGAIN;
-	return 0;
-
-}
-
-/* Gets the shared memory region used to share audio data with the server. */
-static int config_shm(struct cras_audio_shm *shm, int shm_fd, size_t size)
-{
-	shm->area = (struct cras_audio_shm_area *)mmap(
-			NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-			shm_fd, 0);
-	if (shm->area == (struct cras_audio_shm_area *)-1) {
-		syslog(LOG_ERR,
-		       "cras_client: mmap failed to map shm for stream.");
-		return errno;
-	}
-	/* Copy server shm config locally. */
-	cras_shm_copy_shared_config(shm);
-
 	return 0;
 }
 
 /* Release shm areas if references to them are held. */
 static void free_shm(struct client_stream *stream)
 {
-	if (stream->capture_shm.area) {
-		munmap(stream->capture_shm.area, stream->capture_shm_size);
-	}
-	if (stream->play_shm.area) {
-		munmap(stream->play_shm.area, stream->play_shm_size);
-	}
-	stream->capture_shm.area = NULL;
-	stream->play_shm.area = NULL;
+	cras_audio_shm_destroy(stream->shm);
+	stream->shm = NULL;
 }
 
 /* Handles the stream connected message from the server.  Check if we need a
@@ -1396,11 +1381,12 @@ static int stream_connected(struct client_stream *stream,
 			    const struct cras_client_stream_connected *msg,
 			    const int stream_fds[2], const unsigned int num_fds)
 {
-	int rc;
+	int rc, i;
 	struct cras_audio_format mfmt;
+	struct cras_shm_info header_info, samples_info;
 
 	if (msg->err || num_fds != 2) {
-		syslog(LOG_ERR, "cras_client: Error Setting up stream %d\n",
+		syslog(LOG_ERR, "cras_client: Error setting up stream %d\n",
 		       msg->err);
 		rc = msg->err;
 		goto err_ret;
@@ -1408,32 +1394,25 @@ static int stream_connected(struct client_stream *stream,
 
 	unpack_cras_audio_format(&mfmt, &msg->format);
 
-	if (cras_stream_has_input(stream->direction)) {
-		rc = config_shm(&stream->capture_shm,
-				stream_fds[0],
-				msg->shm_max_size);
-		if (rc < 0) {
-			syslog(LOG_ERR,
-			       "cras_client: Error configuring capture shm");
-			goto err_ret;
-		}
-		stream->capture_shm_size = msg->shm_max_size;
+	rc = cras_shm_info_init_with_fd(stream_fds[0], cras_shm_header_size(),
+					&header_info);
+	if (rc < 0)
+		goto err_ret;
+
+	rc = cras_shm_info_init_with_fd(stream_fds[1], msg->samples_shm_size,
+					&samples_info);
+	if (rc < 0) {
+		cras_shm_info_cleanup(&header_info);
+		goto err_ret;
 	}
 
-	if (cras_stream_uses_output_hw(stream->direction)) {
-		rc = config_shm(&stream->play_shm,
-				stream_fds[1],
-				msg->shm_max_size);
-		if (rc < 0) {
-			syslog(LOG_ERR,
-			       "cras_client: Error configuring playback shm");
-			goto err_ret;
-		}
-		stream->play_shm_size = msg->shm_max_size;
-
-		cras_shm_set_volume_scaler(&stream->play_shm,
-					   stream->volume_scaler);
+	rc = cras_audio_shm_create(&header_info, &samples_info, &stream->shm);
+	if (rc < 0) {
+		syslog(LOG_ERR, "cras_client: Error configuring shm");
+		goto err_ret;
 	}
+	cras_shm_copy_shared_config(stream->shm);
+	cras_shm_set_volume_scaler(stream->shm, stream->volume_scaler);
 
 	stream->thread.state = CRAS_THREAD_RUNNING;
 	wake_aud_thread(stream);
@@ -1443,19 +1422,18 @@ static int stream_connected(struct client_stream *stream,
 	return 0;
 err_ret:
 	stop_aud_thread(stream, 1);
-	close(stream_fds[0]);
-	close(stream_fds[1]);
+	for (i = 0; i < num_fds; i++)
+		close(stream_fds[i]);
 	free_shm(stream);
 	return rc;
 }
 
 static int send_connect_message(struct cras_client *client,
-				struct client_stream *stream,
-				uint32_t dev_idx)
+				struct client_stream *stream, uint32_t dev_idx)
 {
 	int rc;
 	struct cras_connect_message serv_msg;
-	int sock[2] = {-1, -1};
+	int sock[2] = { -1, -1 };
 
 	/* Create a socket pair for the server to notify of audio events. */
 	rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sock);
@@ -1465,17 +1443,14 @@ static int send_connect_message(struct cras_client *client,
 		goto fail;
 	}
 
-	cras_fill_connect_message(&serv_msg,
-				  stream->config->direction,
-				  stream->id,
-				  stream->config->stream_type,
+	cras_fill_connect_message(&serv_msg, stream->config->direction,
+				  stream->id, stream->config->stream_type,
 				  stream->config->buffer_frames,
-				  stream->config->cb_threshold,
-				  stream->flags,
-				  stream->config->format,
-				  dev_idx);
+				  stream->config->cb_threshold, stream->flags,
+				  stream->config->effects,
+				  stream->config->format, dev_idx);
 	rc = cras_send_with_fds(client->server_fd, &serv_msg, sizeof(serv_msg),
-			       &sock[1], 1);
+				&sock[1], 1);
 	if (rc != sizeof(serv_msg)) {
 		rc = EIO;
 		syslog(LOG_ERR,
@@ -1509,10 +1484,10 @@ static int client_thread_add_stream(struct cras_client *client,
 
 	/* Find the hotword device index. */
 	if ((stream->flags & HOTWORD_STREAM) == HOTWORD_STREAM &&
-			dev_idx == NO_DEVICE) {
+	    dev_idx == NO_DEVICE) {
 		int hotword_idx;
-		hotword_idx = cras_client_get_first_dev_type_idx(client,
-				CRAS_NODE_TYPE_HOTWORD, CRAS_STREAM_INPUT);
+		hotword_idx = cras_client_get_first_dev_type_idx(
+			client, CRAS_NODE_TYPE_HOTWORD, CRAS_STREAM_INPUT);
 		if (hotword_idx < 0) {
 			syslog(LOG_ERR,
 			       "cras_client: add_stream: Finding hotword dev");
@@ -1557,8 +1532,7 @@ static int client_thread_rm_stream(struct cras_client *client,
 				   cras_stream_id_t stream_id)
 {
 	struct cras_disconnect_stream_message msg;
-	struct client_stream *stream =
-		stream_from_id(client, stream_id);
+	struct client_stream *stream = stream_from_id(client, stream_id);
 	int rc;
 
 	if (stream == NULL)
@@ -1588,7 +1562,7 @@ static int client_thread_rm_stream(struct cras_client *client,
 	return 0;
 }
 
-/* Sets the volume scaling factor for a playing stream. */
+/* Sets the volume scaling factor for a playback or capture stream. */
 static int client_thread_set_stream_volume(struct cras_client *client,
 					   cras_stream_id_t stream_id,
 					   float volume_scaler)
@@ -1600,8 +1574,8 @@ static int client_thread_set_stream_volume(struct cras_client *client,
 		return -EINVAL;
 
 	stream->volume_scaler = volume_scaler;
-	if (stream->play_shm.area != NULL)
-		cras_shm_set_volume_scaler(&stream->play_shm, volume_scaler);
+	if (stream->shm)
+		cras_shm_set_volume_scaler(stream->shm, volume_scaler);
 
 	return 0;
 }
@@ -1619,8 +1593,8 @@ static int client_attach_shm(struct cras_client *client, int shm_fd)
 	}
 
 	client->server_state = (struct cras_server_state *)mmap(
-			NULL, sizeof(*client->server_state),
-			PROT_READ, MAP_SHARED, shm_fd, 0);
+		NULL, sizeof(*client->server_state), PROT_READ, MAP_SHARED,
+		shm_fd, 0);
 	rc = -errno;
 	close(shm_fd);
 	if (client->server_state == (struct cras_server_state *)-1) {
@@ -1645,9 +1619,8 @@ error:
 	return rc;
 }
 
-static void cras_client_get_hotword_models_ready(
-		struct cras_client *client,
-		const char *hotword_models)
+static void cras_client_get_hotword_models_ready(struct cras_client *client,
+						 const char *hotword_models)
 {
 	if (!client->get_hotword_models_cb)
 		return;
@@ -1689,25 +1662,40 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_stream_connected *)msg;
 		struct client_stream *stream =
 			stream_from_id(client, cmsg->stream_id);
-		if (stream == NULL)
+		if (stream == NULL) {
+			if (num_fds != 2) {
+				syslog(LOG_ERR,
+				       "cras_client: Error receiving "
+				       "stream 0x%x connected message",
+				       cmsg->stream_id);
+				return -EINVAL;
+			}
+
+			/*
+			 * Usually, the fds should be closed in stream_connected
+			 * callback. However, sometimes a stream is removed
+			 * before it is connected.
+			 */
+			close(server_fds[0]);
+			close(server_fds[1]);
 			break;
+		}
 		rc = stream_connected(stream, cmsg, server_fds, num_fds);
 		if (rc < 0)
-			stream->config->err_cb(stream->client,
-					       stream->id,
-					       rc,
+			stream->config->err_cb(stream->client, stream->id, rc,
 					       stream->config->user_data);
 		break;
 	}
 	case CRAS_CLIENT_AUDIO_DEBUG_INFO_READY:
 		if (client->debug_info_callback)
 			client->debug_info_callback(client);
+		client->debug_info_callback = NULL;
 		break;
 	case CRAS_CLIENT_GET_HOTWORD_MODELS_READY: {
 		struct cras_client_get_hotword_models_ready *cmsg =
 			(struct cras_client_get_hotword_models_ready *)msg;
-		cras_client_get_hotword_models_ready(client,
-				(const char *)cmsg->hotword_models);
+		cras_client_get_hotword_models_ready(
+			client, (const char *)cmsg->hotword_models);
 		break;
 	}
 	case CRAS_CLIENT_OUTPUT_VOLUME_CHANGED: {
@@ -1715,8 +1703,7 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_volume_changed *)msg;
 		if (client->observer_ops.output_volume_changed)
 			client->observer_ops.output_volume_changed(
-					client->observer_context,
-					cmsg->volume);
+				client->observer_context, cmsg->volume);
 		break;
 	}
 	case CRAS_CLIENT_OUTPUT_MUTE_CHANGED: {
@@ -1724,10 +1711,8 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_mute_changed *)msg;
 		if (client->observer_ops.output_mute_changed)
 			client->observer_ops.output_mute_changed(
-					client->observer_context,
-					cmsg->muted,
-					cmsg->user_muted,
-					cmsg->mute_locked);
+				client->observer_context, cmsg->muted,
+				cmsg->user_muted, cmsg->mute_locked);
 		break;
 	}
 	case CRAS_CLIENT_CAPTURE_GAIN_CHANGED: {
@@ -1735,8 +1720,7 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_volume_changed *)msg;
 		if (client->observer_ops.capture_gain_changed)
 			client->observer_ops.capture_gain_changed(
-					client->observer_context,
-					cmsg->volume);
+				client->observer_context, cmsg->volume);
 		break;
 	}
 	case CRAS_CLIENT_CAPTURE_MUTE_CHANGED: {
@@ -1744,15 +1728,14 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_mute_changed *)msg;
 		if (client->observer_ops.capture_mute_changed)
 			client->observer_ops.capture_mute_changed(
-					client->observer_context,
-					cmsg->muted,
-					cmsg->mute_locked);
+				client->observer_context, cmsg->muted,
+				cmsg->mute_locked);
 		break;
 	}
 	case CRAS_CLIENT_NODES_CHANGED: {
 		if (client->observer_ops.nodes_changed)
 			client->observer_ops.nodes_changed(
-					client->observer_context);
+				client->observer_context);
 		break;
 	}
 	case CRAS_CLIENT_ACTIVE_NODE_CHANGED: {
@@ -1762,8 +1745,8 @@ static int handle_message_from_server(struct cras_client *client)
 			(enum CRAS_STREAM_DIRECTION)cmsg->direction;
 		if (client->observer_ops.active_node_changed)
 			client->observer_ops.active_node_changed(
-					client->observer_context,
-					direction, cmsg->node_id);
+				client->observer_context, direction,
+				cmsg->node_id);
 		break;
 	}
 	case CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED: {
@@ -1771,9 +1754,8 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_node_value_changed *)msg;
 		if (client->observer_ops.output_node_volume_changed)
 			client->observer_ops.output_node_volume_changed(
-					client->observer_context,
-					cmsg->node_id,
-					cmsg->value);
+				client->observer_context, cmsg->node_id,
+				cmsg->value);
 		break;
 	}
 	case CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED: {
@@ -1781,9 +1763,8 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_node_value_changed *)msg;
 		if (client->observer_ops.node_left_right_swapped_changed)
 			client->observer_ops.node_left_right_swapped_changed(
-					client->observer_context,
-					cmsg->node_id,
-					cmsg->value);
+				client->observer_context, cmsg->node_id,
+				cmsg->value);
 		break;
 	}
 	case CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED: {
@@ -1791,20 +1772,19 @@ static int handle_message_from_server(struct cras_client *client)
 			(struct cras_client_node_value_changed *)msg;
 		if (client->observer_ops.input_node_gain_changed)
 			client->observer_ops.input_node_gain_changed(
-					client->observer_context,
-					cmsg->node_id,
-					cmsg->value);
+				client->observer_context, cmsg->node_id,
+				cmsg->value);
 		break;
 	}
 	case CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED: {
 		struct cras_client_num_active_streams_changed *cmsg =
-		    (struct cras_client_num_active_streams_changed *)msg;
+			(struct cras_client_num_active_streams_changed *)msg;
 		enum CRAS_STREAM_DIRECTION direction =
 			(enum CRAS_STREAM_DIRECTION)cmsg->direction;
 		if (client->observer_ops.num_active_streams_changed)
 			client->observer_ops.num_active_streams_changed(
-					client->observer_context,
-					direction, cmsg->num_active_streams);
+				client->observer_context, direction,
+				cmsg->num_active_streams);
 		break;
 	}
 	default:
@@ -1815,8 +1795,7 @@ static int handle_message_from_server(struct cras_client *client)
 }
 
 /* Handles messages from streams to this client. */
-static int handle_stream_message(struct cras_client *client,
-				 int poll_revents)
+static int handle_stream_message(struct cras_client *client, int poll_revents)
 {
 	struct stream_msg msg;
 	int rc;
@@ -1835,8 +1814,7 @@ static int handle_stream_message(struct cras_client *client,
 }
 
 /* Handles messages from users to this client. */
-static int handle_command_message(struct cras_client *client,
-				  int poll_revents)
+static int handle_command_message(struct cras_client *client, int poll_revents)
 {
 	uint8_t buf[MAX_CMD_MSG_LEN];
 	struct command_msg *msg = (struct command_msg *)buf;
@@ -1862,7 +1840,7 @@ static int handle_command_message(struct cras_client *client,
 		struct client_stream *s;
 
 		/* Stop all playing streams */
-		DL_FOREACH(client->streams, s)
+		DL_FOREACH (client->streams, s)
 			client_thread_rm_stream(client, s->id);
 
 		/* And stop this client */
@@ -1873,8 +1851,7 @@ static int handle_command_message(struct cras_client *client,
 	case CLIENT_ADD_STREAM: {
 		struct add_stream_command_message *add_msg =
 			(struct add_stream_command_message *)msg;
-		rc = client_thread_add_stream(client,
-					      add_msg->stream,
+		rc = client_thread_add_stream(client, add_msg->stream,
 					      add_msg->stream_id_out,
 					      add_msg->dev_idx);
 		break;
@@ -1916,7 +1893,7 @@ static void *client_thread(void *arg)
 {
 	struct cras_client *client = (struct cras_client *)arg;
 	struct pollfd pollfds[4];
-	int (*cbs[4])(struct cras_client *client, int poll_revents);
+	int (*cbs[4])(struct cras_client * client, int poll_revents);
 	unsigned int num_pollfds, i;
 	int rc;
 
@@ -1933,8 +1910,7 @@ static void *client_thread(void *arg)
 			pollfds[num_pollfds].events = POLLIN;
 			pollfds[num_pollfds].revents = 0;
 			num_pollfds++;
-		}
-		else
+		} else
 			syslog(LOG_ERR, "file wait fd: %d", rc);
 		if (client->server_fd >= 0) {
 			cbs[num_pollfds] = server_fd_dispatch;
@@ -1999,8 +1975,7 @@ static int send_command_message(struct cras_client *client,
 
 /* Send a simple message to the client thread that holds no data. */
 static int send_simple_cmd_msg(struct cras_client *client,
-			       cras_stream_id_t stream_id,
-			       unsigned msg_id)
+			       cras_stream_id_t stream_id, unsigned msg_id)
 {
 	struct command_msg msg;
 
@@ -2101,7 +2076,7 @@ int cras_client_create(struct cras_client **client)
 		goto free_lock;
 	}
 
-	(*client)->server_event_fd = eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK);
+	(*client)->server_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if ((*client)->server_event_fd < 0) {
 		syslog(LOG_ERR, "cras_client: Could not setup server eventfd.");
 		rc = -errno;
@@ -2114,8 +2089,8 @@ int cras_client_create(struct cras_client **client)
 		rc = -ENOMEM;
 		goto free_error;
 	}
-	snprintf((char *)(*client)->sock_file, sock_file_size, "%s/%s", sock_dir,
-		 CRAS_SOCKET_FILE);
+	snprintf((char *)(*client)->sock_file, sock_file_size, "%s/%s",
+		 sock_dir, CRAS_SOCKET_FILE);
 
 	rc = cras_file_wait_create((*client)->sock_file,
 				   CRAS_FILE_WAIT_FLAG_NONE,
@@ -2172,6 +2147,7 @@ void cras_client_destroy(struct cras_client *client)
 	client->server_err_cb = NULL;
 	cras_client_stop(client);
 	server_disconnect(client);
+	close(client->server_event_fd);
 	close(client->command_fds[0]);
 	close(client->command_fds[1]);
 	close(client->stream_fds[0]);
@@ -2204,16 +2180,10 @@ int cras_client_connect_async(struct cras_client *client)
 }
 
 struct cras_stream_params *cras_client_stream_params_create(
-		enum CRAS_STREAM_DIRECTION direction,
-		size_t buffer_frames,
-		size_t cb_threshold,
-		size_t unused,
-		enum CRAS_STREAM_TYPE stream_type,
-		uint32_t flags,
-		void *user_data,
-		cras_playback_cb_t aud_cb,
-		cras_error_cb_t err_cb,
-		struct cras_audio_format *format)
+	enum CRAS_STREAM_DIRECTION direction, size_t buffer_frames,
+	size_t cb_threshold, size_t unused, enum CRAS_STREAM_TYPE stream_type,
+	uint32_t flags, void *user_data, cras_playback_cb_t aud_cb,
+	cras_error_cb_t err_cb, struct cras_audio_format *format)
 {
 	struct cras_stream_params *params;
 
@@ -2224,7 +2194,7 @@ struct cras_stream_params *cras_client_stream_params_create(
 	params->direction = direction;
 	params->buffer_frames = buffer_frames;
 	params->cb_threshold = cb_threshold;
-
+	params->effects = 0;
 	params->stream_type = stream_type;
 	params->flags = flags;
 	params->user_data = user_data;
@@ -2235,15 +2205,51 @@ struct cras_stream_params *cras_client_stream_params_create(
 	return params;
 }
 
+void cras_client_stream_params_enable_aec(struct cras_stream_params *params)
+{
+	params->effects |= APM_ECHO_CANCELLATION;
+}
+
+void cras_client_stream_params_disable_aec(struct cras_stream_params *params)
+{
+	params->effects &= ~APM_ECHO_CANCELLATION;
+}
+
+void cras_client_stream_params_enable_ns(struct cras_stream_params *params)
+{
+	params->effects |= APM_NOISE_SUPRESSION;
+}
+
+void cras_client_stream_params_disable_ns(struct cras_stream_params *params)
+{
+	params->effects &= ~APM_NOISE_SUPRESSION;
+}
+
+void cras_client_stream_params_enable_agc(struct cras_stream_params *params)
+{
+	params->effects |= APM_GAIN_CONTROL;
+}
+
+void cras_client_stream_params_disable_agc(struct cras_stream_params *params)
+{
+	params->effects &= ~APM_GAIN_CONTROL;
+}
+
+void cras_client_stream_params_enable_vad(struct cras_stream_params *params)
+{
+	params->effects |= APM_VOICE_DETECTION;
+}
+
+void cras_client_stream_params_disable_vad(struct cras_stream_params *params)
+{
+	params->effects &= ~APM_VOICE_DETECTION;
+}
+
 struct cras_stream_params *cras_client_unified_params_create(
-		enum CRAS_STREAM_DIRECTION direction,
-		unsigned int block_size,
-		enum CRAS_STREAM_TYPE stream_type,
-		uint32_t flags,
-		void *user_data,
-		cras_unified_cb_t unified_cb,
-		cras_error_cb_t err_cb,
-		struct cras_audio_format *format)
+	enum CRAS_STREAM_DIRECTION direction, unsigned int block_size,
+	enum CRAS_STREAM_TYPE stream_type, uint32_t flags, void *user_data,
+	cras_unified_cb_t unified_cb, cras_error_cb_t err_cb,
+	struct cras_audio_format *format)
 {
 	struct cras_stream_params *params;
 
@@ -2256,6 +2262,7 @@ struct cras_stream_params *cras_client_unified_params_create(
 	params->cb_threshold = block_size;
 	params->stream_type = stream_type;
 	params->flags = flags;
+	params->effects = 0;
 	params->user_data = user_data;
 	params->aud_cb = 0;
 	params->unified_cb = unified_cb;
@@ -2271,10 +2278,8 @@ void cras_client_stream_params_destroy(struct cras_stream_params *params)
 }
 
 static inline int cras_client_send_add_stream_command_message(
-		struct cras_client *client,
-		uint32_t dev_idx,
-		cras_stream_id_t *stream_id_out,
-		struct cras_stream_params *config)
+	struct cras_client *client, uint32_t dev_idx,
+	cras_stream_id_t *stream_id_out, struct cras_stream_params *config)
 {
 	struct add_stream_command_message cmd_msg;
 	struct client_stream *stream;
@@ -2294,8 +2299,8 @@ static inline int cras_client_send_add_stream_command_message(
 		rc = -ENOMEM;
 		goto add_failed;
 	}
-	stream->config = (struct cras_stream_params *)
-			malloc(sizeof(*(stream->config)));
+	stream->config =
+		(struct cras_stream_params *)malloc(sizeof(*(stream->config)));
 	if (stream->config == NULL) {
 		rc = -ENOMEM;
 		goto add_failed;
@@ -2305,8 +2310,11 @@ static inline int cras_client_send_add_stream_command_message(
 	stream->wake_fds[0] = -1;
 	stream->wake_fds[1] = -1;
 	stream->direction = config->direction;
-	stream->volume_scaler = 1.0;
 	stream->flags = config->flags;
+
+	/* Caller might not set this volume scaler after stream created,
+	 * so always initialize it to 1.0f */
+	stream->volume_scaler = 1.0f;
 
 	cmd_msg.header.len = sizeof(cmd_msg);
 	cmd_msg.header.msg_id = CLIENT_ADD_STREAM;
@@ -2337,22 +2345,15 @@ int cras_client_add_stream(struct cras_client *client,
 			   struct cras_stream_params *config)
 {
 	return cras_client_send_add_stream_command_message(
-			client,
-			NO_DEVICE,
-			stream_id_out,
-			config);
+		client, NO_DEVICE, stream_id_out, config);
 }
 
-int cras_client_add_pinned_stream(struct cras_client *client,
-				  uint32_t dev_idx,
+int cras_client_add_pinned_stream(struct cras_client *client, uint32_t dev_idx,
 				  cras_stream_id_t *stream_id_out,
 				  struct cras_stream_params *config)
 {
 	return cras_client_send_add_stream_command_message(
-			client,
-			dev_idx,
-			stream_id_out,
-			config);
+		client, dev_idx, stream_id_out, config);
 }
 
 int cras_client_rm_stream(struct cras_client *client,
@@ -2578,8 +2579,8 @@ long cras_client_get_system_max_capture_gain(const struct cras_client *client)
 	return max_gain;
 }
 
-const struct audio_debug_info *cras_client_get_audio_debug_info(
-		const struct cras_client *client)
+const struct audio_debug_info *
+cras_client_get_audio_debug_info(const struct cras_client *client)
 {
 	const struct audio_debug_info *debug_info;
 	int lock_rc;
@@ -2591,6 +2592,36 @@ const struct audio_debug_info *cras_client_get_audio_debug_info(
 	debug_info = &client->server_state->audio_debug_info;
 	server_state_unlock(client, lock_rc);
 	return debug_info;
+}
+
+const struct cras_bt_debug_info *
+cras_client_get_bt_debug_info(const struct cras_client *client)
+{
+	const struct cras_bt_debug_info *debug_info;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return 0;
+
+	debug_info = &client->server_state->bt_debug_info;
+	server_state_unlock(client, lock_rc);
+	return debug_info;
+}
+
+const struct cras_audio_thread_snapshot_buffer *
+cras_client_get_audio_thread_snapshot_buffer(const struct cras_client *client)
+{
+	const struct cras_audio_thread_snapshot_buffer *snapshot_buffer;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return 0;
+
+	snapshot_buffer = &client->server_state->snapshot_buffer;
+	server_state_unlock(client, lock_rc);
+	return snapshot_buffer;
 }
 
 unsigned cras_client_get_num_active_streams(const struct cras_client *client,
@@ -2612,7 +2643,8 @@ read_active_streams_again:
 		if (num_streams)
 			clock_gettime(CLOCK_MONOTONIC_RAW, ts);
 		else
-			cras_timespec_to_timespec(ts,
+			cras_timespec_to_timespec(
+				ts,
 				&client->server_state->last_active_stream_time);
 	}
 	if (end_server_state_read(client->server_state, version))
@@ -2673,9 +2705,8 @@ void cras_client_set_server_error_cb(struct cras_client *client,
 }
 
 void cras_client_set_connection_status_cb(
-		struct cras_client *client,
-		cras_connection_status_cb_t connection_cb,
-		void *user_arg)
+	struct cras_client *client, cras_connection_status_cb_t connection_cb,
+	void *user_arg)
 {
 	client->server_connection_cb = connection_cb;
 	client->server_connection_user_arg = user_arg;
@@ -2796,13 +2827,13 @@ static int cras_client_find_output_node(const struct cras_client *client,
 	if (!client || !dev_name || !node_name)
 		goto quit;
 
-	devs = (struct cras_iodev_info *)
-			malloc(CRAS_MAX_IODEVS * sizeof(*devs));
+	devs = (struct cras_iodev_info *)malloc(CRAS_MAX_IODEVS *
+						sizeof(*devs));
 	if (!devs)
 		goto quit;
 
-	nodes = (struct cras_ionode_info *)
-			malloc(CRAS_MAX_IONODES * sizeof(*nodes));
+	nodes = (struct cras_ionode_info *)malloc(CRAS_MAX_IONODES *
+						  sizeof(*nodes));
 	if (!nodes)
 		goto quit;
 
@@ -2838,10 +2869,9 @@ quit:
 	return rc;
 }
 
-int cras_client_get_node_by_id(const struct cras_client *client,
-			       int input,
+int cras_client_get_node_by_id(const struct cras_client *client, int input,
 			       const cras_node_id_t node_id,
-			       struct cras_ionode_info* node_info)
+			       struct cras_ionode_info *node_info)
 {
 	size_t ndevs, nnodes;
 	struct cras_iodev_info *devs = NULL;
@@ -2854,15 +2884,15 @@ int cras_client_get_node_by_id(const struct cras_client *client,
 		goto quit;
 	}
 
-	devs = (struct cras_iodev_info *)
-			malloc(CRAS_MAX_IODEVS * sizeof(*devs));
+	devs = (struct cras_iodev_info *)malloc(CRAS_MAX_IODEVS *
+						sizeof(*devs));
 	if (!devs) {
 		rc = -ENOMEM;
 		goto quit;
 	}
 
-	nodes = (struct cras_ionode_info *)
-			malloc(CRAS_MAX_IONODES * sizeof(*nodes));
+	nodes = (struct cras_ionode_info *)malloc(CRAS_MAX_IONODES *
+						  sizeof(*nodes));
 	if (!nodes) {
 		rc = -ENOMEM;
 		goto quit;
@@ -2871,11 +2901,11 @@ int cras_client_get_node_by_id(const struct cras_client *client,
 	ndevs = CRAS_MAX_IODEVS;
 	nnodes = CRAS_MAX_IONODES;
 	if (input)
-		rc = cras_client_get_input_devices(client, devs, nodes,
-						&ndevs, &nnodes);
+		rc = cras_client_get_input_devices(client, devs, nodes, &ndevs,
+						   &nnodes);
 	else
-		rc = cras_client_get_output_devices(client, devs, nodes,
-						&ndevs, &nnodes);
+		rc = cras_client_get_output_devices(client, devs, nodes, &ndevs,
+						    &nnodes);
 	if (rc < 0)
 		goto quit;
 
@@ -2909,8 +2939,8 @@ int cras_client_output_dev_plugged(const struct cras_client *client,
 }
 
 int cras_client_set_node_attr(struct cras_client *client,
-			      cras_node_id_t node_id,
-			      enum ionode_attr attr, int value)
+			      cras_node_id_t node_id, enum ionode_attr attr,
+			      int value)
 {
 	struct cras_set_node_attr msg;
 
@@ -3021,23 +3051,55 @@ int cras_client_dump_dsp_info(struct cras_client *client)
 }
 
 int cras_client_update_audio_debug_info(
-	struct cras_client *client,
-	void (*debug_info_cb)(struct cras_client *))
+	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
 {
 	struct cras_dump_audio_thread msg;
 
 	if (client == NULL)
 		return -EINVAL;
 
+	if (client->debug_info_callback != NULL)
+		return -EINVAL;
 	client->debug_info_callback = debug_info_cb;
 
 	cras_fill_dump_audio_thread(&msg);
 	return write_message_to_server(client, &msg.header);
 }
 
+int cras_client_update_bt_debug_info(
+	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
+{
+	struct cras_dump_bt msg;
+
+	if (client == NULL)
+		return -EINVAL;
+
+	if (client->debug_info_callback != NULL)
+		return -EINVAL;
+	client->debug_info_callback = debug_info_cb;
+
+	cras_fill_dump_bt(&msg);
+	return write_message_to_server(client, &msg.header);
+}
+
+int cras_client_update_audio_thread_snapshots(
+	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
+{
+	struct cras_dump_snapshots msg;
+
+	if (client == NULL)
+		return -EINVAL;
+
+	if (client->debug_info_callback != NULL)
+		return -EINVAL;
+	client->debug_info_callback = debug_info_cb;
+
+	cras_fill_dump_snapshots(&msg);
+	return write_message_to_server(client, &msg.header);
+}
+
 int cras_client_set_node_volume(struct cras_client *client,
-				cras_node_id_t node_id,
-				uint8_t volume)
+				cras_node_id_t node_id, uint8_t volume)
 {
 	struct cras_set_node_attr msg;
 
@@ -3049,7 +3111,7 @@ int cras_client_set_node_volume(struct cras_client *client,
 }
 
 int cras_client_swap_node_left_right(struct cras_client *client,
-					cras_node_id_t node_id, int enable)
+				     cras_node_id_t node_id, int enable)
 {
 	struct cras_set_node_attr msg;
 
@@ -3062,8 +3124,7 @@ int cras_client_swap_node_left_right(struct cras_client *client,
 }
 
 int cras_client_set_node_capture_gain(struct cras_client *client,
-				      cras_node_id_t node_id,
-				      long gain)
+				      cras_node_id_t node_id, long gain)
 {
 	struct cras_set_node_attr msg;
 
@@ -3088,8 +3149,7 @@ int cras_client_add_test_iodev(struct cras_client *client,
 int cras_client_test_iodev_command(struct cras_client *client,
 				   unsigned int iodev_idx,
 				   enum CRAS_TEST_IODEV_CMD command,
-				   unsigned int data_len,
-				   const uint8_t *data)
+				   unsigned int data_len, const uint8_t *data)
 {
 	struct cras_test_dev_command *msg;
 	int rc;
@@ -3102,26 +3162,25 @@ int cras_client_test_iodev_command(struct cras_client *client,
 }
 
 int cras_client_config_global_remix(struct cras_client *client,
-				    unsigned num_channels,
-				    float *coefficient)
+				    unsigned num_channels, float *coefficient)
 {
 	struct cras_config_global_remix *msg;
 	int rc;
 
-	msg = (struct cras_config_global_remix *)malloc(sizeof(*msg) +
-			num_channels * num_channels * sizeof(*coefficient));
-	cras_fill_config_global_remix_command(msg, num_channels,
-					      coefficient,
+	msg = (struct cras_config_global_remix *)malloc(
+		sizeof(*msg) +
+		num_channels * num_channels * sizeof(*coefficient));
+	cras_fill_config_global_remix_command(msg, num_channels, coefficient,
 					      num_channels * num_channels);
 	rc = write_message_to_server(client, &msg->header);
 	free(msg);
 	return rc;
 }
 
-/* Return the index of the device used for listening to hotwords. */
-int cras_client_get_first_dev_type_idx(const struct cras_client *client,
-				       enum CRAS_NODE_TYPE type,
-				       enum CRAS_STREAM_DIRECTION direction)
+int cras_client_get_first_node_type_idx(const struct cras_client *client,
+					enum CRAS_NODE_TYPE type,
+					enum CRAS_STREAM_DIRECTION direction,
+					cras_node_id_t *node_id)
 {
 	const struct cras_server_state *state;
 	unsigned int version;
@@ -3146,9 +3205,10 @@ read_nodes_again:
 	}
 	for (i = 0; i < num_nodes; i++) {
 		if ((enum CRAS_NODE_TYPE)node_list[i].type_enum == type) {
-			int ret_idx = node_list[i].iodev_idx;
+			*node_id = cras_make_node_id(node_list[i].iodev_idx,
+						     node_list[i].ionode_idx);
 			server_state_unlock(client, lock_rc);
-			return ret_idx;
+			return 0;
 		}
 	}
 	if (end_server_state_read(state, version))
@@ -3156,6 +3216,21 @@ read_nodes_again:
 	server_state_unlock(client, lock_rc);
 
 	return -ENODEV;
+}
+
+int cras_client_get_first_dev_type_idx(const struct cras_client *client,
+				       enum CRAS_NODE_TYPE type,
+				       enum CRAS_STREAM_DIRECTION direction)
+{
+	cras_node_id_t node_id;
+	int rc;
+
+	rc = cras_client_get_first_node_type_idx(client, type, direction,
+						 &node_id);
+	if (rc)
+		return rc;
+
+	return dev_index_of(node_id);
 }
 
 int cras_client_set_suspend(struct cras_client *client, int suspend)
@@ -3167,8 +3242,8 @@ int cras_client_set_suspend(struct cras_client *client, int suspend)
 }
 
 int cras_client_get_hotword_models(struct cras_client *client,
-				     cras_node_id_t node_id,
-				     get_hotword_models_cb_t cb)
+				   cras_node_id_t node_id,
+				   get_hotword_models_cb_t cb)
 {
 	struct cras_get_hotword_models msg;
 
@@ -3190,8 +3265,66 @@ int cras_client_set_hotword_model(struct cras_client *client,
 	return write_message_to_server(client, &msg.header);
 }
 
-void cras_client_set_state_change_callback_context(
-		struct cras_client *client, void *context)
+int cras_client_set_aec_dump(struct cras_client *client,
+			     cras_stream_id_t stream_id, int start, int fd)
+{
+	struct cras_set_aec_dump msg;
+
+	cras_fill_set_aec_dump_message(&msg, stream_id, start);
+
+	if (fd != -1)
+		return cras_send_with_fds(client->server_fd, &msg, sizeof(msg),
+					  &fd, 1);
+	else
+		return write_message_to_server(client, &msg.header);
+}
+
+int cras_client_reload_aec_config(struct cras_client *client)
+{
+	struct cras_reload_aec_config msg;
+
+	cras_fill_reload_aec_config(&msg);
+	return write_message_to_server(client, &msg.header);
+}
+
+int cras_client_get_aec_supported(struct cras_client *client)
+{
+	int aec_supported;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return 0;
+
+	aec_supported = client->server_state->aec_supported;
+	server_state_unlock(client, lock_rc);
+	return aec_supported;
+}
+
+int cras_client_get_aec_group_id(struct cras_client *client)
+{
+	int aec_group_id;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return -1;
+
+	aec_group_id = client->server_state->aec_group_id;
+	server_state_unlock(client, lock_rc);
+	return aec_group_id;
+}
+
+int cras_client_set_bt_wbs_enabled(struct cras_client * client, bool enabled)
+{
+	struct cras_set_bt_wbs_enabled msg;
+
+	cras_fill_set_bt_wbs_enabled(&msg, enabled);
+	return write_message_to_server(client, &msg.header);
+}
+
+void cras_client_set_state_change_callback_context(struct cras_client *client,
+						   void *context)
 {
 	if (!client)
 		return;
@@ -3216,113 +3349,111 @@ static int cras_send_register_notification(struct cras_client *client,
 }
 
 int cras_client_set_output_volume_changed_callback(
-		struct cras_client *client,
-		cras_client_output_volume_changed_callback cb)
+	struct cras_client *client,
+	cras_client_output_volume_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.output_volume_changed = cb;
 	return cras_send_register_notification(
-			client, CRAS_CLIENT_OUTPUT_VOLUME_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_OUTPUT_VOLUME_CHANGED, cb != NULL);
 }
 
 int cras_client_set_output_mute_changed_callback(
-		struct cras_client *client,
-		cras_client_output_mute_changed_callback cb)
+	struct cras_client *client, cras_client_output_mute_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.output_mute_changed = cb;
 	return cras_send_register_notification(
-			client, CRAS_CLIENT_OUTPUT_MUTE_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_OUTPUT_MUTE_CHANGED, cb != NULL);
 }
 
 int cras_client_set_capture_gain_changed_callback(
-		struct cras_client *client,
-		cras_client_capture_gain_changed_callback cb)
+	struct cras_client *client,
+	cras_client_capture_gain_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.capture_gain_changed = cb;
 	return cras_send_register_notification(
-			client, CRAS_CLIENT_CAPTURE_GAIN_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_CAPTURE_GAIN_CHANGED, cb != NULL);
 }
 
 int cras_client_set_capture_mute_changed_callback(
-		struct cras_client *client,
-		cras_client_capture_mute_changed_callback cb)
+	struct cras_client *client,
+	cras_client_capture_mute_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.capture_mute_changed = cb;
 	return cras_send_register_notification(
-			client, CRAS_CLIENT_CAPTURE_MUTE_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_CAPTURE_MUTE_CHANGED, cb != NULL);
 }
 
 int cras_client_set_nodes_changed_callback(
-		struct cras_client *client,
-		cras_client_nodes_changed_callback cb)
+	struct cras_client *client, cras_client_nodes_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.nodes_changed = cb;
 	return cras_send_register_notification(
-			client, CRAS_CLIENT_NODES_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_NODES_CHANGED, cb != NULL);
 }
 
 int cras_client_set_active_node_changed_callback(
-		struct cras_client *client,
-		cras_client_active_node_changed_callback cb)
+	struct cras_client *client, cras_client_active_node_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.active_node_changed = cb;
 	return cras_send_register_notification(
-		   client, CRAS_CLIENT_ACTIVE_NODE_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_ACTIVE_NODE_CHANGED, cb != NULL);
 }
 
 int cras_client_set_output_node_volume_changed_callback(
-		struct cras_client *client,
-		cras_client_output_node_volume_changed_callback cb)
+	struct cras_client *client,
+	cras_client_output_node_volume_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.output_node_volume_changed = cb;
 	return cras_send_register_notification(
-		    client, CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_OUTPUT_NODE_VOLUME_CHANGED, cb != NULL);
 }
 
 int cras_client_set_node_left_right_swapped_changed_callback(
-		struct cras_client *client,
-		cras_client_node_left_right_swapped_changed_callback cb)
+	struct cras_client *client,
+	cras_client_node_left_right_swapped_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.node_left_right_swapped_changed = cb;
 	return cras_send_register_notification(
-	       client, CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_NODE_LEFT_RIGHT_SWAPPED_CHANGED,
+		cb != NULL);
 }
 
 int cras_client_set_input_node_gain_changed_callback(
-		struct cras_client *client,
-		cras_client_input_node_gain_changed_callback cb)
+	struct cras_client *client,
+	cras_client_input_node_gain_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.input_node_gain_changed = cb;
 	return cras_send_register_notification(
-		       client, CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_INPUT_NODE_GAIN_CHANGED, cb != NULL);
 }
 
 int cras_client_set_num_active_streams_changed_callback(
-		struct cras_client *client,
-		cras_client_num_active_streams_changed_callback cb)
+	struct cras_client *client,
+	cras_client_num_active_streams_changed_callback cb)
 {
 	if (!client)
 		return -EINVAL;
 	client->observer_ops.num_active_streams_changed = cb;
 	return cras_send_register_notification(
-	      client, CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED, cb != NULL);
+		client, CRAS_CLIENT_NUM_ACTIVE_STREAMS_CHANGED, cb != NULL);
 }
 
 static int reregister_notifications(struct cras_client *client)
@@ -3331,72 +3462,160 @@ static int reregister_notifications(struct cras_client *client)
 
 	if (client->observer_ops.output_volume_changed) {
 		rc = cras_client_set_output_volume_changed_callback(
-				client,
-				client->observer_ops.output_volume_changed);
+			client, client->observer_ops.output_volume_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.output_mute_changed) {
 		rc = cras_client_set_output_mute_changed_callback(
-				client,
-				client->observer_ops.output_mute_changed);
+			client, client->observer_ops.output_mute_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.capture_gain_changed) {
 		rc = cras_client_set_capture_gain_changed_callback(
-				client,
-				client->observer_ops.capture_gain_changed);
+			client, client->observer_ops.capture_gain_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.capture_mute_changed) {
 		rc = cras_client_set_capture_mute_changed_callback(
-				client,
-				client->observer_ops.capture_mute_changed);
+			client, client->observer_ops.capture_mute_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.nodes_changed) {
 		rc = cras_client_set_nodes_changed_callback(
-				client, client->observer_ops.nodes_changed);
+			client, client->observer_ops.nodes_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.active_node_changed) {
 		rc = cras_client_set_active_node_changed_callback(
-				client,
-				client->observer_ops.active_node_changed);
+			client, client->observer_ops.active_node_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.output_node_volume_changed) {
 		rc = cras_client_set_output_node_volume_changed_callback(
-			    client,
-			    client->observer_ops.output_node_volume_changed);
+			client,
+			client->observer_ops.output_node_volume_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.node_left_right_swapped_changed) {
 		rc = cras_client_set_node_left_right_swapped_changed_callback(
-			  client,
-			  client->observer_ops.node_left_right_swapped_changed);
+			client,
+			client->observer_ops.node_left_right_swapped_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.input_node_gain_changed) {
 		rc = cras_client_set_input_node_gain_changed_callback(
-				client,
-				client->observer_ops.input_node_gain_changed);
+			client, client->observer_ops.input_node_gain_changed);
 		if (rc != 0)
 			return rc;
 	}
 	if (client->observer_ops.num_active_streams_changed) {
 		rc = cras_client_set_num_active_streams_changed_callback(
-			       client,
-			       client->observer_ops.num_active_streams_changed);
+			client,
+			client->observer_ops.num_active_streams_changed);
 		if (rc != 0)
 			return rc;
 	}
+	return 0;
+}
+
+static int hotword_read_cb(struct cras_client *client,
+			   cras_stream_id_t stream_id,
+			   uint8_t *captured_samples, uint8_t *playback_samples,
+			   unsigned int frames,
+			   const struct timespec *captured_time,
+			   const struct timespec *playback_time, void *user_arg)
+{
+	struct cras_hotword_handle *handle;
+
+	handle = (struct cras_hotword_handle *)user_arg;
+	if (handle->trigger_cb)
+		handle->trigger_cb(client, handle, handle->user_data);
+
+	return 0;
+}
+
+static int hotword_err_cb(struct cras_client *client,
+			  cras_stream_id_t stream_id, int error, void *user_arg)
+{
+	struct cras_hotword_handle *handle;
+
+	handle = (struct cras_hotword_handle *)user_arg;
+	if (handle->err_cb)
+		handle->err_cb(client, handle, error, handle->user_data);
+
+	return 0;
+}
+
+int cras_client_enable_hotword_callback(struct cras_client *client,
+					void *user_data,
+					cras_hotword_trigger_cb_t trigger_cb,
+					cras_hotword_error_cb_t err_cb,
+					struct cras_hotword_handle **handle_out)
+{
+	struct cras_hotword_handle *handle;
+	int ret = 0;
+
+	if (!client)
+		return -EINVAL;
+
+	handle = (struct cras_hotword_handle *)calloc(1, sizeof(*handle));
+	if (!handle)
+		return -ENOMEM;
+
+	handle->format = cras_audio_format_create(SND_PCM_FORMAT_S16_LE,
+						  HOTWORD_FRAME_RATE, 1);
+	if (!handle->format) {
+		ret = -ENOMEM;
+		goto cleanup;
+	}
+
+	handle->params = cras_client_unified_params_create(
+		CRAS_STREAM_INPUT, HOTWORD_BLOCK_SIZE, CRAS_STREAM_TYPE_DEFAULT,
+		HOTWORD_STREAM | TRIGGER_ONLY, (void *)handle, hotword_read_cb,
+		hotword_err_cb, handle->format);
+	if (!handle->params) {
+		ret = -ENOMEM;
+		goto cleanup_format;
+	}
+
+	handle->trigger_cb = trigger_cb;
+	handle->err_cb = err_cb;
+	handle->user_data = user_data;
+
+	ret = cras_client_add_stream(client, &handle->stream_id,
+				     handle->params);
+	if (ret)
+		goto cleanup_params;
+
+	*handle_out = handle;
+	return 0;
+
+cleanup_params:
+	cras_client_stream_params_destroy(handle->params);
+cleanup_format:
+	cras_audio_format_destroy(handle->format);
+cleanup:
+	free(handle);
+	return ret;
+}
+
+int cras_client_disable_hotword_callback(struct cras_client *client,
+					 struct cras_hotword_handle *handle)
+{
+	if (!client || !handle)
+		return -EINVAL;
+
+	cras_client_rm_stream(client, handle->stream_id);
+	cras_audio_format_destroy(handle->format);
+	cras_client_stream_params_destroy(handle->params);
+	free(handle);
 	return 0;
 }

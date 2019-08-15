@@ -11,12 +11,15 @@
 #include "cras_a2dp_endpoint.h"
 #include "cras_bt_adapter.h"
 #include "cras_bt_constants.h"
+#include "cras_bt_log.h"
 #include "cras_bt_profile.h"
 #include "cras_hfp_ag_profile.h"
 #include "cras_hfp_info.h"
 #include "cras_hfp_iodev.h"
-#include "cras_hfp_slc.h"
+#include "cras_hfp_alsa_iodev.h"
+#include "cras_server_metrics.h"
 #include "cras_system_state.h"
+#include "cras_iodev_list.h"
 #include "utlist.h"
 
 #define STR(s) #s
@@ -97,14 +100,28 @@ struct audio_gateway {
 
 static struct audio_gateway *connected_ags;
 
+static int need_go_sco_pcm(struct cras_bt_device *device)
+{
+	return cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_INPUT) ||
+	       cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_OUTPUT);
+}
+
 static void destroy_audio_gateway(struct audio_gateway *ag)
 {
 	DL_DELETE(connected_ags, ag);
 
-	if (ag->idev)
-		hfp_iodev_destroy(ag->idev);
-	if (ag->odev)
-		hfp_iodev_destroy(ag->odev);
+	if (need_go_sco_pcm(ag->device)) {
+		if (ag->idev)
+			hfp_alsa_iodev_destroy(ag->idev);
+		if (ag->odev)
+			hfp_alsa_iodev_destroy(ag->odev);
+	} else {
+		if (ag->idev)
+			hfp_iodev_destroy(ag->idev);
+		if (ag->odev)
+			hfp_iodev_destroy(ag->odev);
+	}
+
 	if (ag->info) {
 		if (hfp_info_running(ag->info))
 			hfp_info_stop(ag->info);
@@ -145,6 +162,12 @@ static int cras_hfp_ag_slc_initialized(struct hfp_slc_handle *handle)
 	DL_SEARCH_SCALAR(connected_ags, ag, slc_handle, handle);
 	if (!ag)
 		return -EINVAL;
+
+	/* Log if the hands-free device supports WBS or not. Assuming the
+	 * codec negotiation feature means the WBS capability on headset.
+	 */
+	cras_server_metrics_hfp_wideband_support(
+			hfp_slc_get_hf_codec_negotiation_supported(handle));
 
 	/* Defer the starting of audio gateway to bt_device. */
 	return cras_bt_device_audio_gateway_initialized(ag->device);
@@ -216,6 +239,9 @@ static int cras_hfp_ag_new_connection(DBusConnection *conn,
 				       int rfcomm_fd)
 {
 	struct audio_gateway *ag;
+	int ag_features;
+
+	BTLOG(btlog, BT_HFP_NEW_CONNECTION, 0, 0);
 
 	if (has_audio_gateway(device)) {
 		syslog(LOG_ERR, "Audio gateway exists when %s connects for profile %s",
@@ -232,8 +258,19 @@ static int cras_hfp_ag_new_connection(DBusConnection *conn,
 	ag->device = device;
 	ag->conn = conn;
 	ag->profile = cras_bt_device_profile_from_uuid(profile->uuid);
+
+	/*
+	 * If the WBS enabled flag is set, add codec negotiation feature.
+	 * TODO(hychao): replace this check by query bluetooth stack whether
+	 * controller supports WBS feature.
+	 */
+	ag_features = profile->features;
+	if (cras_system_get_bt_wbs_enabled())
+		ag_features |= AG_CODEC_NEGOTIATION;
+
 	ag->slc_handle = hfp_slc_create(rfcomm_fd,
 					0,
+					ag_features,
 					device,
 					cras_hfp_ag_slc_initialized,
 					cras_hfp_ag_slc_disconnected);
@@ -245,6 +282,9 @@ static void cras_hfp_ag_request_disconnection(struct cras_bt_profile *profile,
 					      struct cras_bt_device *device)
 {
 	struct audio_gateway *ag;
+
+	BTLOG(btlog, BT_HFP_REQUEST_DISCONNECT, 0, 0);
+
 	DL_FOREACH(connected_ags, ag) {
 		if (ag->slc_handle && ag->device == device)
 			destroy_audio_gateway(ag);
@@ -261,7 +301,7 @@ static struct cras_bt_profile cras_hfp_ag_profile = {
 	.uuid = HFP_AG_UUID,
 	.version = HFP_VERSION_1_5,
 	.role = NULL,
-	.features = HFP_SUPPORTED_FEATURE & 0x1F,
+	.features = CRAS_AG_SUPPORTED_FEATURES & 0x1F,
 	.record = NULL,
 	.release = cras_hfp_ag_release,
 	.new_connection = cras_hfp_ag_new_connection,
@@ -281,6 +321,8 @@ static int cras_hsp_ag_new_connection(DBusConnection *conn,
 {
 	struct audio_gateway *ag;
 
+	BTLOG(btlog, BT_HSP_NEW_CONNECTION, 0, 0);
+
 	if (has_audio_gateway(device)) {
 		syslog(LOG_ERR, "Audio gateway exists when %s connects for profile %s",
 			cras_bt_device_name(device), profile->name);
@@ -296,11 +338,28 @@ static int cras_hsp_ag_new_connection(DBusConnection *conn,
 	ag->device = device;
 	ag->conn = conn;
 	ag->profile = cras_bt_device_profile_from_uuid(profile->uuid);
-	ag->slc_handle = hfp_slc_create(rfcomm_fd, 1, device, NULL,
+	ag->slc_handle = hfp_slc_create(rfcomm_fd,
+					1,
+					profile->features,
+					device,
+					NULL,
 					cras_hfp_ag_slc_disconnected);
 	DL_APPEND(connected_ags, ag);
 	cras_hfp_ag_slc_initialized(ag->slc_handle);
 	return 0;
+}
+
+static void cras_hsp_ag_request_disconnection(struct cras_bt_profile *profile,
+					      struct cras_bt_device *device)
+{
+	struct audio_gateway *ag;
+
+	BTLOG(btlog, BT_HSP_REQUEST_DISCONNECT, 0, 0);
+
+	DL_FOREACH(connected_ags, ag) {
+		if (ag->slc_handle && ag->device == device)
+			destroy_audio_gateway(ag);
+	}
 }
 
 static struct cras_bt_profile cras_hsp_ag_profile = {
@@ -312,7 +371,7 @@ static struct cras_bt_profile cras_hsp_ag_profile = {
 	.record = HSP_AG_RECORD,
 	.release = cras_hfp_ag_release,
 	.new_connection = cras_hsp_ag_new_connection,
-	.request_disconnection = cras_hfp_ag_request_disconnection,
+	.request_disconnection = cras_hsp_ag_request_disconnection,
 	.cancel = cras_hfp_ag_cancel
 };
 
@@ -320,17 +379,43 @@ int cras_hfp_ag_start(struct cras_bt_device *device)
 {
 	struct audio_gateway *ag;
 
+	BTLOG(btlog, BT_AUDIO_GATEWAY_START, 0, 0);
+
 	DL_SEARCH_SCALAR(connected_ags, ag, device, device);
 	if (ag == NULL)
 		return -EEXIST;
 
-	ag->info = hfp_info_create();
-	ag->idev = hfp_iodev_create(CRAS_STREAM_INPUT, ag->device,
-				    ag->slc_handle,
-				    ag->profile, ag->info);
-	ag->odev = hfp_iodev_create(CRAS_STREAM_OUTPUT, ag->device,
-				    ag->slc_handle,
-				    ag->profile, ag->info);
+	/*
+	 * There is chance that bluetooth stack notifies us about remote
+	 * device's capability incrementally in multiple events. That could
+	 * cause hfp_ag_start be called more than once. Check if the input
+	 * HFP iodev is already created so we don't re-create HFP resources.
+	 */
+	if (ag->idev)
+		return 0;
+
+	if (need_go_sco_pcm(device)) {
+		struct cras_iodev *in_aio, *out_aio;
+
+		in_aio = cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_INPUT);
+		out_aio = cras_iodev_list_get_sco_pcm_iodev(CRAS_STREAM_OUTPUT);
+
+		ag->idev = hfp_alsa_iodev_create(in_aio, ag->device,
+						 ag->slc_handle,
+						 ag->profile);
+		ag->odev = hfp_alsa_iodev_create(out_aio, ag->device,
+						 ag->slc_handle,
+						 ag->profile);
+	} else {
+		ag->info = hfp_info_create(
+				hfp_slc_get_selected_codec(ag->slc_handle));
+		ag->idev = hfp_iodev_create(CRAS_STREAM_INPUT, ag->device,
+					    ag->slc_handle,
+					    ag->profile, ag->info);
+		ag->odev = hfp_iodev_create(CRAS_STREAM_OUTPUT, ag->device,
+					    ag->slc_handle,
+					    ag->profile, ag->info);
+	}
 
 	if (!ag->idev && !ag->odev) {
 		destroy_audio_gateway(ag);
