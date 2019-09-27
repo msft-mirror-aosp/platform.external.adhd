@@ -1,5 +1,6 @@
 rust_library_host_rlib {
     name: "libcras_sys",
+    deny_warnings: false,
     crate_name: "cras_sys",
     edition: "2015",
     rlibs: ["libdata_model"],
