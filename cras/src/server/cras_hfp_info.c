@@ -11,10 +11,12 @@
 
 #include "audio_thread.h"
 #include "byte_buffer.h"
-#include "cras_iodev_list.h"
 #include "cras_hfp_info.h"
 #include "cras_hfp_slc.h"
+#include "cras_iodev_list.h"
+#include "cras_plc.h"
 #include "cras_sbc_codec.h"
+#include "cras_server_metrics.h"
 #include "utlist.h"
 
 /* The max buffer size. Note that the actual used size must set to multiple
@@ -28,36 +30,24 @@
 #define HFP_BYTE_RATE 16000
 
 /* Per Bluetooth Core v5.0 and HFP 1.7 specification. */
-#define MSBC_H2_HEADER_LEN	2
-#define MSBC_FRAME_LEN		57
-#define MSBC_FRAME_SIZE		59
-#define MSBC_CODE_SIZE		240
-#define MSBC_SYNC_WORD		0xAD
+#define MSBC_H2_HEADER_LEN 2
+#define MSBC_FRAME_LEN 57
+#define MSBC_FRAME_SIZE 59
+#define MSBC_CODE_SIZE 240
+#define MSBC_SYNC_WORD 0xAD
 
 /* For one mSBC 1 compressed wideband audio channel the HCI packets will
  * be 3 octets of HCI header + 60 octets of data. */
 #define MSBC_PKT_SIZE 60
-#define WRITE_BUF_SIZE_BYTES	MSBC_PKT_SIZE
-#define READ_BUF_SIZE_BYTES	(2 * MSBC_PKT_SIZE)
+#define WRITE_BUF_SIZE_BYTES MSBC_PKT_SIZE
+#define HCI_SCO_HDR_SIZE_BYTES 3
+#define HCI_SCO_PKT_SIZE (MSBC_PKT_SIZE + HCI_SCO_HDR_SIZE_BYTES)
 
-#define H2_HEADER_0		0x01
+#define H2_HEADER_0 0x01
 
 /* Second octet of H2 header is composed by 4 bits fixed 0x8 and 4 bits
  * sequence number 0000, 0011, 1100, 1111. */
-static const uint8_t h2_header_frames_count[] = {
-	0x08, 0x38, 0xc8, 0xf8
-};
-
-/* The pre-computed zero input bit stream of mSBC codec, per HFP 1.7 spec.
- * This mSBC frame will be decoded into all-zero input PCM. */
-static const uint8_t msbc_zero_frame[] = {
-	0xad, 0x00, 0x00, 0xc5, 0x00, 0x00, 0x00, 0x00, 0x77, 0x6d,
-	0xb6, 0xdd, 0xdb, 0x6d, 0xb7, 0x76, 0xdb, 0x6d, 0xdd, 0xb6,
-	0xdb, 0x77, 0x6d, 0xb6, 0xdd, 0xdb, 0x6d, 0xb7, 0x76, 0xdb,
-	0x6d, 0xdd, 0xb6, 0xdb, 0x77, 0x6d, 0xb6, 0xdd, 0xdb, 0x6d,
-	0xb7, 0x76, 0xdb, 0x6d, 0xdd, 0xb6, 0xdb, 0x77, 0x6d, 0xb6,
-	0xdd, 0xdb, 0x6d, 0xb7, 0x76, 0xdb, 0x6c
-};
+static const uint8_t h2_header_frames_count[] = { 0x08, 0x38, 0xc8, 0xf8 };
 
 /* Structure to hold variables for a HFP connection. Since HFP supports
  * bi-direction audio, two iodevs should share one hfp_info if they
@@ -72,14 +62,19 @@ static const uint8_t msbc_zero_frame[] = {
  *     playback_buf - The buffer to hold samples about to write to SCO socket.
  *     msbc_read - mSBC codec to decode input audio in wideband speech mode.
  *     msbc_write - mSBC codec to encode output audio in wideband speech mode.
+ *     msbc_plc - PLC component to handle the packet loss of input audio in
+ *         wideband speech mode.
  *     msbc_num_out_frames - Number of total written mSBC frames.
  *     msbc_num_in_frames - Number of total read mSBC frames.
- *     read_cb - Callback to call when SCO socket can read.
+ *     msbc_num_lost_frames - Number of total lost mSBC frames.
+ *     read_cb - Callback to call when SCO socket can read. It returns the
+ *         number of PCM bytes read.
  *     write_cb - Callback to call when SCO socket can write.
- *     read_buf - Buffer to hold input audio bytes.
- *     read_buf_level - Read input audio level in bytes.
- *     idev - The input iodev using this hfp_info.
- *     odev - The output iodev using this hfp_info.
+ *     hci_sco_buf - Buffer to read one HCI SCO packet.
+ *     input_format_bytes - The audio format bytes for input device. 0 means
+ *         there is no input device for the hfp_info.
+ *     output_format_bytes - The audio format bytes for output device. 0 means
+ *         there is no output device for the hfp_info.
  */
 struct hfp_info {
 	int fd;
@@ -90,29 +85,32 @@ struct hfp_info {
 	struct byte_buffer *playback_buf;
 	struct cras_audio_codec *msbc_read;
 	struct cras_audio_codec *msbc_write;
+	struct cras_msbc_plc *msbc_plc;
 	unsigned int msbc_num_out_frames;
 	unsigned int msbc_num_in_frames;
+	unsigned int msbc_num_lost_frames;
 	int (*read_cb)(struct hfp_info *info);
 	int (*write_cb)(struct hfp_info *info);
 	uint8_t write_buf[WRITE_BUF_SIZE_BYTES];
-	uint8_t read_buf[READ_BUF_SIZE_BYTES];
-	int read_buf_level;
-	struct cras_iodev *idev;
-	struct cras_iodev *odev;
+	uint8_t hci_sco_buf[HCI_SCO_PKT_SIZE];
+	size_t input_format_bytes;
+	size_t output_format_bytes;
 };
 
-int hfp_info_add_iodev(struct hfp_info *info, struct cras_iodev *dev)
+int hfp_info_add_iodev(struct hfp_info *info,
+		       enum CRAS_STREAM_DIRECTION direction,
+		       struct cras_audio_format *format)
 {
-	if (dev->direction == CRAS_STREAM_OUTPUT) {
-		if (info->odev)
+	if (direction == CRAS_STREAM_OUTPUT) {
+		if (info->output_format_bytes)
 			goto invalid;
-		info->odev = dev;
+		info->output_format_bytes = cras_get_format_bytes(format);
 
 		buf_reset(info->playback_buf);
-	} else if (dev->direction == CRAS_STREAM_INPUT) {
-		if (info->idev)
+	} else if (direction == CRAS_STREAM_INPUT) {
+		if (info->input_format_bytes)
 			goto invalid;
-		info->idev = dev;
+		info->input_format_bytes = cras_get_format_bytes(format);
 
 		buf_reset(info->capture_buf);
 	}
@@ -123,112 +121,121 @@ invalid:
 	return -EINVAL;
 }
 
-int hfp_info_rm_iodev(struct hfp_info *info, struct cras_iodev *dev)
+int hfp_info_rm_iodev(struct hfp_info *info,
+		      enum CRAS_STREAM_DIRECTION direction)
 {
-	if (dev->direction == CRAS_STREAM_OUTPUT && info->odev == dev) {
-		info->odev = NULL;
-	} else if (dev->direction == CRAS_STREAM_INPUT && info->idev == dev){
-		info->idev = NULL;
-	} else
+	if (direction == CRAS_STREAM_OUTPUT && info->output_format_bytes) {
+		memset(info->playback_buf->bytes, 0,
+		       info->playback_buf->used_size);
+		info->output_format_bytes = 0;
+	} else if (direction == CRAS_STREAM_INPUT && info->input_format_bytes) {
+		info->input_format_bytes = 0;
+	} else {
 		return -EINVAL;
+	}
 
 	return 0;
 }
 
 int hfp_info_has_iodev(struct hfp_info *info)
 {
-	return info->odev || info->idev;
+	return info->output_format_bytes || info->input_format_bytes;
 }
 
-void hfp_buf_acquire(struct hfp_info *info, struct cras_iodev *dev,
-		     uint8_t **buf, unsigned *count)
+void hfp_buf_acquire(struct hfp_info *info,
+		     enum CRAS_STREAM_DIRECTION direction, uint8_t **buf,
+		     unsigned *count)
 {
 	size_t format_bytes;
 	unsigned int buf_avail;
-	format_bytes = cras_get_format_bytes(dev->format);
 
-	*count *= format_bytes;
-
-	if (dev->direction == CRAS_STREAM_OUTPUT)
+	if (direction == CRAS_STREAM_OUTPUT && info->output_format_bytes) {
 		*buf = buf_write_pointer_size(info->playback_buf, &buf_avail);
-	else
+		format_bytes = info->output_format_bytes;
+	} else if (direction == CRAS_STREAM_INPUT && info->input_format_bytes) {
 		*buf = buf_read_pointer_size(info->capture_buf, &buf_avail);
+		format_bytes = info->input_format_bytes;
+	} else {
+		*count = 0;
+		return;
+	}
 
-	if (*count > buf_avail)
-		*count = buf_avail;
-	*count /= format_bytes;
+	if (*count * format_bytes > buf_avail)
+		*count = buf_avail / format_bytes;
 }
 
-int hfp_buf_size(struct hfp_info *info, struct cras_iodev *dev)
+int hfp_buf_size(struct hfp_info *info, enum CRAS_STREAM_DIRECTION direction)
 {
-	return info->playback_buf->used_size / cras_get_format_bytes(dev->format);
+	if (direction == CRAS_STREAM_OUTPUT && info->output_format_bytes)
+		return info->playback_buf->used_size /
+		       info->output_format_bytes;
+	else if (direction == CRAS_STREAM_INPUT && info->input_format_bytes)
+		return info->capture_buf->used_size / info->input_format_bytes;
+	return 0;
 }
 
-void hfp_buf_release(struct hfp_info *info, struct cras_iodev *dev,
+void hfp_buf_release(struct hfp_info *info,
+		     enum CRAS_STREAM_DIRECTION direction,
 		     unsigned written_frames)
 {
-	size_t format_bytes;
-	format_bytes = cras_get_format_bytes(dev->format);
-
-	written_frames *= format_bytes;
-
-	if (dev->direction == CRAS_STREAM_OUTPUT)
-		buf_increment_write(info->playback_buf, written_frames);
+	if (direction == CRAS_STREAM_OUTPUT && info->output_format_bytes)
+		buf_increment_write(info->playback_buf,
+				    written_frames * info->output_format_bytes);
+	else if (direction == CRAS_STREAM_INPUT && info->input_format_bytes)
+		buf_increment_read(info->capture_buf,
+				   written_frames * info->input_format_bytes);
 	else
-		buf_increment_read(info->capture_buf, written_frames);
+		written_frames = 0;
 }
 
-int hfp_buf_queued(struct hfp_info *info, const struct cras_iodev *dev)
+int hfp_buf_queued(struct hfp_info *info, enum CRAS_STREAM_DIRECTION direction)
 {
-	size_t format_bytes;
-	format_bytes = cras_get_format_bytes(dev->format);
-
-	if (dev->direction == CRAS_STREAM_OUTPUT)
-		return buf_queued(info->playback_buf) / format_bytes;
+	if (direction == CRAS_STREAM_OUTPUT && info->output_format_bytes)
+		return buf_queued(info->playback_buf) /
+		       info->output_format_bytes;
+	else if (direction == CRAS_STREAM_INPUT && info->input_format_bytes)
+		return buf_queued(info->capture_buf) / info->input_format_bytes;
 	else
-		return buf_queued(info->capture_buf) / format_bytes;
+		return 0;
 }
 
-int hfp_fill_output_with_zeros(struct hfp_info *info,
-			       struct cras_iodev *dev,
-			       unsigned int nframes)
+int hfp_fill_output_with_zeros(struct hfp_info *info, unsigned int nframes)
 {
 	unsigned int buf_avail;
-	unsigned int format_bytes;
 	unsigned int nbytes;
 	uint8_t *buf;
 	int i;
 	int ret = 0;
 
-	format_bytes = cras_get_format_bytes(dev->format);
-	nbytes = nframes * format_bytes;
-	/* Loop twice to make sure ring buffer is filled. */
-	for (i = 0; i < 2; i++) {
-		buf = buf_write_pointer_size(info->playback_buf, &buf_avail);
-		if (buf_avail == 0)
-			break;
-		buf_avail = MIN(nbytes, buf_avail);
-		memset(buf, 0, buf_avail);
-		buf_increment_write(info->playback_buf, buf_avail);
-		nbytes -= buf_avail;
-		ret += buf_avail / format_bytes;
+	if (info->output_format_bytes) {
+		nbytes = nframes * info->output_format_bytes;
+		/* Loop twice to make sure ring buffer is filled. */
+		for (i = 0; i < 2; i++) {
+			buf = buf_write_pointer_size(info->playback_buf,
+						     &buf_avail);
+			if (buf_avail == 0)
+				break;
+			buf_avail = MIN(nbytes, buf_avail);
+			memset(buf, 0, buf_avail);
+			buf_increment_write(info->playback_buf, buf_avail);
+			nbytes -= buf_avail;
+			ret += buf_avail / info->output_format_bytes;
+		}
 	}
 	return ret;
 }
 
-int hfp_force_output_level(struct hfp_info *info,
-			   struct cras_iodev *dev,
-			   unsigned int level)
+void hfp_force_output_level(struct hfp_info *info, unsigned int level)
 {
-	level *= cras_get_format_bytes(dev->format);
-	level = MIN(level, MAX_HFP_BUF_SIZE_BYTES);
-	buf_adjust_readable(info->playback_buf, level);
-	return 0;
+	if (info->output_format_bytes) {
+		level *= info->output_format_bytes;
+		level = MIN(level, MAX_HFP_BUF_SIZE_BYTES);
+		buf_adjust_readable(info->playback_buf, level);
+	}
 }
 
 int hfp_write_msbc(struct hfp_info *info)
 {
-	int to_write = 0;
 	size_t encoded;
 	int err;
 	int pcm_encoded;
@@ -243,25 +250,28 @@ int hfp_write_msbc(struct hfp_info *info)
 		wp[0] = H2_HEADER_0;
 		wp[1] = h2_header_frames_count[info->msbc_num_out_frames % 4];
 		pcm_encoded = info->msbc_write->encode(
-				info->msbc_write, samples, pcm_avail,
-				wp + MSBC_H2_HEADER_LEN,
-				WRITE_BUF_SIZE_BYTES - MSBC_H2_HEADER_LEN,
-				&encoded);
+			info->msbc_write, samples, pcm_avail,
+			wp + MSBC_H2_HEADER_LEN,
+			WRITE_BUF_SIZE_BYTES - MSBC_H2_HEADER_LEN, &encoded);
+		if (pcm_encoded < 0) {
+			syslog(LOG_ERR, "msbc encoding err: %s",
+			       strerror(pcm_encoded));
+			return pcm_encoded;
+		}
 		buf_increment_read(info->playback_buf, pcm_encoded);
 		pcm_avail -= pcm_encoded;
 	} else {
 		memset(wp, 0, WRITE_BUF_SIZE_BYTES);
 	}
-	to_write = info->packet_size;
 
 msbc_send_again:
-	err = send(info->fd, info->write_buf, to_write, 0);
+	err = send(info->fd, info->write_buf, MSBC_PKT_SIZE, 0);
 	if (err < 0) {
 		if (errno == EINTR)
 			goto msbc_send_again;
 		return err;
 	}
-	if (err != (int)info->packet_size) {
+	if (err != MSBC_PKT_SIZE) {
 		syslog(LOG_ERR, "Partially write %d bytes for mSBC", err);
 		return -1;
 	}
@@ -293,8 +303,8 @@ send_sample:
 
 	if (err != (int)info->packet_size) {
 		syslog(LOG_ERR,
-		       "Partially write %d bytes for SCO packet size %u",
-		       err, info->packet_size);
+		       "Partially write %d bytes for SCO packet size %u", err,
+		       info->packet_size);
 		return -1;
 	}
 
@@ -303,7 +313,8 @@ send_sample:
 	return err;
 }
 
-static int h2_header_get_seq(const uint8_t *p) {
+static int h2_header_get_seq(const uint8_t *p)
+{
 	int i;
 	for (i = 0; i < 4; i++) {
 		if (*p == h2_header_frames_count[i])
@@ -318,60 +329,61 @@ static int h2_header_get_seq(const uint8_t *p) {
  * Args:
  *    input - Pointer to input bytes read from SCO socket.
  *    len - Length of input bytes.
- *    seq - To be filled by the sequence number of mSBC packet.
- *    frame_head - To be filled by the starting position of mSBC frame if found.
+ *    seq_out - To be filled by the sequence number of mSBC packet.
  * Returns:
- *    The position of input bytes that has been read during the extraction.
+ *    The starting position of mSBC frame if found.
  */
-static int extract_msbc_frame(const uint8_t *input, int len,
-			      int *seq, const uint8_t **frame_head)
+static const uint8_t *extract_msbc_frame(const uint8_t *input, int len,
+					 unsigned int *seq_out)
 {
 	int rp = 0;
+	int seq = -1;
 	while (len - rp >= MSBC_FRAME_SIZE) {
 		if ((input[rp] != H2_HEADER_0) ||
 		    (input[rp + 2] != MSBC_SYNC_WORD)) {
 			rp++;
 			continue;
 		}
-		*seq = h2_header_get_seq(input + rp + 1);
-		if (*seq < 0) {
+		seq = h2_header_get_seq(input + rp + 1);
+		if (seq < 0) {
 			rp++;
 			continue;
 		}
-		*frame_head = input + rp;
-		break;
+		// `seq` is guaranteed to be positive now.
+		*seq_out = (unsigned int)seq;
+		return input + rp;
 	}
-	return rp;
+	return NULL;
 }
 
 /*
  * Handle the case when mSBC frame is considered lost.
  * Args:
- *    msbc - The mSBC codec handles audio input.
- *    capture_buf - The buf to store decoded PCM audio.
- *    pcm_avail - Available room of capture_buf in bytes.
+ *    info - The hfp_info instance holding mSBC codec and PLC objects.
  */
-static int handle_packet_loss(struct cras_audio_codec *msbc,
-			      uint8_t *capture_buf, unsigned int pcm_avail)
+static int handle_packet_loss(struct hfp_info *info)
 {
-	size_t pcm_decoded = 0;
 	int decoded;
+	unsigned int pcm_avail;
+	uint8_t *in_bytes;
 
-	/*
-	 * Handle packet loss by feeding one zero input bit stream of mSBC.
-	 * TODO(enshuo): add PLC.
-	 */
-	decoded = msbc->decode(
-			msbc,
-			msbc_zero_frame,
-			MSBC_FRAME_LEN,
-			capture_buf,
-			pcm_avail,
-			&pcm_decoded);
+	/* It's possible client doesn't consume data causing overrun. In that
+	 * case we treat it as one mSBC frame read but dropped. */
+	info->msbc_num_in_frames++;
+	info->msbc_num_lost_frames++;
+
+	in_bytes = buf_write_pointer_size(info->capture_buf, &pcm_avail);
+	if (pcm_avail < MSBC_CODE_SIZE)
+		return 0;
+
+	decoded = cras_msbc_plc_handle_bad_frames(info->msbc_plc,
+						  info->msbc_read, in_bytes);
 	if (decoded < 0)
 		return decoded;
 
-	return pcm_decoded;
+	buf_increment_write(info->capture_buf, decoded);
+
+	return decoded;
 }
 
 int hfp_read_msbc(struct hfp_info *info)
@@ -379,22 +391,16 @@ int hfp_read_msbc(struct hfp_info *info)
 	int err = 0;
 	unsigned int pcm_avail = 0;
 	int decoded;
-	int rp = 0;
 	size_t pcm_decoded = 0;
+	size_t pcm_read = 0;
 	uint8_t *capture_buf;
 	const uint8_t *frame_head = NULL;
-	int seq;
-
-	/* Check if there's room for more PCM. */
-	capture_buf = buf_write_pointer_size(info->capture_buf, &pcm_avail);
-	if (pcm_avail < MSBC_CODE_SIZE)
-		return 0;
+	unsigned int seq;
 
 recv_msbc_bytes:
-	err = recv(info->fd, info->read_buf + info->read_buf_level,
-		   info->packet_size, 0);
+	err = recv(info->fd, info->hci_sco_buf, HCI_SCO_PKT_SIZE, 0);
 	if (err < 0) {
-		syslog(LOG_ERR, "mSBC read err %s", strerror(errno));
+		syslog(LOG_ERR, "HCI SCO packet read err %s", strerror(errno));
 		if (errno == EINTR)
 			goto recv_msbc_bytes;
 		return err;
@@ -403,64 +409,74 @@ recv_msbc_bytes:
 	 * Treat return code 0 (socket shutdown) as error here. BT stack
 	 * shall send signal to main thread for device disconnection.
 	 */
-	if (err != (int)info->packet_size) {
+	if (err != HCI_SCO_PKT_SIZE) {
 		syslog(LOG_ERR, "Partially read %d bytes for mSBC packet", err);
 		return -1;
 	}
-	info->read_buf_level += err;
 
-	rp = extract_msbc_frame(info->read_buf, info->read_buf_level,
-				&seq, &frame_head);
+	/*
+	 * HCI SCO packet status flag:
+	 * 0x00 - correctly received data.
+	 * 0x01 - possibly invalid data.
+	 * 0x10 - No data received.
+	 * 0x11 - Data partially lost.
+	 */
+	err = (info->hci_sco_buf[1] >> 4);
+	if (err) {
+		syslog(LOG_ERR, "HCI SCO status flag %u", err);
+		return handle_packet_loss(info);
+	}
+
+	/* There is chance that erroneous data reporting gives us false positive.
+	 * If mSBC frame extraction fails, we shall handle it as packet loss.
+	 */
+	frame_head =
+		extract_msbc_frame(info->hci_sco_buf + HCI_SCO_HDR_SIZE_BYTES,
+				   MSBC_PKT_SIZE, &seq);
 	if (!frame_head) {
-		info->read_buf_level -= rp;
-		memmove(info->read_buf, info->read_buf + rp,
-			info->read_buf_level);
-		return err;
+		syslog(LOG_ERR, "Failed to extract msbc frame");
+		return handle_packet_loss(info);
 	}
 
 	/*
 	 * Consider packet loss when found discontinuity in sequence number.
-	 * TODO(hychao): Integrate with erroneous data reporting feature from
-	 * controller that sets packet statue flag on HCI SCO packet.
 	 */
 	while (seq != (info->msbc_num_in_frames % 4)) {
-		err = handle_packet_loss(info->msbc_read,
-					 capture_buf,
-					 pcm_avail);
+		syslog(LOG_ERR, "SCO packet seq unmatch");
+		err = handle_packet_loss(info);
 		if (err < 0)
 			return err;
-		buf_increment_write(info->capture_buf, err);
-		info->msbc_num_in_frames++;
+		pcm_read += err;
 	}
 
-	decoded = info->msbc_read->decode(
-			info->msbc_read,
-			frame_head + MSBC_H2_HEADER_LEN,
-			MSBC_FRAME_LEN,
-			capture_buf,
-			pcm_avail,
-			&pcm_decoded);
+	/* Check if there's room for more PCM. */
+	capture_buf = buf_write_pointer_size(info->capture_buf, &pcm_avail);
+	if (pcm_avail < MSBC_CODE_SIZE)
+		return pcm_read;
+
+	decoded = info->msbc_read->decode(info->msbc_read,
+					  frame_head + MSBC_H2_HEADER_LEN,
+					  MSBC_FRAME_LEN, capture_buf,
+					  pcm_avail, &pcm_decoded);
 	if (decoded < 0) {
 		/*
 		 * If mSBC frame cannot be decoded, consider this packet is
 		 * corrupted and lost.
 		 */
-		err = handle_packet_loss(info->msbc_read,
-					 capture_buf,
-					 pcm_avail);
+		syslog(LOG_ERR, "mSBC decode failed");
+		err = handle_packet_loss(info);
 		if (err < 0)
 			return err;
-		pcm_decoded = err;
+		pcm_read += err;
+	} else {
+		/* Good mSBC frame decoded. */
+		buf_increment_write(info->capture_buf, pcm_decoded);
+		info->msbc_num_in_frames++;
+		cras_msbc_plc_handle_good_frames(info->msbc_plc, capture_buf,
+						 capture_buf);
+		pcm_read += pcm_decoded;
 	}
-
-	rp += MSBC_FRAME_SIZE;
-	buf_increment_write(info->capture_buf, pcm_decoded);
-	info->msbc_num_in_frames++;
-
-	info->read_buf_level -= rp;
-	memmove(info->read_buf, info->read_buf + rp, info->read_buf_level);
-
-	return 0;
+	return pcm_read;
 }
 
 int hfp_read(struct hfp_info *info)
@@ -494,7 +510,8 @@ recv_sample:
 		if (err && (info->packet_size == info->mtu)) {
 			info->packet_size = err;
 		} else {
-			syslog(LOG_ERR, "Partially read %d bytes for %u size SCO packet",
+			syslog(LOG_ERR,
+			       "Partially read %d bytes for %u size SCO packet",
 			       err, info->packet_size);
 			return -1;
 		}
@@ -528,16 +545,22 @@ static int hfp_info_callback(void *arg)
 		goto read_write_error;
 	}
 
-	/* Ignore the MTU bytes just read if input dev not in present */
-	if (!info->idev)
-		buf_increment_read(info->capture_buf, info->packet_size);
+	/* Ignore the bytes just read if input dev not in present */
+	if (!info->input_format_bytes)
+		buf_increment_read(info->capture_buf, err);
 
-	if (info->odev) {
-		err = info->write_cb(info);
-		if (err < 0) {
-			syslog(LOG_ERR, "Write error");
-			goto read_write_error;
-		}
+	/* Without output stream's presence, we shall still send zero packets
+	 * to HF. This is required for some HF devices to start sending non-zero
+	 * data to AG.
+	 */
+	if (!info->output_format_bytes)
+		buf_increment_write(info->playback_buf,
+				    info->msbc_write ? err : info->packet_size);
+
+	err = info->write_cb(info);
+	if (err < 0) {
+		syslog(LOG_ERR, "Write error");
+		goto read_write_error;
 	}
 
 	return 0;
@@ -575,6 +598,7 @@ struct hfp_info *hfp_info_create(int codec)
 		info->read_cb = hfp_read_msbc;
 		info->msbc_read = cras_msbc_codec_create();
 		info->msbc_write = cras_msbc_codec_create();
+		info->msbc_plc = cras_msbc_plc_create();
 	} else {
 		info->write_cb = hfp_write;
 		info->read_cb = hfp_read;
@@ -610,10 +634,10 @@ int hfp_info_start(int fd, unsigned int mtu, struct hfp_info *info)
 
 	audio_thread_add_callback(info->fd, hfp_info_callback, info);
 
-	info->read_buf_level = 0;
 	info->started = 1;
 	info->msbc_num_out_frames = 0;
 	info->msbc_num_in_frames = 0;
+	info->msbc_num_lost_frames = 0;
 
 	return 0;
 }
@@ -623,13 +647,18 @@ int hfp_info_stop(struct hfp_info *info)
 	if (!info->started)
 		return 0;
 
-	audio_thread_rm_callback_sync(
-		cras_iodev_list_get_audio_thread(),
-		info->fd);
+	audio_thread_rm_callback_sync(cras_iodev_list_get_audio_thread(),
+				      info->fd);
 
 	close(info->fd);
 	info->fd = 0;
 	info->started = 0;
+
+	if (info->msbc_num_in_frames) {
+		cras_server_metrics_hfp_packet_loss(
+			(float)info->msbc_num_lost_frames /
+			info->msbc_num_in_frames);
+	}
 
 	return 0;
 }
@@ -646,6 +675,8 @@ void hfp_info_destroy(struct hfp_info *info)
 		cras_sbc_codec_destroy(info->msbc_read);
 	if (info->msbc_write)
 		cras_sbc_codec_destroy(info->msbc_write);
+	if (info->msbc_plc)
+		cras_msbc_plc_destroy(info->msbc_plc);
 
 	free(info);
 }

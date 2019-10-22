@@ -7,6 +7,7 @@
 #include <syslog.h>
 
 #include "audio_thread.h"
+#include "audio_thread_log.h"
 #include "cras_apm_list.h"
 #include "cras_bt_log.h"
 #include "cras_config.h"
@@ -17,124 +18,13 @@
 #include "cras_messages.h"
 #include "cras_observer.h"
 #include "cras_rclient.h"
+#include "cras_rclient_util.h"
 #include "cras_rstream.h"
-#include "cras_server_metrics.h"
 #include "cras_system_state.h"
 #include "cras_types.h"
 #include "cras_util.h"
 #include "stream_list.h"
 #include "utlist.h"
-
-/* Handles a message from the client to connect a new stream */
-static int handle_client_stream_connect(struct cras_rclient *client,
-					const struct cras_connect_message *msg,
-					int aud_fd)
-{
-	struct cras_rstream *stream;
-	struct cras_client_stream_connected stream_connected;
-	struct cras_client_message *reply;
-	struct cras_audio_format remote_fmt;
-	struct cras_rstream_config stream_config;
-	int rc, header_fd, samples_fd;
-	int stream_fds[2];
-
-	unpack_cras_audio_format(&remote_fmt, &msg->format);
-
-	/* check the aud_fd is valid. */
-	if (aud_fd < 0) {
-		syslog(LOG_ERR, "Invalid fd in stream connect.\n");
-		rc = -EINVAL;
-		goto reply_err;
-	}
-	/* When full, getting an error is preferable to blocking. */
-	cras_make_fd_nonblocking(aud_fd);
-
-	/* Create the stream with the specified parameters. */
-	stream_config.stream_id = msg->stream_id;
-	stream_config.stream_type = msg->stream_type;
-	stream_config.direction = msg->direction;
-	stream_config.dev_idx = msg->dev_idx;
-	stream_config.flags = msg->flags;
-	stream_config.effects = msg->effects;
-	stream_config.format = &remote_fmt;
-	stream_config.buffer_frames = msg->buffer_frames;
-	stream_config.cb_threshold = msg->cb_threshold;
-	stream_config.audio_fd = aud_fd;
-	stream_config.client = client;
-	stream_config.use_split_shm = msg->proto_version > 2;
-	rc = stream_list_add(cras_iodev_list_get_stream_list(), &stream_config,
-			     &stream);
-	if (rc)
-		goto reply_err;
-
-	/* Tell client about the stream setup. */
-	syslog(LOG_DEBUG, "Send connected for stream %x\n", msg->stream_id);
-	if (stream_config.use_split_shm) {
-		cras_fill_client_stream_connected(
-			&stream_connected, 0, /* No error. */
-			msg->stream_id, &remote_fmt,
-			cras_rstream_get_samples_shm_size(stream),
-			cras_rstream_get_effects(stream));
-		reply = &stream_connected.header;
-
-	} else {
-		cras_fill_client_stream_connected(
-			&stream_connected, 0, /* No error. */
-			msg->stream_id, &remote_fmt,
-			cras_rstream_get_samples_shm_size(stream) +
-				cras_shm_header_size(),
-			cras_rstream_get_effects(stream));
-		reply = &stream_connected.header;
-	}
-
-	rc = cras_rstream_get_shm_fds(stream, &header_fd, &samples_fd);
-	if (rc)
-		goto reply_err;
-
-	if (stream_config.use_split_shm) {
-		stream_fds[0] = header_fd;
-		stream_fds[1] = samples_fd;
-	} else {
-		// for unsplit shm, the client expects both fds to be the same.
-		stream_fds[0] = header_fd;
-		stream_fds[1] = header_fd;
-	}
-
-	rc = client->ops->send_message_to_client(client, reply, stream_fds, 2);
-	if (rc < 0) {
-		syslog(LOG_ERR, "Failed to send connected messaged\n");
-		stream_list_rm(cras_iodev_list_get_stream_list(),
-			       stream->stream_id);
-		goto reply_err;
-	}
-
-	/* Metrics logs the stream configurations. */
-	cras_server_metrics_stream_config(&stream_config);
-
-	return 0;
-
-reply_err:
-	/* Send the error code to the client. */
-	cras_fill_client_stream_connected(&stream_connected, rc, msg->stream_id,
-					  &remote_fmt, 0, msg->effects);
-	reply = &stream_connected.header;
-	client->ops->send_message_to_client(client, reply, NULL, 0);
-
-	if (aud_fd >= 0)
-		close(aud_fd);
-
-	return rc;
-}
-
-/* Handles messages from the client requesting that a stream be removed from the
- * server. */
-static int handle_client_stream_disconnect(
-	struct cras_rclient *client,
-	const struct cras_disconnect_stream_message *msg)
-{
-	return stream_list_rm(cras_iodev_list_get_stream_list(),
-			      msg->stream_id);
-}
 
 /* Handles dumping audio thread debug info back to the client. */
 static void dump_audio_thread_info(struct cras_rclient *client)
@@ -147,6 +37,17 @@ static void dump_audio_thread_info(struct cras_rclient *client)
 	audio_thread_dump_thread_info(cras_iodev_list_get_audio_thread(),
 				      &state->audio_debug_info);
 	client->ops->send_message_to_client(client, &msg.header, NULL, 0);
+}
+
+/* Sends shared memory fd for audio thread event log back to the client. */
+static void get_atlog_fd(struct cras_rclient *client)
+{
+	struct cras_client_atlog_fd_ready msg;
+	int atlog_fd;
+
+	cras_fill_client_atlog_fd_ready(&msg);
+	atlog_fd = audio_thread_event_log_shm_fd();
+	client->ops->send_message_to_client(client, &msg.header, &atlog_fd, 1);
 }
 
 /* Handles dumping audio snapshots to shared memory for the client. */
@@ -172,7 +73,7 @@ static void handle_get_hotword_models(struct cras_rclient *client,
 	if (!hotword_models)
 		goto empty_reply;
 	hotword_models_size = strlen(hotword_models);
-	if (hotword_models_size + sizeof(*msg) > CRAS_CLIENT_MAX_MSG_SIZE) {
+	if (hotword_models_size > CRAS_MAX_HOTWORD_MODELS) {
 		free(hotword_models);
 		goto empty_reply;
 	}
@@ -363,60 +264,50 @@ static void register_for_notification(struct cras_rclient *client,
 	}
 }
 
-/* Removes all streams that the client owns and destroys it. */
-static void ccr_destroy(struct cras_rclient *client)
-{
-	cras_observer_remove(client->observer);
-	stream_list_rm_all_client_streams(cras_iodev_list_get_stream_list(),
-					  client);
-	free(client);
-}
-
 static int direction_valid(enum CRAS_STREAM_DIRECTION direction)
 {
 	return direction < CRAS_NUM_DIRECTIONS &&
 	       direction != CRAS_STREAM_UNDEFINED;
 }
 
-#define MSG_LEN_VALID(msg, type) ((msg)->length >= sizeof(type))
-
 /* Entry point for handling a message from the client.  Called from the main
  * server context. */
 static int ccr_handle_message_from_client(struct cras_rclient *client,
 					  const struct cras_server_message *msg,
-					  int fd)
+					  int *fds, unsigned int num_fds)
 {
+	int rc = 0;
 	assert(client && msg);
 
-	/* Most messages should not have a file descriptor. */
-	switch (msg->id) {
-	case CRAS_SERVER_CONNECT_STREAM:
-		break;
-	case CRAS_SERVER_SET_AEC_DUMP:
-		syslog(LOG_ERR, "client msg for APM debug, fd %d", fd);
-		break;
-	default:
-		if (fd != -1) {
-			syslog(LOG_ERR,
-			       "Message %d should not have fd attached.",
-			       msg->id);
-			close(fd);
-			return -1;
-		}
-		break;
+	rc = rclient_validate_message_fds(msg, fds, num_fds);
+	if (rc < 0) {
+		for (int i = 0; i < (int)num_fds; i++)
+			if (fds[i] >= 0)
+				close(fds[i]);
+		return rc;
 	}
+	int fd = num_fds > 0 ? fds[0] : -1;
 
 	switch (msg->id) {
-	case CRAS_SERVER_CONNECT_STREAM:
-		if (!MSG_LEN_VALID(msg, struct cras_connect_message))
+	case CRAS_SERVER_CONNECT_STREAM: {
+		int client_shm_fd = num_fds > 1 ? fds[1] : -1;
+		struct cras_connect_message cmsg;
+		if (MSG_LEN_VALID(msg, struct cras_connect_message)) {
+			return rclient_handle_client_stream_connect(
+				client,
+				(const struct cras_connect_message *)msg, fd,
+				client_shm_fd);
+		} else if (!convert_connect_message_old(msg, &cmsg)) {
+			return rclient_handle_client_stream_connect(
+				client, &cmsg, fd, client_shm_fd);
+		} else {
 			return -EINVAL;
-		handle_client_stream_connect(
-			client, (const struct cras_connect_message *)msg, fd);
-		break;
+		}
+	}
 	case CRAS_SERVER_DISCONNECT_STREAM:
 		if (!MSG_LEN_VALID(msg, struct cras_disconnect_stream_message))
 			return -EINVAL;
-		handle_client_stream_disconnect(
+		rclient_handle_client_stream_disconnect(
 			client,
 			(const struct cras_disconnect_stream_message *)msg);
 		break;
@@ -507,6 +398,9 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 		break;
 	case CRAS_SERVER_DUMP_AUDIO_THREAD:
 		dump_audio_thread_info(client);
+		break;
+	case CRAS_SERVER_GET_ATLOG_FD:
+		get_atlog_fd(client);
 		break;
 	case CRAS_SERVER_DUMP_BT: {
 		struct cras_client_audio_debug_info_ready msg;
@@ -622,20 +516,11 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 	return 0;
 }
 
-/* Sends a message to the client. */
-static int ccr_send_message_to_client(const struct cras_rclient *client,
-				      const struct cras_client_message *msg,
-				      int *fds, unsigned int num_fds)
-{
-	return cras_send_with_fds(client->fd, (const void *)msg, msg->length,
-				  fds, num_fds);
-}
-
 /* Declarations of cras_rclient operators for cras_control_rclient. */
 static const struct cras_rclient_ops cras_control_rclient_ops = {
 	.handle_message_from_client = ccr_handle_message_from_client,
-	.send_message_to_client = ccr_send_message_to_client,
-	.destroy = ccr_destroy,
+	.send_message_to_client = rclient_send_message_to_client,
+	.destroy = rclient_destroy,
 };
 
 /*
@@ -656,8 +541,11 @@ struct cras_rclient *cras_control_rclient_create(int fd, size_t id)
 
 	client->fd = fd;
 	client->id = id;
-
 	client->ops = &cras_control_rclient_ops;
+	client->supported_directions = CRAS_STREAM_ALL_DIRECTION;
+	/* Filters CRAS_STREAM_UNDEFINED stream out. */
+	client->supported_directions ^=
+		cras_stream_direction_mask(CRAS_STREAM_UNDEFINED);
 
 	cras_fill_client_connected(&msg, client->id);
 	state_fd = cras_sys_state_shm_fd();
