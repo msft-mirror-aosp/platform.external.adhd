@@ -25,7 +25,7 @@
 //! use std::thread::{spawn, JoinHandle};
 //! type Result<T> = std::result::Result<T, Box<std::error::Error>>;
 //!
-//! use libcras::CrasClient;
+//! use libcras::{CrasClient, CrasClientType};
 //! use audio_streams::StreamSource;
 //!
 //! const BUFFER_SIZE: usize = 256;
@@ -37,6 +37,7 @@
 //! #    match args.len() {
 //! #        2 => {
 //!              let mut cras_client = CrasClient::new()?;
+//!              cras_client.set_client_type(CrasClientType::CRAS_CLIENT_TYPE_TEST);
 //!              let (_control, mut stream) = cras_client
 //!                  .new_playback_stream(NUM_CHANNELS, FRAME_RATE, BUFFER_SIZE)?;
 //!
@@ -76,7 +77,7 @@
 //! use std::thread::{spawn, JoinHandle};
 //! type Result<T> = std::result::Result<T, Box<std::error::Error>>;
 //!
-//! use libcras::CrasClient;
+//! use libcras::{CrasClient, CrasClientType};
 //! use audio_streams::StreamSource;
 //!
 //! const BUFFER_SIZE: usize = 256;
@@ -88,6 +89,7 @@
 //! #    match args.len() {
 //! #        2 => {
 //!              let mut cras_client = CrasClient::new()?;
+//!              cras_client.set_client_type(CrasClientType::CRAS_CLIENT_TYPE_TEST);
 //!              let (_control, mut stream) = cras_client
 //!                  .new_capture_stream(NUM_CHANNELS, FRAME_RATE, BUFFER_SIZE)?;
 //!
@@ -124,6 +126,7 @@ use audio_streams::{
     capture::{CaptureBufferStream, DummyCaptureStream},
     BufferDrop, DummyStreamControl, PlaybackBufferStream, StreamControl, StreamSource,
 };
+pub use cras_sys::gen::CRAS_CLIENT_TYPE as CrasClientType;
 use cras_sys::gen::*;
 use sys_util::{PollContext, PollToken};
 
@@ -143,7 +146,6 @@ pub enum ErrorType {
     CrasStreamError(cras_stream::Error),
     IoError(io::Error),
     SysUtilError(sys_util::Error),
-    NoClientId,
     MessageTypeError,
     UnexpectedExit,
 }
@@ -168,7 +170,6 @@ impl fmt::Display for Error {
             ErrorType::CrasStreamError(ref err) => err.fmt(f),
             ErrorType::IoError(ref err) => err.fmt(f),
             ErrorType::SysUtilError(ref err) => err.fmt(f),
-            ErrorType::NoClientId => write!(f, "client_id dose not exists"),
             ErrorType::MessageTypeError => write!(f, "Message type error"),
             ErrorType::UnexpectedExit => write!(f, "Unexpected exit"),
         }
@@ -205,9 +206,10 @@ impl From<cras_client_message::Error> for Error {
 /// to CRAS server.
 pub struct CrasClient {
     server_socket: CrasServerSocket,
-    client_id: Option<u32>,
+    client_id: u32,
     next_stream_id: u32,
     cras_capture: bool,
+    client_type: CRAS_CLIENT_TYPE,
 }
 
 impl CrasClient {
@@ -222,30 +224,36 @@ impl CrasClient {
     /// Returns error if error occurs while handling server message or message
     /// type is incorrect
     pub fn new() -> Result<Self> {
-        // Initializes a client
-        let server_socket = CrasServerSocket::new()?;
-        let mut cras_client = Self {
-            server_socket,
-            client_id: None,
-            next_stream_id: 0,
-            cras_capture: false,
-        };
+        // Create a connection to the server.
+        let mut server_socket = CrasServerSocket::new()?;
 
         // Gets client ID from server
-        cras_client.client_id = Some({
-            match cras_client.handle_server_message()? {
+        let client_id = {
+            match CrasClient::wait_for_message(&mut server_socket)? {
                 ServerResult::Connected(res, _server_state_fd) => res as u32,
                 _ => {
                     return Err(Error::new(ErrorType::MessageTypeError));
                 }
             }
-        });
-        Ok(cras_client)
+        };
+
+        Ok(Self {
+            server_socket,
+            client_id,
+            next_stream_id: 0,
+            cras_capture: false,
+            client_type: CRAS_CLIENT_TYPE::CRAS_CLIENT_TYPE_UNKNOWN,
+        })
     }
 
     /// Enables capturing audio through CRAS server.
     pub fn enable_cras_capture(&mut self) {
         self.cras_capture = true;
+    }
+
+    /// Set the type of this client to report to CRAS when connecting streams.
+    pub fn set_client_type(&mut self, client_type: CRAS_CLIENT_TYPE) {
+        self.client_type = client_type;
     }
 
     // Gets next server_stream_id from client and increment stream_id counter.
@@ -257,7 +265,7 @@ impl CrasClient {
 
     // Gets server_stream_id from given stream_id
     fn server_stream_id(&self, stream_id: &u32) -> Result<u32> {
-        Ok((self.client_id.ok_or(Error::new(ErrorType::NoClientId))? << 16) | stream_id)
+        Ok((self.client_id << 16) | stream_id)
     }
 
     // Creates general stream with given parameters
@@ -289,6 +297,8 @@ impl CrasClient {
             format: audio_format,
             dev_idx: CRAS_SPECIAL_DEVICE::NO_DEVICE as u32,
             effects: 0,
+            client_type: self.client_type,
+            client_shm_size: 0,
         };
 
         // Creates AudioSocket pair
@@ -312,7 +322,7 @@ impl CrasClient {
         );
 
         loop {
-            let result = self.handle_server_message()?;
+            let result = CrasClient::wait_for_message(&mut self.server_socket)?;
             if let ServerResult::StreamConnected(_stream_id, header_fd, samples_fd) = result {
                 stream.init_shm(header_fd, samples_fd)?;
                 break;
@@ -322,14 +332,14 @@ impl CrasClient {
         Ok(stream)
     }
 
-    // Blocks handling the first server message received from server socket.
-    fn handle_server_message(&self) -> Result<ServerResult> {
+    // Blocks handling the first server message received from `socket`.
+    fn wait_for_message(socket: &mut CrasServerSocket) -> Result<ServerResult> {
         #[derive(PollToken)]
         enum Token {
             ServerMsg,
         }
-        let poll_ctx: PollContext<Token> = PollContext::new()
-            .and_then(|pc| pc.add(&self.server_socket, Token::ServerMsg).and(Ok(pc)))?;
+        let poll_ctx: PollContext<Token> =
+            PollContext::new().and_then(|pc| pc.add(socket, Token::ServerMsg).and(Ok(pc)))?;
 
         let events = poll_ctx.wait()?;
         // Check the first readable message
@@ -339,7 +349,7 @@ impl CrasClient {
             .ok_or_else(|| Error::new(ErrorType::UnexpectedExit))
             .and_then(|ref token| {
                 match token {
-                    Token::ServerMsg => ServerResult::handle_server_message(&self.server_socket),
+                    Token::ServerMsg => ServerResult::handle_server_message(socket),
                 }
                 .map_err(Into::into)
             })
@@ -354,7 +364,7 @@ impl StreamSource for CrasClient {
         buffer_size: usize,
     ) -> std::result::Result<
         (Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>),
-        Box<error::Error>,
+        Box<dyn error::Error>,
     > {
         Ok((
             Box::new(DummyStreamControl::new()),
@@ -375,7 +385,7 @@ impl StreamSource for CrasClient {
         buffer_size: usize,
     ) -> std::result::Result<
         (Box<dyn StreamControl>, Box<dyn CaptureBufferStream>),
-        Box<error::Error>,
+        Box<dyn error::Error>,
     > {
         if self.cras_capture {
             Ok((
