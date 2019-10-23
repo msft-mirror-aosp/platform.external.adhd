@@ -37,7 +37,7 @@ static void cras_bt_interface_added(DBusConnection *conn,
 				adapter, properties_array_iter, NULL);
 		} else {
 			BTLOG(btlog, BT_ADAPTER_ADDED, 0, 0);
-			adapter = cras_bt_adapter_create(object_path);
+			adapter = cras_bt_adapter_create(conn, object_path);
 			if (adapter) {
 				cras_bt_adapter_update_properties(
 					adapter, properties_array_iter, NULL);
@@ -137,7 +137,7 @@ static void cras_bt_interface_removed(DBusConnection *conn,
 		if (transport) {
 			syslog(LOG_INFO, "Bluetooth Transport: %s removed",
 			       cras_bt_transport_object_path(transport));
-			cras_bt_transport_destroy(transport);
+			cras_bt_transport_remove(transport);
 		}
 	}
 }
