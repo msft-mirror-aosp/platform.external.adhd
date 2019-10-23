@@ -1179,8 +1179,6 @@ static struct alsa_output_node *new_output(struct alsa_io *aio,
 	output->base.idx = aio->next_ionode_index++;
 	output->base.stable_id =
 		SuperFastHash(name, strlen(name), aio->base.info.stable_id);
-	output->base.stable_id_new =
-		SuperFastHash(name, strlen(name), aio->base.info.stable_id_new);
 	if (aio->ucm)
 		output->base.dsp_name =
 			ucm_get_dsp_name_for_dev(aio->ucm, name);
@@ -1263,8 +1261,6 @@ static struct alsa_input_node *new_input(struct alsa_io *aio,
 	input->base.idx = aio->next_ionode_index++;
 	input->base.stable_id =
 		SuperFastHash(name, strlen(name), aio->base.info.stable_id);
-	input->base.stable_id_new =
-		SuperFastHash(name, strlen(name), aio->base.info.stable_id_new);
 	if (strcmp(name, "SCO Line In") == 0)
 		input->base.is_sco_pcm = 1;
 	input->mixer_input = cras_input;
@@ -1568,7 +1564,6 @@ static void set_iodev_name(struct cras_iodev *dev, const char *card_name,
 		dev->info.stable_id = SuperFastHash((const char *)&device_index,
 						    sizeof(device_index),
 						    dev->info.stable_id);
-		dev->info.stable_id_new = dev->info.stable_id;
 		break;
 	case ALSA_CARD_TYPE_USB:
 		dev->info.stable_id =
@@ -1577,17 +1572,14 @@ static void set_iodev_name(struct cras_iodev *dev, const char *card_name,
 		dev->info.stable_id =
 			SuperFastHash((const char *)&usb_pid, sizeof(usb_pid),
 				      dev->info.stable_id);
-		dev->info.stable_id_new =
-			SuperFastHash(usb_serial_number,
-				      strlen(usb_serial_number),
-				      dev->info.stable_id);
+		dev->info.stable_id = SuperFastHash(usb_serial_number,
+						    strlen(usb_serial_number),
+						    dev->info.stable_id);
 		break;
 	default:
-		dev->info.stable_id_new = dev->info.stable_id;
 		break;
 	}
-	syslog(LOG_DEBUG, "Stable ID=%08x, New Stable ID=%08x",
-	       dev->info.stable_id, dev->info.stable_id_new);
+	syslog(LOG_DEBUG, "Stable ID=%08x", dev->info.stable_id);
 }
 
 static int get_fixed_rate(struct alsa_io *aio)
@@ -1898,8 +1890,9 @@ static unsigned int get_num_severe_underruns(const struct cras_iodev *iodev)
 
 static void set_default_hotword_model(struct cras_iodev *iodev)
 {
-	const char *default_model = "en_us";
+	const char *default_models[] = { "en_all", "en_us" };
 	cras_node_id_t node_id;
+	unsigned i;
 
 	if (!iodev->active_node ||
 	    iodev->active_node->type != CRAS_NODE_TYPE_HOTWORD)
@@ -1907,7 +1900,10 @@ static void set_default_hotword_model(struct cras_iodev *iodev)
 
 	node_id = cras_make_node_id(iodev->info.idx, iodev->active_node->idx);
 	/* This is a no-op if the default_model is not supported */
-	cras_iodev_list_set_hotword_model(node_id, default_model);
+	for (i = 0; i < ARRAY_SIZE(default_models); ++i)
+		if (!cras_iodev_list_set_hotword_model(node_id,
+						       default_models[i]))
+			return;
 }
 
 static int get_valid_frames(const struct cras_iodev *odev,

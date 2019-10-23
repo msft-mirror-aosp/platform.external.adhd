@@ -16,6 +16,7 @@ extern "C" {
 
 // Access to data structures and static functions.
 #include "cras_control_rclient.c"
+#include "cras_rclient_util.c"
 }
 
 //  Stub data.
@@ -58,6 +59,7 @@ static size_t cras_observer_set_ops_called;
 static size_t cras_observer_ops_are_empty_called;
 static struct cras_observer_ops cras_observer_ops_are_empty_empty_ops;
 static size_t cras_observer_remove_called;
+static unsigned int cras_rstream_config_init_with_message_called;
 
 void ResetStubData() {
   cras_rstream_create_return = 0;
@@ -99,6 +101,7 @@ void ResetStubData() {
   memset(&cras_observer_ops_are_empty_empty_ops, 0,
          sizeof(cras_observer_ops_are_empty_empty_ops));
   cras_observer_remove_called = 0;
+  cras_rstream_config_init_with_message_called = 0;
 }
 
 namespace {
@@ -135,7 +138,7 @@ class RClientMessagesSuite : public testing::Test {
     rc = pipe(pipe_fds_);
     if (rc < 0)
       return;
-    rclient_ = cras_control_rclient_create(pipe_fds_[1], 800);
+    rclient_ = cras_control_rclient_create(pipe_fds_[1], 1);
     rc = read(pipe_fds_[0], &msg, sizeof(msg));
     if (rc < 0)
       return;
@@ -156,6 +159,7 @@ class RClientMessagesSuite : public testing::Test {
     connect_msg_.format.frame_rate = 48000;
     connect_msg_.format.format = SND_PCM_FORMAT_S16_LE;
     connect_msg_.dev_idx = NO_DEVICE;
+    connect_msg_.client_shm_size = 0;
     btlog = cras_bt_event_log_init();
     ResetStubData();
   }
@@ -177,6 +181,7 @@ class RClientMessagesSuite : public testing::Test {
   struct cras_rstream* rstream_;
   size_t stream_id_;
   int pipe_fds_[2];
+  int fd_;
 };
 
 TEST_F(RClientMessagesSuite, AudThreadAttachFail) {
@@ -186,15 +191,17 @@ TEST_F(RClientMessagesSuite, AudThreadAttachFail) {
   cras_rstream_create_stream_out = rstream_;
   stream_list_add_stream_return = -EINVAL;
 
+  fd_ = 100;
   rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
-                                                 100);
-  EXPECT_EQ(0, rc);
+                                                 &fd_, 1);
+  EXPECT_EQ(-EINVAL, rc);
 
   rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
   EXPECT_EQ(sizeof(out_msg), rc);
   EXPECT_EQ(stream_id_, out_msg.stream_id);
   EXPECT_NE(0, out_msg.err);
   EXPECT_EQ(0, cras_iodev_list_rm_output_called);
+  EXPECT_EQ(1, cras_rstream_config_init_with_message_called);
   EXPECT_EQ(1, stream_list_add_stream_called);
   EXPECT_EQ(0, stream_list_disconnect_stream_called);
   EXPECT_EQ(0, cras_server_metrics_stream_config_called);
@@ -205,8 +212,8 @@ TEST_F(RClientMessagesSuite, ConnectMsgWithBadFd) {
   int rc;
 
   rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
-                                                 -1);
-  EXPECT_EQ(0, rc);
+                                                 NULL, 0);
+  EXPECT_EQ(-EBADF, rc);
 
   rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
   EXPECT_EQ(sizeof(out_msg), rc);
@@ -217,15 +224,19 @@ TEST_F(RClientMessagesSuite, ConnectMsgWithBadFd) {
   EXPECT_EQ(0, cras_server_metrics_stream_config_called);
 }
 
-TEST_F(RClientMessagesSuite, SuccessReply) {
+TEST_F(RClientMessagesSuite, ConnectMsgFromOldClient) {
   struct cras_client_stream_connected out_msg;
   int rc;
 
   cras_rstream_create_stream_out = rstream_;
   cras_iodev_attach_stream_retval = 0;
 
+  connect_msg_.header.length = sizeof(struct cras_connect_message_old);
+  connect_msg_.proto_version = 3;
+
+  fd_ = 100;
   rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
-                                                 100);
+                                                 &fd_, 1);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_make_fd_nonblocking_called);
 
@@ -233,6 +244,104 @@ TEST_F(RClientMessagesSuite, SuccessReply) {
   EXPECT_EQ(sizeof(out_msg), rc);
   EXPECT_EQ(stream_id_, out_msg.stream_id);
   EXPECT_EQ(0, out_msg.err);
+  EXPECT_EQ(1, cras_rstream_config_init_with_message_called);
+  EXPECT_EQ(1, stream_list_add_stream_called);
+  EXPECT_EQ(0, stream_list_disconnect_stream_called);
+  EXPECT_EQ(1, cras_server_metrics_stream_config_called);
+}
+
+TEST_F(RClientMessagesSuite, StreamConnectMessageValidDirection) {
+  struct cras_client_stream_connected out_msg;
+  int rc;
+  int called = 0;
+
+  for (int i = 0; i < CRAS_NUM_DIRECTIONS; i++) {
+    connect_msg_.direction = static_cast<CRAS_STREAM_DIRECTION>(i);
+    if (connect_msg_.direction == CRAS_STREAM_UNDEFINED)
+      continue;
+    called++;
+    cras_rstream_create_stream_out = rstream_;
+    cras_iodev_attach_stream_retval = 0;
+
+    fd_ = 100;
+    rc = rclient_->ops->handle_message_from_client(
+        rclient_, &connect_msg_.header, &fd_, 1);
+    EXPECT_EQ(0, rc);
+    EXPECT_EQ(called, cras_make_fd_nonblocking_called);
+
+    rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
+    EXPECT_EQ(sizeof(out_msg), rc);
+    EXPECT_EQ(stream_id_, out_msg.stream_id);
+    EXPECT_EQ(0, out_msg.err);
+    EXPECT_EQ(called, cras_rstream_config_init_with_message_called);
+    EXPECT_EQ(called, stream_list_add_stream_called);
+    EXPECT_EQ(0, stream_list_disconnect_stream_called);
+    EXPECT_EQ(called, cras_server_metrics_stream_config_called);
+  }
+}
+
+TEST_F(RClientMessagesSuite, StreamConnectMessageInvalidDirection) {
+  struct cras_client_stream_connected out_msg;
+  int rc;
+
+  connect_msg_.direction = CRAS_STREAM_UNDEFINED;
+  cras_rstream_create_stream_out = rstream_;
+  cras_iodev_attach_stream_retval = 0;
+
+  fd_ = 100;
+  rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
+                                                 &fd_, 1);
+  EXPECT_EQ(-EINVAL, rc);
+  EXPECT_EQ(0, cras_make_fd_nonblocking_called);
+
+  rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
+  EXPECT_EQ(sizeof(out_msg), rc);
+  EXPECT_EQ(stream_id_, out_msg.stream_id);
+  EXPECT_EQ(-EINVAL, out_msg.err);
+  EXPECT_EQ(0, stream_list_add_stream_called);
+  EXPECT_EQ(0, stream_list_disconnect_stream_called);
+  EXPECT_EQ(0, cras_server_metrics_stream_config_called);
+}
+
+TEST_F(RClientMessagesSuite, StreamConnectMessageInvalidClientId) {
+  struct cras_client_stream_connected out_msg;
+  int rc;
+
+  connect_msg_.stream_id = 0x20002;  // stream_id with invalid client_id
+
+  fd_ = 100;
+  rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
+                                                 &fd_, 1);
+  EXPECT_EQ(-EINVAL, rc);
+  EXPECT_EQ(0, cras_make_fd_nonblocking_called);
+  EXPECT_EQ(0, cras_rstream_config_init_with_message_called);
+  EXPECT_EQ(0, stream_list_add_stream_called);
+  EXPECT_EQ(0, stream_list_disconnect_stream_called);
+
+  rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
+  EXPECT_EQ(sizeof(out_msg), rc);
+  EXPECT_EQ(-EINVAL, out_msg.err);
+  EXPECT_EQ(connect_msg_.stream_id, out_msg.stream_id);
+}
+
+TEST_F(RClientMessagesSuite, SuccessReply) {
+  struct cras_client_stream_connected out_msg;
+  int rc;
+
+  cras_rstream_create_stream_out = rstream_;
+  cras_iodev_attach_stream_retval = 0;
+
+  fd_ = 100;
+  rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
+                                                 &fd_, 1);
+  EXPECT_EQ(0, rc);
+  EXPECT_EQ(1, cras_make_fd_nonblocking_called);
+
+  rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
+  EXPECT_EQ(sizeof(out_msg), rc);
+  EXPECT_EQ(stream_id_, out_msg.stream_id);
+  EXPECT_EQ(0, out_msg.err);
+  EXPECT_EQ(1, cras_rstream_config_init_with_message_called);
   EXPECT_EQ(1, stream_list_add_stream_called);
   EXPECT_EQ(0, stream_list_disconnect_stream_called);
   EXPECT_EQ(1, cras_server_metrics_stream_config_called);
@@ -245,8 +354,9 @@ TEST_F(RClientMessagesSuite, SuccessCreateThreadReply) {
   cras_rstream_create_stream_out = rstream_;
   cras_iodev_attach_stream_retval = 0;
 
+  fd_ = 100;
   rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
-                                                 100);
+                                                 &fd_, 1);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_make_fd_nonblocking_called);
 
@@ -254,6 +364,7 @@ TEST_F(RClientMessagesSuite, SuccessCreateThreadReply) {
   EXPECT_EQ(sizeof(out_msg), rc);
   EXPECT_EQ(stream_id_, out_msg.stream_id);
   EXPECT_EQ(0, out_msg.err);
+  EXPECT_EQ(1, cras_rstream_config_init_with_message_called);
   EXPECT_EQ(1, stream_list_add_stream_called);
   EXPECT_EQ(0, stream_list_disconnect_stream_called);
   EXPECT_EQ(1, cras_server_metrics_stream_config_called);
@@ -267,7 +378,8 @@ TEST_F(RClientMessagesSuite, SetVolume) {
   msg.header.length = sizeof(msg);
   msg.volume = 66;
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_volume_called);
   EXPECT_EQ(66, cras_system_set_volume_value);
@@ -281,7 +393,8 @@ TEST_F(RClientMessagesSuite, SetCaptureVolume) {
   msg.header.length = sizeof(msg);
   msg.volume = 66;
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_capture_gain_called);
   EXPECT_EQ(66, cras_system_set_capture_gain_value);
@@ -295,13 +408,15 @@ TEST_F(RClientMessagesSuite, SetMute) {
   msg.header.length = sizeof(msg);
   msg.mute = 1;
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_mute_called);
   EXPECT_EQ(1, cras_system_set_mute_value);
 
   msg.header.id = CRAS_SERVER_SET_SYSTEM_MUTE_LOCKED;
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_mute_locked_called);
   EXPECT_EQ(1, cras_system_set_mute_locked_value);
@@ -315,7 +430,8 @@ TEST_F(RClientMessagesSuite, SetUserMute) {
   msg.header.length = sizeof(msg);
   msg.mute = 1;
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_user_mute_called);
   EXPECT_EQ(1, cras_system_set_user_mute_value);
@@ -329,13 +445,15 @@ TEST_F(RClientMessagesSuite, SetCaptureMute) {
   msg.header.length = sizeof(msg);
   msg.mute = 1;
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_capture_mute_called);
   EXPECT_EQ(1, cras_system_set_capture_mute_value);
 
   msg.header.id = CRAS_SERVER_SET_SYSTEM_CAPTURE_MUTE_LOCKED;
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_set_capture_mute_locked_called);
   EXPECT_EQ(1, cras_system_set_capture_mute_locked_value);
@@ -345,7 +463,8 @@ TEST_F(RClientMessagesSuite, DumpSnapshots) {
   struct cras_dump_snapshots msg;
   int rc;
   cras_fill_dump_snapshots(&msg);
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(1, cras_system_state_dump_snapshots_called);
 }
@@ -366,7 +485,8 @@ void RClientMessagesSuite::RegisterNotification(
   EXPECT_EQ(msg.do_register, do_register);
   EXPECT_EQ(msg.msg_id, msg_id);
 
-  rc = rclient_->ops->handle_message_from_client(rclient_, &msg.header, -1);
+  rc =
+      rclient_->ops->handle_message_from_client(rclient_, &msg.header, NULL, 0);
   EXPECT_EQ(0, rc);
   EXPECT_EQ(cras_observer_register_notify_called, cras_observer_get_ops_called);
   EXPECT_EQ(cras_observer_register_notify_called,
@@ -686,6 +806,10 @@ int audio_thread_set_aec_dump(struct audio_thread* thread,
   return 0;
 }
 
+int audio_thread_event_log_shm_fd() {
+  return -1;
+}
+
 #ifdef HAVE_WEBRTC_APM
 void cras_apm_list_reload_aec_config() {}
 #endif
@@ -889,5 +1013,17 @@ int cras_server_metrics_stream_config(struct cras_rstream_config* config) {
   cras_server_metrics_stream_config_called++;
   return 0;
 }
+
+void cras_rstream_config_init_with_message(
+    struct cras_rclient* client,
+    const struct cras_connect_message* msg,
+    int* aud_fd,
+    int* client_shm_fd,
+    const struct cras_audio_format* remote_fmt,
+    struct cras_rstream_config* stream_config) {
+  cras_rstream_config_init_with_message_called++;
+}
+
+void cras_rstream_config_cleanup(struct cras_rstream_config* stream_config) {}
 
 }  // extern "C"

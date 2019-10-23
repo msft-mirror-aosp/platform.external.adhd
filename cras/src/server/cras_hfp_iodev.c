@@ -51,8 +51,9 @@ static int update_supported_formats(struct cras_iodev *iodev)
 	iodev->supported_rates = (size_t *)malloc(2 * sizeof(size_t));
 
 	iodev->supported_rates[0] =
-		(hfp_slc_get_selected_codec(hfpio->slc) == HFP_CODEC_ID_MSBC)
-			? 16000 : 8000;
+		(hfp_slc_get_selected_codec(hfpio->slc) == HFP_CODEC_ID_MSBC) ?
+			16000 :
+			8000;
 	iodev->supported_rates[1] = 0;
 
 	free(iodev->supported_channel_counts);
@@ -81,19 +82,17 @@ static int no_stream(struct cras_iodev *iodev, int enable)
 
 	hw_level = iodev->frames_queued(iodev, &hw_tstamp);
 	if (enable) {
-		if (!hfpio->drain_complete &&
-		    (hw_level <= hfpio->filled_zeros))
+		if (!hfpio->drain_complete && (hw_level <= hfpio->filled_zeros))
 			hfpio->drain_complete = 1;
-		hfpio->filled_zeros +=
-			hfp_fill_output_with_zeros(hfpio->info, iodev,
-						   iodev->buffer_size);
+		hfpio->filled_zeros += hfp_fill_output_with_zeros(
+			hfpio->info, iodev->buffer_size);
 		return 0;
 	}
 
 	/* Leave no stream state.*/
 	level_target = iodev->min_cb_level;
 	if (hfpio->drain_complete) {
-		hfp_force_output_level(hfpio->info, iodev, level_target);
+		hfp_force_output_level(hfpio->info, level_target);
 	} else {
 		unsigned int valid_samples = 0;
 		if (hw_level > hfpio->filled_zeros)
@@ -101,11 +100,10 @@ static int no_stream(struct cras_iodev *iodev, int enable)
 		level_target = MAX(level_target, valid_samples);
 
 		if (level_target > hw_level)
-			hfp_fill_output_with_zeros(hfpio->info, iodev,
+			hfp_fill_output_with_zeros(hfpio->info,
 						   level_target - hw_level);
 		else
-			hfp_force_output_level(hfpio->info, iodev,
-					       level_target);
+			hfp_force_output_level(hfpio->info, level_target);
 	}
 	hfpio->drain_complete = 0;
 	hfpio->filled_zeros = 0;
@@ -124,7 +122,7 @@ static int frames_queued(const struct cras_iodev *iodev,
 	/* Do not enable timestamp mechanism on HFP device because last time
 	 * stamp might be a long time ago and it is not really useful. */
 	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
-	return hfp_buf_queued(hfpio->info, iodev);
+	return hfp_buf_queued(hfpio->info, iodev->direction);
 }
 
 static int configure_dev(struct cras_iodev *iodev)
@@ -141,14 +139,13 @@ static int configure_dev(struct cras_iodev *iodev)
 	if (hfp_info_running(hfpio->info))
 		goto add_dev;
 
-	sk = cras_bt_device_sco_connect(
-			hfpio->device,
-			hfp_slc_get_selected_codec(hfpio->slc));
+	sk = cras_bt_device_sco_connect(hfpio->device,
+					hfp_slc_get_selected_codec(hfpio->slc));
 	if (sk < 0)
 		goto error;
 
-	mtu = cras_bt_device_sco_packet_size(hfpio->device, sk,
-			hfp_slc_get_selected_codec(hfpio->slc));
+	mtu = cras_bt_device_sco_packet_size(
+		hfpio->device, sk, hfp_slc_get_selected_codec(hfpio->slc));
 
 	/* Start hfp_info */
 	err = hfp_info_start(sk, mtu, hfpio->info);
@@ -158,10 +155,10 @@ static int configure_dev(struct cras_iodev *iodev)
 	hfpio->drain_complete = 0;
 	hfpio->filled_zeros = 0;
 add_dev:
-	hfp_info_add_iodev(hfpio->info, iodev);
+	hfp_info_add_iodev(hfpio->info, iodev->direction, iodev->format);
 	hfp_set_call_status(hfpio->slc, 1);
 
-	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev);
+	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev->direction);
 
 	return 0;
 error:
@@ -173,7 +170,7 @@ static int close_dev(struct cras_iodev *iodev)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
-	hfp_info_rm_iodev(hfpio->info, iodev);
+	hfp_info_rm_iodev(hfpio->info, iodev->direction);
 	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info)) {
 		hfp_info_stop(hfpio->info);
 		hfp_set_call_status(hfpio->slc, 0);
@@ -191,7 +188,8 @@ static void set_hfp_volume(struct cras_iodev *iodev)
 
 	volume = cras_system_get_volume();
 	if (iodev->active_node)
-		volume = cras_iodev_adjust_node_volume(iodev->active_node, volume);
+		volume = cras_iodev_adjust_node_volume(iodev->active_node,
+						       volume);
 
 	hfp_event_speaker_gain(hfpio->slc, volume);
 }
@@ -203,8 +201,7 @@ static int delay_frames(const struct cras_iodev *iodev)
 	return frames_queued(iodev, &tstamp);
 }
 
-static int get_buffer(struct cras_iodev *iodev,
-		      struct cras_audio_area **area,
+static int get_buffer(struct cras_iodev *iodev, struct cras_audio_area **area,
 		      unsigned *frames)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
@@ -213,7 +210,7 @@ static int get_buffer(struct cras_iodev *iodev,
 	if (!hfp_info_running(hfpio->info))
 		return -1;
 
-	hfp_buf_acquire(hfpio->info, iodev, &dst, frames);
+	hfp_buf_acquire(hfpio->info, iodev->direction, &dst, frames);
 
 	iodev->area->frames = *frames;
 	/* HFP is mono only. */
@@ -232,7 +229,7 @@ static int put_buffer(struct cras_iodev *iodev, unsigned nwritten)
 	if (!hfp_info_running(hfpio->info))
 		return -1;
 
-	hfp_buf_release(hfpio->info, iodev, nwritten);
+	hfp_buf_release(hfpio->info, iodev->direction, nwritten);
 	return 0;
 }
 
@@ -242,8 +239,8 @@ static int flush_buffer(struct cras_iodev *iodev)
 	unsigned nframes;
 
 	if (iodev->direction == CRAS_STREAM_INPUT) {
-		nframes = hfp_buf_queued(hfpio->info, iodev);
-		hfp_buf_release(hfpio->info, iodev, nframes);
+		nframes = hfp_buf_queued(hfpio->info, iodev->direction);
+		hfp_buf_release(hfpio->info, iodev->direction, nframes);
 	}
 	return 0;
 }
@@ -267,12 +264,11 @@ void hfp_free_resources(struct hfp_io *hfpio)
 	cras_iodev_free_resources(&hfpio->base);
 }
 
-struct cras_iodev *hfp_iodev_create(
-		enum CRAS_STREAM_DIRECTION dir,
-		struct cras_bt_device *device,
-		struct hfp_slc_handle *slc,
-		enum cras_bt_device_profile profile,
-		struct hfp_info *info)
+struct cras_iodev *hfp_iodev_create(enum CRAS_STREAM_DIRECTION dir,
+				    struct cras_bt_device *device,
+				    struct hfp_slc_handle *slc,
+				    enum cras_bt_device_profile profile,
+				    struct hfp_info *info)
 {
 	struct hfp_io *hfpio;
 	struct cras_iodev *iodev;
@@ -296,13 +292,12 @@ struct cras_iodev *hfp_iodev_create(
 
 	snprintf(iodev->info.name, sizeof(iodev->info.name), "%s", name);
 	iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] = 0;
-	iodev->info.stable_id = SuperFastHash(
-			cras_bt_device_object_path(device),
-			strlen(cras_bt_device_object_path(device)),
-			strlen(cras_bt_device_object_path(device)));
-	iodev->info.stable_id_new = iodev->info.stable_id;
+	iodev->info.stable_id =
+		SuperFastHash(cras_bt_device_object_path(device),
+			      strlen(cras_bt_device_object_path(device)),
+			      strlen(cras_bt_device_object_path(device)));
 
-	iodev->configure_dev= configure_dev;
+	iodev->configure_dev = configure_dev;
 	iodev->frames_queued = frames_queued;
 	iodev->delay_frames = delay_frames;
 	iodev->get_buffer = get_buffer;
