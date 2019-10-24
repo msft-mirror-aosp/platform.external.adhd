@@ -4,12 +4,13 @@
  */
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE /* for ppoll */
+#define _GNU_SOURCE /* for ppoll and asprintf*/
 #endif
 
 #include <pthread.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/param.h>
 #include <syslog.h>
 
@@ -20,6 +21,7 @@
 #include "cras_fmt_conv.h"
 #include "cras_iodev.h"
 #include "cras_rstream.h"
+#include "cras_server_metrics.h"
 #include "cras_system_state.h"
 #include "cras_types.h"
 #include "cras_util.h"
@@ -102,11 +104,16 @@ struct audio_thread_aec_dump_msg {
 	int fd;
 };
 
-/* Audio thread logging. */
+/* Audio thread logging. If atlog is successfully created from cras_shm_setup,
+ * then the fds should have valid value. Or audio thread will fallback to use
+ * calloc to create atlog and leave the fds as -1.
+ */
 struct audio_thread_event_log *atlog;
+char *atlog_name;
+int atlog_rw_shm_fd;
+int atlog_ro_shm_fd;
 
 static struct iodev_callback_list *iodev_callbacks;
-static struct timespec longest_wake;
 
 struct iodev_callback_list {
 	int fd;
@@ -500,6 +507,8 @@ static void append_dev_dump_info(struct audio_dev_debug_info *di,
 	subtract_timespecs(&now, &adev->dev->open_ts, &time_since);
 	di->runtime_sec = time_since.tv_sec;
 	di->runtime_nsec = time_since.tv_nsec;
+	di->longest_wake_sec = adev->longest_wake.tv_sec;
+	di->longest_wake_nsec = adev->longest_wake.tv_nsec;
 
 	if (fmt) {
 		di->frame_rate = fmt->frame_rate;
@@ -526,6 +535,7 @@ static void append_stream_dump_info(struct audio_debug_info *info,
 	si->dev_idx = dev_idx;
 	si->direction = stream->stream->direction;
 	si->stream_type = stream->stream->stream_type;
+	si->client_type = stream->stream->client_type;
 	si->buffer_frames = stream->stream->buffer_frames;
 	si->cb_threshold = stream->stream->cb_threshold;
 	si->frame_rate = stream->stream->format.frame_rate;
@@ -545,9 +555,6 @@ static void append_stream_dump_info(struct audio_debug_info *info,
 	subtract_timespecs(&now, &stream->stream->start_ts, &time_since);
 	si->runtime_sec = time_since.tv_sec;
 	si->runtime_nsec = time_since.tv_nsec;
-
-	longest_wake.tv_sec = 0;
-	longest_wake.tv_nsec = 0;
 }
 
 /* Handle a message sent to the playback thread */
@@ -755,13 +762,40 @@ static struct pollfd *add_pollfd(struct audio_thread *thread, int fd,
 }
 
 static int continuous_zero_sleep_count = 0;
+static unsigned busyloop_count = 0;
+
+/*
+ * Logs the number of busyloop during one audio thread running state
+ * (wait_ts != NULL).
+ */
+static void log_busyloop(struct timespec *wait_ts)
+{
+	static struct timespec start_time;
+	static bool started = false;
+	struct timespec diff, now;
+
+	/* If wait_ts is NULL, there is no stream running. */
+	if (wait_ts && !started) {
+		started = true;
+		busyloop_count = 0;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &start_time);
+	} else if (!wait_ts && started) {
+		started = false;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+		subtract_timespecs(&now, &start_time, &diff);
+		cras_server_metrics_busyloop(&diff, busyloop_count);
+	}
+}
+
 static void check_busyloop(struct timespec *wait_ts)
 {
 	if (wait_ts->tv_sec == 0 && wait_ts->tv_nsec == 0) {
 		continuous_zero_sleep_count++;
 		if (continuous_zero_sleep_count ==
-		    MAX_CONTINUOUS_ZERO_SLEEP_COUNT)
-			cras_audio_thread_busyloop();
+		    MAX_CONTINUOUS_ZERO_SLEEP_COUNT) {
+			busyloop_count++;
+			cras_audio_thread_event_busyloop();
+		}
 	} else {
 		continuous_zero_sleep_count = 0;
 	}
@@ -779,7 +813,7 @@ static void *audio_io_thread(void *arg)
 	struct audio_thread *thread = (struct audio_thread *)arg;
 	struct open_dev *adev;
 	struct dev_stream *curr;
-	struct timespec ts, now, last_wake;
+	struct timespec ts;
 	int msg_fd;
 	int rc;
 
@@ -788,10 +822,6 @@ static void *audio_io_thread(void *arg)
 	/* Attempt to get realtime scheduling */
 	if (cras_set_rt_scheduling(CRAS_SERVER_RT_THREAD_PRIORITY) == 0)
 		cras_set_thread_priority(CRAS_SERVER_RT_THREAD_PRIORITY);
-
-	last_wake.tv_sec = 0;
-	longest_wake.tv_sec = 0;
-	longest_wake.tv_nsec = 0;
 
 	thread->pollfds[0].fd = msg_fd;
 	thread->pollfds[0].events = POLLIN;
@@ -843,20 +873,18 @@ static void *audio_io_thread(void *arg)
 			}
 		}
 
-		if (last_wake.tv_sec) {
-			struct timespec this_wake;
-			clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-			subtract_timespecs(&now, &last_wake, &this_wake);
-			if (timespec_after(&this_wake, &longest_wake))
-				longest_wake = this_wake;
-		}
+		log_busyloop(wait_ts);
 
 		ATLOG(atlog, AUDIO_THREAD_SLEEP, wait_ts ? wait_ts->tv_sec : 0,
-		      wait_ts ? wait_ts->tv_nsec : 0, longest_wake.tv_nsec);
+		      wait_ts ? wait_ts->tv_nsec : 0, 0);
 		if (wait_ts)
 			check_busyloop(wait_ts);
+
+		/* Sync atlog with shared memory. */
+		__sync_synchronize();
+		atlog->sync_write_pos = atlog->write_pos;
+
 		rc = ppoll(thread->pollfds, thread->num_pollfds, wait_ts, NULL);
-		clock_gettime(CLOCK_MONOTONIC_RAW, &last_wake);
 		ATLOG(atlog, AUDIO_THREAD_WAKE, rc, 0, 0);
 		if (rc <= 0)
 			continue;
@@ -864,7 +892,7 @@ static void *audio_io_thread(void *arg)
 		if (thread->pollfds[0].revents & POLLIN) {
 			rc = handle_playback_thread_message(thread);
 			if (rc < 0)
-				syslog(LOG_INFO, "handle message %d", rc);
+				syslog(LOG_ERR, "handle message %d", rc);
 		}
 
 		DL_FOREACH (iodev_callbacks, iodev_cb) {
@@ -977,6 +1005,11 @@ init_device_start_ramp_msg(struct audio_thread_dev_start_ramp_msg *msg,
 }
 
 /* Exported Interface */
+
+int audio_thread_event_log_shm_fd()
+{
+	return atlog_ro_shm_fd;
+}
 
 int audio_thread_add_stream(struct audio_thread *thread,
 			    struct cras_rstream *stream,
@@ -1136,7 +1169,12 @@ struct audio_thread *audio_thread_create()
 		return NULL;
 	}
 
-	atlog = audio_thread_event_log_init();
+	if (asprintf(&atlog_name, "/ATlog-%d", getpid()) < 0) {
+		syslog(LOG_ERR, "Failed to generate ATlog name.");
+		exit(-1);
+	}
+
+	atlog = audio_thread_event_log_init(atlog_name);
 
 	thread->pollfds_size = 32;
 	thread->pollfds = (struct pollfd *)malloc(sizeof(*thread->pollfds) *
@@ -1229,7 +1267,8 @@ void audio_thread_destroy(struct audio_thread *thread)
 
 	free(thread->pollfds);
 
-	audio_thread_event_log_deinit(atlog);
+	audio_thread_event_log_deinit(atlog, atlog_name);
+	free(atlog_name);
 
 	if (thread->to_thread_fds[0] != -1) {
 		close(thread->to_thread_fds[0]);
