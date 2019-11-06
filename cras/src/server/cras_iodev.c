@@ -1048,6 +1048,17 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 	int rc;
 	struct cras_loopback *loopback;
 
+	/* Calculate whether the final output was non-empty, if requested. */
+	if (is_non_empty) {
+		unsigned int i;
+		for (i = 0; i < nframes * cras_get_format_bytes(fmt); i++) {
+			if (frames[i]) {
+				*is_non_empty = 1;
+				break;
+			}
+		}
+	}
+
 	DL_FOREACH (iodev->loopbacks, loopback) {
 		if (loopback->type == LOOPBACK_POST_MIX_PRE_DSP)
 			loopback->hook_data(frames, nframes, iodev->format,
@@ -1074,9 +1085,6 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 	    ramp_action.type != CRAS_RAMP_ACTION_PARTIAL) {
 		const unsigned int frame_bytes = cras_get_format_bytes(fmt);
 		cras_mix_mute_buffer(frames, frame_bytes, nframes);
-
-		// Skip non-empty check, since we know it's empty.
-		is_non_empty = NULL;
 	}
 
 	/* Compute scaler for software volume if needed. */
@@ -1115,17 +1123,6 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 					   frames, nframes);
 	if (iodev->rate_est)
 		rate_estimator_add_frames(iodev->rate_est, nframes);
-
-	// Calculate whether the final output was non-empty, if requested.
-	if (is_non_empty) {
-		unsigned int i;
-		for (i = 0; i < nframes * cras_get_format_bytes(fmt); i++) {
-			if (frames[i]) {
-				*is_non_empty = 1;
-				break;
-			}
-		}
-	}
 
 	return iodev->put_buffer(iodev, nframes);
 }
@@ -1247,7 +1244,7 @@ int cras_iodev_frames_queued(struct cras_iodev *iodev,
 
 	rc = iodev->frames_queued(iodev, hw_tstamp);
 	if (rc == -EPIPE)
-		cras_audio_thread_severe_underrun();
+		cras_audio_thread_event_severe_underrun();
 
 	if (rc < 0)
 		return rc;
@@ -1309,7 +1306,7 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 
 int cras_iodev_output_underrun(struct cras_iodev *odev)
 {
-	cras_audio_thread_underrun();
+	cras_audio_thread_event_underrun();
 	if (odev->output_underrun)
 		return odev->output_underrun(odev);
 	else
@@ -1545,4 +1542,60 @@ void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
 					unsigned int hw_level)
 {
 	iodev->highest_hw_level = MAX(iodev->highest_hw_level, hw_level);
+}
+
+/*
+ * Makes an input device drop the given number of frames.
+ * Args:
+ *    iodev - The device.
+ *    frames - How many frames will be dropped in a device.
+ * Returns:
+ *    The number of frames have been dropped. Negative error code on failure.
+ */
+static int cras_iodev_drop_frames(struct cras_iodev *iodev, unsigned int frames)
+{
+	struct timespec hw_tstamp;
+	int rc;
+
+	if (iodev->direction != CRAS_STREAM_INPUT)
+		return -EINVAL;
+
+	rc = cras_iodev_frames_queued(iodev, &hw_tstamp);
+	if (rc < 0)
+		return rc;
+
+	frames = MIN(frames, rc);
+
+	rc = iodev->get_buffer(iodev, &iodev->input_data->area, &frames);
+	if (rc < 0)
+		return rc;
+
+	rc = iodev->put_buffer(iodev, frames);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * Tell rate estimator that some frames have been dropped to avoid calculating
+	 * the wrong rate.
+	 */
+	rate_estimator_add_frames(iodev->rate_est, -frames);
+
+	ATLOG(atlog, AUDIO_THREAD_DEV_DROP_FRAMES, iodev->info.idx, frames, 0);
+
+	return frames;
+}
+
+int cras_iodev_drop_frames_by_time(struct cras_iodev *iodev, struct timespec ts)
+{
+	int frames_to_set;
+	double est_rate;
+	int rc;
+
+	est_rate = iodev->format->frame_rate *
+		   cras_iodev_get_est_rate_ratio(iodev);
+	frames_to_set = cras_time_to_frames(&ts, est_rate);
+
+	rc = cras_iodev_drop_frames(iodev, frames_to_set);
+
+	return rc;
 }

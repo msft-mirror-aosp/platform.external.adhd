@@ -45,6 +45,7 @@
 #define DEFAULT_SCO_PKT_SIZE USB_CVSD_PKT_SIZE
 
 static const unsigned int PROFILE_SWITCH_DELAY_MS = 500;
+static const unsigned int PROFILE_DROP_SUSPEND_DELAY_MS = 5000;
 
 /* Check profile connections every 2 seconds and rerty 30 times maximum.
  * Attemp to connect profiles which haven't been ready every 3 retries.
@@ -52,6 +53,11 @@ static const unsigned int PROFILE_SWITCH_DELAY_MS = 500;
 static const unsigned int CONN_WATCH_PERIOD_MS = 2000;
 static const unsigned int CONN_WATCH_MAX_RETRIES = 30;
 static const unsigned int PROFILE_CONN_RETRIES = 3;
+
+static const unsigned int CRAS_SUPPORTED_PROFILES =
+	CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
+	CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE |
+	CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY;
 
 /* Object to represent a general bluetooth device, and used to
  * associate with some CRAS modules if it supports audio.
@@ -76,7 +82,6 @@ static const unsigned int PROFILE_CONN_RETRIES = 3;
  *    suspend_timer - The timer used to suspend device.
  *    switch_profile_timer - The timer used to delay enabling iodev after
  *        profile switch.
- *    append_iodev_cb - The callback to trigger when an iodev is appended.
  *    sco_fd - The file descriptor of the SCO connection.
  *    sco_ref_count - The reference counts of the SCO connection.
  */
@@ -99,7 +104,6 @@ struct cras_bt_device {
 	struct cras_timer *conn_watch_timer;
 	struct cras_timer *suspend_timer;
 	struct cras_timer *switch_profile_timer;
-	void (*append_iodev_cb)(void *data);
 	int sco_fd;
 	size_t sco_ref_count;
 
@@ -122,12 +126,6 @@ struct bt_device_msg {
 };
 
 static struct cras_bt_device *devices;
-
-void cras_bt_device_set_append_iodev_cb(struct cras_bt_device *device,
-					void (*cb)(void *data))
-{
-	device->append_iodev_cb = cb;
-}
 
 enum cras_bt_device_profile cras_bt_device_profile_from_uuid(const char *uuid)
 {
@@ -383,10 +381,6 @@ void cras_bt_device_append_iodev(struct cras_bt_device *device,
 	if (bt_iodev) {
 		cras_bt_io_append(bt_iodev, iodev, profile);
 	} else {
-		if (device->append_iodev_cb) {
-			device->append_iodev_cb(device);
-			device->append_iodev_cb = NULL;
-		}
 		device->bt_iodevs[iodev->direction] =
 			cras_bt_io_create(device, iodev, profile);
 	}
@@ -460,39 +454,28 @@ int cras_bt_device_can_switch_to_a2dp(struct cras_bt_device *device)
 	       (!idev || !cras_iodev_is_open(idev));
 }
 
+static void bt_device_remove_conflict(struct cras_bt_device *device)
+{
+	struct cras_bt_device *connected;
+
+	/* Suspend other HFP audio gateways that conflict with device. */
+	cras_hfp_ag_remove_conflict(device);
+
+	/* Check if there's conflict A2DP headset and suspend it. */
+	connected = cras_a2dp_connected_device();
+	if (connected && (connected != device))
+		cras_a2dp_suspend_connected_device(connected);
+}
+
 int cras_bt_device_audio_gateway_initialized(struct cras_bt_device *device)
 {
-	int rc = 0;
-	struct cras_tm *tm;
-
 	BTLOG(btlog, BT_AUDIO_GATEWAY_INIT, device->profiles, 0);
 	/* Marks HFP/HSP as connected. This is what connection watcher
 	 * checks. */
 	device->connected_profiles |= (CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE |
 				       CRAS_BT_DEVICE_PROFILE_HSP_HEADSET);
 
-	/* If this is a HFP/HSP only headset, no need to wait for A2DP. */
-	if (!cras_bt_device_supports_profile(
-		    device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK)) {
-		syslog(LOG_DEBUG,
-		       "Start HFP audio gateway as A2DP is not supported");
-
-		rc = cras_hfp_ag_start(device);
-		if (rc) {
-			syslog(LOG_ERR, "Start audio gateway failed");
-			return rc;
-		}
-		if (device->conn_watch_timer) {
-			tm = cras_system_state_get_tm();
-			cras_tm_cancel_timer(tm, device->conn_watch_timer);
-			device->conn_watch_timer = NULL;
-		}
-	} else {
-		syslog(LOG_DEBUG, "HFP audio gateway is connected but A2DP "
-				  "is not connected yet");
-	}
-
-	return rc;
+	return 0;
 }
 
 int cras_bt_device_get_active_profile(const struct cras_bt_device *device)
@@ -560,10 +543,15 @@ static void bt_device_conn_watch_cb(struct cras_timer *timer, void *arg)
 {
 	struct cras_tm *tm;
 	struct cras_bt_device *device = (struct cras_bt_device *)arg;
+	int rc;
 
 	BTLOG(btlog, BT_DEV_CONN_WATCH_CB, device->conn_watch_retries,
 	      device->profiles);
 	device->conn_watch_timer = NULL;
+
+	/* Skip the callback if it is not an audio device. */
+	if (!device->profiles)
+		return;
 
 	/* If A2DP is not ready, try connect it after a while. */
 	if (cras_bt_device_supports_profile(device,
@@ -587,21 +575,27 @@ static void bt_device_conn_watch_cb(struct cras_timer *timer, void *arg)
 		goto arm_retry_timer;
 	}
 
-	if (cras_bt_device_is_profile_connected(
-		    device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK)) {
-		/* When A2DP-only device connected, suspend all HFP/HSP audio
-		 * gateways. */
-		if (!cras_bt_device_supports_profile(
-			    device, CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE |
-					    CRAS_BT_DEVICE_PROFILE_HSP_HEADSET))
-			cras_hfp_ag_suspend();
+	/* Expected profiles are all connected, no more connection watch
+	 * callback will be scheduled.
+	 * Base on the decision that we expose only the latest connected
+	 * BT audio device to user, treat all other connected devices as
+	 * conflict and remove them before we start A2DP/HFP of this device.
+	 */
+	bt_device_remove_conflict(device);
 
+	if (cras_bt_device_is_profile_connected(
+		    device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK))
 		cras_a2dp_start(device);
-	}
 
 	if (cras_bt_device_is_profile_connected(
-		    device, CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE))
-		cras_hfp_ag_start(device);
+		    device, CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE)) {
+		rc = cras_hfp_ag_start(device);
+		if (rc) {
+			syslog(LOG_ERR, "Start audio gateway failed, rc %d",
+			       rc);
+			bt_device_schedule_suspend(device, 0);
+		}
+	}
 	return;
 
 arm_retry_timer:
@@ -632,11 +626,9 @@ cras_bt_device_start_new_conn_watch_timer(struct cras_bt_device *device)
 		tm, CONN_WATCH_PERIOD_MS, bt_device_conn_watch_cb, device);
 }
 
-static void cras_bt_device_set_connected(struct cras_bt_device *device,
-					 int value)
+void cras_bt_device_set_connected(struct cras_bt_device *device, int value)
 {
 	struct cras_tm *tm = cras_system_state_get_tm();
-
 	if (device->connected || value)
 		BTLOG(btlog, BT_DEV_CONNECTED_CHANGE, device->profiles, value);
 
@@ -648,12 +640,23 @@ static void cras_bt_device_set_connected(struct cras_bt_device *device,
 
 	device->connected = value;
 
-	if (device->connected) {
-		cras_bt_device_start_new_conn_watch_timer(device);
-	} else if (device->conn_watch_timer) {
+	if (!device->connected && device->conn_watch_timer) {
 		cras_tm_cancel_timer(tm, device->conn_watch_timer);
 		device->conn_watch_timer = NULL;
 	}
+}
+
+void cras_bt_device_notify_profile_dropped(struct cras_bt_device *device,
+					   enum cras_bt_device_profile profile)
+{
+	device->connected_profiles &= !profile;
+
+	/* If any profile, a2dp or hfp/hsp, has dropped for some reason,
+	 * we shall make sure this device is fully disconnected within
+	 * given time so that user does not see a headset stay connected
+	 * but works with partial function.
+	 */
+	bt_device_schedule_suspend(device, PROFILE_DROP_SUSPEND_DELAY_MS);
 }
 
 /*
@@ -665,14 +668,9 @@ static void cras_bt_device_set_connected(struct cras_bt_device *device,
  * Returns:
  *    True if uuid is a new audio profiles not already supported by device.
  */
-static int update_supported_profiles(struct cras_bt_device *device,
-				     const char *uuid)
+int cras_bt_device_add_supported_profiles(struct cras_bt_device *device,
+					  const char *uuid)
 {
-	static unsigned int audio_profiles =
-		CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-		CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE |
-		CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY;
-
 	enum cras_bt_device_profile profile =
 		cras_bt_device_profile_from_uuid(uuid);
 
@@ -685,21 +683,20 @@ static int update_supported_profiles(struct cras_bt_device *device,
 
 	/* Log this event as we might need to re-intialize the BT audio nodes
 	 * if new audio profile is reported for already connected device. */
-	if (device->connected && (profile & audio_profiles))
+	if (device->connected && (profile & CRAS_SUPPORTED_PROFILES))
 		BTLOG(btlog, BT_NEW_AUDIO_PROFILE_AFTER_CONNECT,
 		      device->profiles, profile);
 	device->profiles |= profile;
 	cras_bt_device_log_profile(device, profile);
 
-	return (profile & audio_profiles);
+	return (profile & CRAS_SUPPORTED_PROFILES);
 }
 
 void cras_bt_device_update_properties(struct cras_bt_device *device,
 				      DBusMessageIter *properties_array_iter,
 				      DBusMessageIter *invalidated_array_iter)
 {
-	int has_new_audio_profile = 0;
-
+	int watch_needed = 0;
 	while (dbus_message_iter_get_arg_type(properties_array_iter) !=
 	       DBUS_TYPE_INVALID) {
 		DBusMessageIter properties_dict_iter, variant_iter;
@@ -750,6 +747,10 @@ void cras_bt_device_update_properties(struct cras_bt_device *device,
 				device->trusted = value;
 			} else if (strcmp(key, "Connected") == 0) {
 				cras_bt_device_set_connected(device, value);
+				watch_needed = device->connected &&
+					       cras_bt_device_supports_profile(
+						       device,
+						       CRAS_SUPPORTED_PROFILES);
 			}
 
 		} else if (strcmp(dbus_message_iter_get_signature(&variant_iter),
@@ -766,8 +767,18 @@ void cras_bt_device_update_properties(struct cras_bt_device *device,
 				dbus_message_iter_get_basic(&uuid_array_iter,
 							    &uuid);
 
-				has_new_audio_profile =
-					update_supported_profiles(device, uuid);
+				/*
+				 * If updated properties includes new audio
+				 * profile, and device is connected, we need
+				 * to start connection watcher. This is needed
+				 * because on some bluetooth device, supported
+				 * profiles do not present when device
+				 * interface is added and they are updated
+				 * later.
+				 */
+				if (cras_bt_device_add_supported_profiles(
+					    device, uuid))
+					watch_needed = device->connected;
 
 				dbus_message_iter_next(&uuid_array_iter);
 			}
@@ -807,14 +818,8 @@ void cras_bt_device_update_properties(struct cras_bt_device *device,
 		dbus_message_iter_next(invalidated_array_iter);
 	}
 
-	/* If updated properties includes new audio profile, and device is
-	 * connected, we need to start connection watcher. This is needed
-	 * because on some bluetooth device, supported profiles do not present
-	 * when device interface is added and they are updated later.
-	 */
-	if (has_new_audio_profile && device->connected) {
+	if (watch_needed)
 		cras_bt_device_start_new_conn_watch_timer(device);
-	}
 }
 
 /* Converts bluetooth address string into sockaddr structure. The address
@@ -1144,11 +1149,13 @@ static void bt_device_suspend_cb(struct cras_timer *timer, void *arg)
 {
 	struct cras_bt_device *device = (struct cras_bt_device *)arg;
 
-	BTLOG(btlog, BT_DEV_SUSPEND_CB, 0, 0);
+	BTLOG(btlog, BT_DEV_SUSPEND_CB, device->profiles,
+	      device->connected_profiles);
 	device->suspend_timer = NULL;
 
 	cras_a2dp_suspend_connected_device(device);
 	cras_hfp_ag_suspend_connected_device(device);
+	cras_bt_device_disconnect(device->conn, device);
 }
 
 static void bt_device_schedule_suspend(struct cras_bt_device *device,

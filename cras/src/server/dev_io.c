@@ -9,6 +9,7 @@
 
 #include "audio_thread_log.h"
 #include "cras_audio_area.h"
+#include "cras_audio_thread_monitor.h"
 #include "cras_iodev.h"
 #include "cras_non_empty_audio_handler.h"
 #include "cras_rstream.h"
@@ -16,6 +17,7 @@
 #include "dev_stream.h"
 #include "input_data.h"
 #include "polled_interval_checker.h"
+#include "rate_estimator.h"
 #include "utlist.h"
 
 #include "dev_io.h"
@@ -32,6 +34,15 @@ static const int NON_EMPTY_UPDATE_INTERVAL_SEC = 5;
  * played before a device is considered to be playing empty audio.
  */
 static const int MIN_EMPTY_PERIOD_SEC = 30;
+
+/*
+ * When the hw_level is less than this time, do not drop frames.
+ * (unit: millisecond).
+ * TODO(yuhsuan): Reduce the threshold when we create the other overrun op for
+ * boards which captures a lot of frames at one time.
+ * e.g. Input devices on grunt reads 1024 frames each time.
+ */
+static const int DROP_FRAMES_THRESHOLD_MS = 50;
 
 /* The number of devices playing/capturing non-empty stream(s). */
 static int non_empty_device_count = 0;
@@ -323,12 +334,31 @@ static int get_input_dev_max_wake_ts(struct open_dev *adev,
 	return 0;
 }
 
+/* Returns whether a device can drop samples. */
+static bool input_devices_can_drop_samples(struct cras_iodev *iodev)
+{
+	if (!cras_iodev_is_open(iodev))
+		return false;
+	if (!iodev->streams)
+		return false;
+	if (!iodev->active_node ||
+	    iodev->active_node->type == CRAS_NODE_TYPE_HOTWORD)
+		return false;
+	return true;
+}
+
 /*
  * Set wake_ts for this device to be the earliest wake up time for
  * dev_streams. Default value for adev->wake_ts will be now + 20s even if
  * any error occurs in this function.
+ * Args:
+ *    adev - The input device.
+ *    need_to_drop - The pointer to store whether we need to drop samples from
+ *                   a device in order to keep the lower hw_level.
+ * Returns:
+ *    0 on success. Negative error code on failure.
  */
-static int set_input_dev_wake_ts(struct open_dev *adev)
+static int set_input_dev_wake_ts(struct open_dev *adev, bool *need_to_drop)
 {
 	int rc;
 	struct timespec level_tstamp, wake_time_out, min_ts, now, dev_wake_ts;
@@ -350,6 +380,16 @@ static int set_input_dev_wake_ts(struct open_dev *adev)
 	curr_level = rc;
 	if (!timespec_is_nonzero(&level_tstamp))
 		clock_gettime(CLOCK_MONOTONIC_RAW, &level_tstamp);
+
+	/*
+	 * If any input device has more than largest_cb_level * 1.5 frames, need to
+	 * drop frames from all devices.
+	 */
+	if (input_devices_can_drop_samples(adev->dev) &&
+	    rc >= adev->dev->largest_cb_level * 1.5 &&
+	    cras_frames_to_ms(rc, adev->dev->format->frame_rate) >=
+		    DROP_FRAMES_THRESHOLD_MS)
+		*need_to_drop = true;
 
 	cap_limit = get_stream_limit(adev, UINT_MAX, &cap_limit_stream);
 
@@ -378,8 +418,11 @@ static int set_input_dev_wake_ts(struct open_dev *adev)
 		}
 	}
 
+	/* If there's no room in streams, don't bother schedule wake for more
+	 * input data. */
 	if (adev->dev->active_node &&
-	    adev->dev->active_node->type != CRAS_NODE_TYPE_HOTWORD) {
+	    adev->dev->active_node->type != CRAS_NODE_TYPE_HOTWORD &&
+	    cap_limit) {
 		rc = get_input_dev_max_wake_ts(adev, curr_level, &dev_wake_ts);
 		if (rc < 0) {
 			syslog(LOG_ERR,
@@ -758,12 +801,92 @@ int write_output_samples(struct open_dev **odevs, struct open_dev *adev,
 }
 
 /*
+ * Chooses the smallest difference between hw_level and min_cb_level as the
+ * drop time.
+ */
+static void get_input_devices_drop_time(struct open_dev *idev_list,
+					struct timespec *reset_ts)
+{
+	struct open_dev *adev;
+	struct cras_iodev *iodev;
+	struct timespec tmp;
+	struct timespec hw_tstamp;
+	double est_rate;
+	unsigned int target_level;
+	bool is_set = false;
+	int rc;
+
+	DL_FOREACH (idev_list, adev) {
+		iodev = adev->dev;
+		if (!input_devices_can_drop_samples(iodev))
+			continue;
+
+		rc = cras_iodev_frames_queued(iodev, &hw_tstamp);
+		if (rc < 0) {
+			syslog(LOG_ERR, "Get frames from device %d, rc = %d",
+			       iodev->info.idx, rc);
+			continue;
+		}
+
+		target_level = iodev->min_cb_level;
+		if (rc <= target_level) {
+			reset_ts->tv_sec = 0;
+			reset_ts->tv_nsec = 0;
+			return;
+		}
+		est_rate = iodev->format->frame_rate *
+			   cras_iodev_get_est_rate_ratio(iodev);
+		cras_frames_to_time(rc - target_level, est_rate, &tmp);
+
+		if (!is_set || timespec_after(reset_ts, &tmp)) {
+			*reset_ts = tmp;
+			is_set = true;
+		}
+	}
+}
+
+/*
+ * Drop samples from all input devices.
+ */
+static void dev_io_drop_samples(struct open_dev *idev_list)
+{
+	struct open_dev *adev;
+	struct timespec drop_time;
+	int rc;
+
+	get_input_devices_drop_time(idev_list, &drop_time);
+	ATLOG(atlog, AUDIO_THREAD_CAPTURE_DROP_TIME, drop_time.tv_sec,
+	      drop_time.tv_nsec, 0);
+
+	if (timespec_is_zero(&drop_time))
+		return;
+
+	DL_FOREACH (idev_list, adev) {
+		if (!input_devices_can_drop_samples(adev->dev))
+			continue;
+
+		rc = cras_iodev_drop_frames_by_time(adev->dev, drop_time);
+		if (rc < 0) {
+			syslog(LOG_ERR,
+			       "Failed to drop frames from device %d, rc = %d",
+			       adev->dev->info.idx, rc);
+			continue;
+		}
+	}
+
+	cras_audio_thread_event_drop_samples();
+
+	return;
+}
+
+/*
  * Public funcitons.
  */
 
 int dev_io_send_captured_samples(struct open_dev *idev_list)
 {
 	struct open_dev *adev;
+	bool need_to_drop = false;
 	int rc;
 
 	// TODO(dgreid) - once per rstream, not once per dev_stream.
@@ -779,10 +902,13 @@ int dev_io_send_captured_samples(struct open_dev *idev_list)
 		}
 
 		/* Set wake_ts for this device. */
-		rc = set_input_dev_wake_ts(adev);
+		rc = set_input_dev_wake_ts(adev, &need_to_drop);
 		if (rc < 0)
 			return rc;
 	}
+
+	if (need_to_drop)
+		dev_io_drop_samples(idev_list);
 
 	return 0;
 }
@@ -795,10 +921,9 @@ static void handle_dev_err(int err_rc, struct open_dev **odevs,
 		ATLOG(atlog, AUDIO_THREAD_SEVERE_UNDERRUN, adev->dev->info.idx,
 		      0, 0);
 		cras_iodev_reset_request(adev->dev);
-	} else {
-		/* Device error, close it. */
-		dev_io_rm_open_dev(odevs, adev);
 	}
+	/* Device error, remove it. */
+	dev_io_rm_open_dev(odevs, adev);
 }
 
 int dev_io_capture(struct open_dev **list)
@@ -929,10 +1054,38 @@ int dev_io_playback_write(struct open_dev **odevs,
 	return 0;
 }
 
+static void update_longest_wake(struct open_dev *dev_list,
+				const struct timespec *ts)
+{
+	struct open_dev *adev;
+	struct timespec wake_interval;
+
+	DL_FOREACH (dev_list, adev) {
+		if (adev->dev->streams == NULL)
+			continue;
+		/*
+		 * Calculate longest wake only when there's stream attached
+		 * and the last wake time has been set.
+		 */
+		if (adev->last_wake.tv_sec) {
+			subtract_timespecs(ts, &adev->last_wake,
+					   &wake_interval);
+			if (timespec_after(&wake_interval, &adev->longest_wake))
+				adev->longest_wake = wake_interval;
+		}
+		adev->last_wake = *ts;
+	}
+}
+
 void dev_io_run(struct open_dev **odevs, struct open_dev **idevs,
 		struct cras_fmt_conv *output_converter)
 {
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
 	pic_update_current_time();
+	update_longest_wake(*odevs, &now);
+	update_longest_wake(*idevs, &now);
 
 	dev_io_playback_fetch(*odevs);
 	dev_io_capture(idevs);
@@ -1118,6 +1271,17 @@ int dev_io_append_stream(struct open_dev **dev_list,
 			continue;
 
 		/*
+		 * When dev transitions from no stream to the 1st stream, reset
+		 * last_wake and longest_wake so it can start over the tracking.
+		 */
+		if (dev->streams == NULL) {
+			open_dev->last_wake.tv_sec = 0;
+			open_dev->last_wake.tv_nsec = 0;
+			open_dev->longest_wake.tv_sec = 0;
+			open_dev->longest_wake.tv_nsec = 0;
+		}
+
+		/*
 		 * When the first input stream is added, flush the input buffer
 		 * so that we can read from multiple input devices of the same
 		 * buffer level.
@@ -1176,6 +1340,11 @@ int dev_io_append_stream(struct open_dev **dev_list,
 			 * by hw_level of input device, set the first cb_ts to zero. The stream
 			 * will wake up when it gets enough samples to post. The next_cb_ts will
 			 * be updated after its first post.
+			 *
+			 * TODO(yuhsuan) - Align the new stream fetch time to avoid getting a large
+			 * delay. If a new stream with smaller block size starts when the hardware
+			 * level is high, the hardware level will keep high after removing other
+			 * old streams.
 			 */
 			init_cb_ts.tv_sec = 0;
 			init_cb_ts.tv_nsec = 0;
