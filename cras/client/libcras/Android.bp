@@ -5,7 +5,7 @@ rust_library_host_rlib {
     edition: "2018",
     srcs: ["src/libcras.rs"],
     rlibs: [
-        "libc_rust",
+        "liblibc",
         "libaudio_streams",
         "libcras_sys",
         "libdata_model",
