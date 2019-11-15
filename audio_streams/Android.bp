@@ -1,7 +1,7 @@
 rust_library_host_rlib {
     name: "libaudio_streams",
+    defaults: ["crosvm_defaults"],
     deny_warnings: false,
     crate_name: "audio_streams",
-    edition: "2018",
     srcs: ["src/audio_streams.rs"],
 }
