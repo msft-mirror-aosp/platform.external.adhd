@@ -1,8 +1,8 @@
 rust_library_host_rlib {
     name: "liblibcras",
+    defaults: ["crosvm_defaults"],
     deny_warnings: false,
     crate_name: "libcras",
-    edition: "2018",
     srcs: ["src/libcras.rs"],
     rlibs: [
         "liblibc",
