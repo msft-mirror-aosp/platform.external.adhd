@@ -115,24 +115,6 @@ typedef int (*cras_error_cb_t)(struct cras_client *client,
 			       cras_stream_id_t stream_id, int error,
 			       void *user_arg);
 
-/* Callback for handling server error. DEPRECATED
- *
- * Deprecated by cras_server_connection_status_cb_t: use that instead.
- * This is equivalent to CRAS_CONN_STATUS_FAILED.
- *
- * This callback is executed rarely: only when the connection to the server has
- * already been interrupted and could not be re-established due to resource
- * allocation failure (memory or file-descriptors). The caller may attempt
- * to reestablish communication once those resources are available with
- * cras_client_connect_async(), or (blocking) cras_client_connect().
- *
- * Args:
- *    client - The client created with cras_client_create().
- *    user_arg - The argument defined in cras_client_set_server_errro_cb().
- */
-typedef void (*cras_server_error_cb_t)(struct cras_client *client,
-				       void *user_arg);
-
 /* Server connection status. */
 typedef enum cras_connection_status {
 	CRAS_CONN_STATUS_FAILED,
@@ -197,6 +179,18 @@ typedef int (*cras_hotword_error_cb_t)(struct cras_client *client,
  *    Negative error code on failure(*client will be NULL).
  */
 int cras_client_create(struct cras_client **client);
+
+/* Creates a new client with given connection type.
+ * Args:
+ *     client - Filled with a pointer to the new client.
+ *     conn_type - enum CRAS_CONNECTION_TYPE
+ *
+ * Returns:
+ *     0 on success (*client is filled with a valid cras_client pointer).
+ *     Negative error code on failure(*client will be NULL).
+ */
+int cras_client_create_with_type(struct cras_client **client,
+				 enum CRAS_CONNECTION_TYPE conn_type);
 
 /* Destroys a client.
  * Args:
@@ -275,19 +269,6 @@ int cras_client_connected_wait(struct cras_client *client);
  *    not running.
  */
 int cras_client_connect_async(struct cras_client *client);
-
-/* Sets server error callback. DEPRECATED
- *
- * See cras_server_error_cb_t for more information about this callback.
- *
- * Args:
- *    client - The client from cras_client_create.
- *    err_cb - The callback function to register.
- *    user_arg - Pointer that will be passed to the callback.
- */
-void cras_client_set_server_error_cb(struct cras_client *client,
-				     cras_server_error_cb_t err_cb,
-				     void *user_arg);
 
 /* Sets server connection status callback.
  *
@@ -501,10 +482,37 @@ int cras_client_update_audio_debug_info(struct cras_client *client,
  *    client - The client from cras_client_create.
  *    cb - Function to call when debug info is ready.
  * Returns:
- *    0 on sucess, -EINVAL if the client isn't valid or isn't running.
+ *    0 on success, -EINVAL if the client isn't valid or isn't running.
  */
 int cras_client_update_bt_debug_info(struct cras_client *client,
 				     void (*cb)(struct cras_client *));
+
+/* Gets read-only access to audio thread log. Should be called once before
+   calling cras_client_read_atlog.
+ * Args:
+ *    client - The client from cras_client_create.
+ *    atlog_access_cb - Function to call after getting atlog access.
+ * Returns:
+ *    0 on success, -EINVAL if the client or atlog_access_cb isn't valid.
+ */
+int cras_client_get_atlog_access(struct cras_client *client,
+				 void (*atlog_access_cb)(struct cras_client *));
+
+/* Reads continuous audio thread log into 'buf', starting from 'read_idx'-th log
+ * till the latest. The number of missing logs within the range will be stored
+ * in 'missing'. Requires calling cras_client_get_atlog_access() beforehand
+ * to get access to audio thread log.
+ * Args:
+ *    client - The client from cras_client_create.
+ *    read_idx - The log number to start reading with.
+ *    missing - The pointer to store the number of missing logs.
+ *    buf - The buffer to which continuous logs will be copied.
+ * Returns:
+ *    The number of logs copied. < 0 if failed to read audio thread log.
+ */
+int cras_client_read_atlog(struct cras_client *client, uint64_t *read_idx,
+			   uint64_t *missing,
+			   struct audio_thread_event_log *buf);
 
 /* Asks the server to dump current audio thread snapshots.
  *
@@ -543,6 +551,14 @@ struct cras_stream_params *cras_client_stream_params_create(
 	size_t cb_threshold, size_t unused, enum CRAS_STREAM_TYPE stream_type,
 	uint32_t flags, void *user_data, cras_playback_cb_t aud_cb,
 	cras_error_cb_t err_cb, struct cras_audio_format *format);
+
+/* Functions to set the client type on given stream parameter.
+ * Args:
+ *    params - Stream configuration parameters.
+ *    client_type - A client type.
+ */
+void cras_client_stream_params_set_client_type(
+	struct cras_stream_params *params, enum CRAS_CLIENT_TYPE client_type);
 
 /* Functions to enable or disable specific effect on given stream parameter.
  * Args:
@@ -1132,7 +1148,7 @@ int cras_client_get_aec_group_id(struct cras_client *client);
 /*
  * Sets the flag to enable bluetooth wideband speech in server.
  */
-int cras_client_set_bt_wbs_enabled(struct cras_client * client, bool enabled);
+int cras_client_set_bt_wbs_enabled(struct cras_client *client, bool enabled);
 
 /* Set the context pointer for system state change callbacks.
  * Args:
@@ -1297,7 +1313,6 @@ int cras_client_set_input_node_gain_changed_callback(
 int cras_client_set_num_active_streams_changed_callback(
 	struct cras_client *client,
 	cras_client_num_active_streams_changed_callback cb);
-
 #ifdef __cplusplus
 }
 #endif

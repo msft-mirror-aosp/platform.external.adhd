@@ -30,6 +30,11 @@
 #define PCM_BUF_MAX_SIZE_FRAMES (4096 * 4)
 #define PCM_BUF_MAX_SIZE_BYTES (PCM_BUF_MAX_SIZE_FRAMES * 4)
 
+/* no_stream target_frames in timespec. */
+static const struct timespec no_stream_target_frames_ts = {
+	0, 10 * 1000 * 1000 /* 10 msec. */
+};
+
 /* Child of cras_iodev to handle bluetooth A2DP streaming.
  * Members:
  *    base - The cras_iodev structure "base class"
@@ -38,7 +43,6 @@
  *    sock_depth_frames - Socket depth in frames of the a2dp socket.
  *    pcm_buf - Buffer to hold pcm samples before encode.
  *    destroyed - Flag to note if this a2dp_io is about to destroy.
- *    pre_fill_complete - Flag to note if socket pre-fill is completed.
  *    bt_written_frames - Accumulated frames written to a2dp socket. Used
  *        together with the device open timestamp to estimate how many virtual
  *        buffer is queued there.
@@ -55,7 +59,6 @@ struct a2dp_io {
 	unsigned sock_depth_frames;
 	struct byte_buffer *pcm_buf;
 	int destroyed;
-	int pre_fill_complete;
 	uint64_t bt_written_frames;
 	struct timespec dev_open_time;
 	bool drain_complete;
@@ -141,59 +144,46 @@ static int frames_queued(const struct cras_iodev *iodev,
 
 static int no_stream(struct cras_iodev *iodev, int enable)
 {
-	unsigned int pcm_bytes;
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
 	unsigned int buf_avail;
 	unsigned int format_bytes;
 	unsigned int target_bytes;
+	unsigned int target_total_bytes;
+	unsigned int bt_queued_bytes;
 	uint8_t *buf;
+	struct timespec tstamp;
 	int i;
 
 	format_bytes = cras_get_format_bytes(iodev->format);
-	pcm_bytes = buf_queued(a2dpio->pcm_buf);
 
 	if (enable) {
-		if (!a2dpio->drain_complete &&
-		    (pcm_bytes <= a2dpio->filled_zeros_bytes))
-			a2dpio->drain_complete = 1;
+		/* Target to have let hw_level = 2 * (frames in 10ms) */
+		bt_queued_bytes =
+			cras_iodev_frames_queued(iodev, &tstamp) * format_bytes;
+		target_total_bytes =
+			2 *
+			cras_time_to_frames(&no_stream_target_frames_ts,
+					    iodev->format->frame_rate) *
+			format_bytes;
+		if (target_total_bytes <= bt_queued_bytes)
+			return 0;
+		target_total_bytes -= bt_queued_bytes;
 
-		/* Loop twice to make sure ring buffer is filled. */
+		/* Loop twice to make sure target_total_bytes are filled. */
 		for (i = 0; i < 2; i++) {
 			buf = buf_write_pointer_size(a2dpio->pcm_buf,
 						     &buf_avail);
-			if (buf_avail == 0)
+			if (buf_avail == 0 || target_total_bytes == 0)
 				break;
-			target_bytes = iodev->buffer_size * format_bytes;
-			target_bytes = MIN(buf_avail, target_bytes);
+			target_bytes = MIN(buf_avail, target_total_bytes);
 			memset(buf, 0, target_bytes);
 			buf_increment_write(a2dpio->pcm_buf, target_bytes);
-			a2dpio->filled_zeros_bytes += target_bytes;
+			bt_queued_frames(iodev, target_bytes / format_bytes);
+			target_total_bytes -= target_bytes;
 		}
+		flush_data(iodev);
 		return 0;
 	}
-	/* Leave no stream state. */
-	target_bytes = iodev->min_cb_level * format_bytes;
-	if (a2dpio->drain_complete) {
-		buf_adjust_readable(a2dpio->pcm_buf, target_bytes);
-	} else {
-		unsigned int valid_bytes = 0;
-		if (pcm_bytes > a2dpio->filled_zeros_bytes)
-			valid_bytes = pcm_bytes - a2dpio->filled_zeros_bytes;
-
-		target_bytes = MAX(target_bytes, valid_bytes);
-		if (target_bytes > pcm_bytes) {
-			target_bytes -= pcm_bytes;
-			buf = buf_write_pointer_size(a2dpio->pcm_buf,
-						     &buf_avail);
-			target_bytes = MIN(target_bytes, buf_avail);
-			memset(buf, 0, target_bytes);
-			buf_increment_write(a2dpio->pcm_buf, target_bytes);
-		} else {
-			buf_adjust_readable(a2dpio->pcm_buf, target_bytes);
-		}
-	}
-	a2dpio->drain_complete = 0;
-	a2dpio->filled_zeros_bytes = 0;
 	return 0;
 }
 
@@ -202,6 +192,7 @@ static int configure_dev(struct cras_iodev *iodev)
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
 	int sock_depth;
 	int err;
+	socklen_t optlen;
 
 	err = cras_bt_transport_acquire(a2dpio->transport);
 	if (err < 0) {
@@ -233,13 +224,14 @@ static int configure_dev(struct cras_iodev *iodev)
 	setsockopt(cras_bt_transport_fd(a2dpio->transport), SOL_SOCKET,
 		   SO_SNDBUF, &sock_depth, sizeof(sock_depth));
 
-	a2dpio->sock_depth_frames =
-		a2dp_block_size(&a2dpio->a2dp, cras_bt_transport_write_mtu(
-						       a2dpio->transport)) /
-		cras_get_format_bytes(iodev->format) * 2;
+	optlen = sizeof(sock_depth);
+	getsockopt(cras_bt_transport_fd(a2dpio->transport), SOL_SOCKET,
+		   SO_SNDBUF, &sock_depth, &optlen);
+	a2dpio->sock_depth_frames = a2dp_block_size(&a2dpio->a2dp, sock_depth) /
+				    cras_get_format_bytes(iodev->format);
+
 	iodev->min_buffer_level = a2dpio->sock_depth_frames;
 
-	a2dpio->pre_fill_complete = 0;
 	a2dpio->drain_complete = 0;
 	a2dpio->filled_zeros_bytes = 0;
 
@@ -279,38 +271,6 @@ static int close_dev(struct cras_iodev *iodev)
 	byte_buffer_destroy(&a2dpio->pcm_buf);
 	cras_iodev_free_format(iodev);
 	cras_iodev_free_audio_area(iodev);
-	return 0;
-}
-
-static int pre_fill_socket(struct a2dp_io *a2dpio)
-{
-	static const uint16_t zero_buffer[1024 * 2];
-	int processed;
-	int written = 0;
-
-	while (1) {
-		processed = a2dp_encode(
-			&a2dpio->a2dp, zero_buffer, sizeof(zero_buffer),
-			cras_get_format_bytes(a2dpio->base.format),
-			cras_bt_transport_write_mtu(a2dpio->transport));
-		if (processed < 0)
-			return processed;
-		if (processed == 0)
-			break;
-
-		written = a2dp_write(
-			&a2dpio->a2dp, cras_bt_transport_fd(a2dpio->transport),
-			cras_bt_transport_write_mtu(a2dpio->transport));
-		/* Full when EAGAIN is returned. */
-		if (written == -EAGAIN)
-			break;
-		else if (written < 0)
-			return written;
-		else if (written == 0)
-			break;
-	};
-
-	a2dp_drain(&a2dpio->a2dp);
 	return 0;
 }
 
@@ -437,16 +397,11 @@ static int put_buffer(struct cras_iodev *iodev, unsigned nwritten)
 
 	buf_increment_write(a2dpio->pcm_buf, written_bytes);
 
-	bt_queued_frames(iodev, nwritten);
-
-	/* Until the minimum number of frames have been queued, don't send
-	 * anything. */
-	if (!a2dpio->pre_fill_complete) {
-		pre_fill_socket(a2dpio);
-		a2dpio->pre_fill_complete = 1;
-		/* Start measuring frames_consumed from now. */
+	/* Set dev open time at when the first data arrives. */
+	if (nwritten && !a2dpio->bt_written_frames)
 		clock_gettime(CLOCK_MONOTONIC_RAW, &a2dpio->dev_open_time);
-	}
+
+	bt_queued_frames(iodev, nwritten);
 
 	return flush_data(iodev);
 }
@@ -533,7 +488,6 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport)
 		SuperFastHash(cras_bt_device_object_path(device),
 			      strlen(cras_bt_device_object_path(device)),
 			      strlen(cras_bt_device_object_path(device)));
-	iodev->info.stable_id_new = iodev->info.stable_id;
 
 	iodev->configure_dev = configure_dev;
 	iodev->frames_queued = frames_queued;
@@ -556,11 +510,12 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport)
 	node->volume = 100;
 	gettimeofday(&node->plugged_time, NULL);
 
-	/* A2DP does output only */
-	cras_bt_device_append_iodev(
-		device, iodev, cras_bt_transport_profile(a2dpio->transport));
+	/* Prepare active node before append, so bt_io can extract correct
+	 * info from A2DP iodev and node. */
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
+	cras_bt_device_append_iodev(
+		device, iodev, cras_bt_transport_profile(a2dpio->transport));
 
 	return iodev;
 error:

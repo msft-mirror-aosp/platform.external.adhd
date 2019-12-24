@@ -11,6 +11,7 @@ poll: 1
 ppoll: 1
 fstat: 1
 write: 1
+writev: 1
 open: 1
 openat: 1
 close: 1
@@ -38,6 +39,7 @@ unlink: 1
 nanosleep: 1
 pipe: 1
 ftruncate: 1
+fallocate: 1
 mprotect: 1
 connect: 1
 getsockname: 1
@@ -85,3 +87,5 @@ getpid: 1
 prlimit64: 1
 tgkill: 1
 mremap: 1
+dup: 1
+gettimeofday: 1

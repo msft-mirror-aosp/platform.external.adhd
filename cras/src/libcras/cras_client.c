@@ -13,7 +13,7 @@
  *    client_stream struct and send a file descriptor to server. That file
  *    descriptor and aud_fd are a pair created from socketpair().
  *  client_connected - The server will send a connected message to indicate that
- *    the client should start receving audio events from aud_fd. This message
+ *    the client should start receiving audio events from aud_fd. This message
  *    also specifies the shared memory region to use to share audio samples.
  *    This region will be shmat'd.
  *  running - Once the connections are established, the client will listen for
@@ -125,6 +125,7 @@ struct cras_stream_params {
 	size_t buffer_frames;
 	size_t cb_threshold;
 	enum CRAS_STREAM_TYPE stream_type;
+	enum CRAS_CLIENT_TYPE client_type;
 	uint32_t flags;
 	uint64_t effects;
 	void *user_data;
@@ -205,10 +206,10 @@ typedef enum cras_socket_state {
  * last_command_result - Passes back the result of the last user command.
  * streams - Linked list of streams attached to this client.
  * server_state - RO shared memory region holding server state.
+ * atlog_ro - RO shared memory region holding audio thread log.
  * debug_info_callback - Function to call when debug info is received.
+ * atlog_access_callback - Function to call when atlog RO fd is received.
  * get_hotword_models_cb_t - Function to call when hotword models info is ready.
- * server_err_cb - Function to call when failed to read messages from server.
- * server_err_user_arg - User argument for server_err_cb.
  * server_connection_cb - Function to called when a connection state changes.
  * server_connection_user_arg - User argument for server_connection_cb.
  * thread_priority_cb - Function to call for setting audio thread priority.
@@ -233,9 +234,10 @@ struct cras_client {
 	int last_command_result;
 	struct client_stream *streams;
 	const struct cras_server_state *server_state;
+	struct audio_thread_event_log *atlog_ro;
 	void (*debug_info_callback)(struct cras_client *);
+	void (*atlog_access_callback)(struct cras_client *);
 	get_hotword_models_cb_t get_hotword_models_cb;
-	cras_server_error_cb_t server_err_cb;
 	cras_connection_status_cb_t server_connection_cb;
 	void *server_connection_user_arg;
 	cras_thread_priority_cb_t thread_priority_cb;
@@ -663,9 +665,6 @@ static void disconnect_transition_action(struct cras_client *client, bool force)
 			client->server_connection_cb(
 				client, CRAS_CONN_STATUS_FAILED,
 				client->server_connection_user_arg);
-		else if (client->server_err_cb)
-			client->server_err_cb(
-				client, client->server_connection_user_arg);
 		break;
 	case CRAS_SOCKET_STATE_WAIT_FOR_SOCKET:
 	case CRAS_SOCKET_STATE_WAIT_FOR_WRITABLE:
@@ -1381,7 +1380,8 @@ static int stream_connected(struct client_stream *stream,
 			    const struct cras_client_stream_connected *msg,
 			    const int stream_fds[2], const unsigned int num_fds)
 {
-	int rc, i;
+	int rc, samples_prot;
+	unsigned int i;
 	struct cras_audio_format mfmt;
 	struct cras_shm_info header_info, samples_info;
 
@@ -1406,7 +1406,14 @@ static int stream_connected(struct client_stream *stream,
 		goto err_ret;
 	}
 
-	rc = cras_audio_shm_create(&header_info, &samples_info, &stream->shm);
+	samples_prot = 0;
+	if (stream->direction == CRAS_STREAM_OUTPUT)
+		samples_prot = PROT_WRITE;
+	else
+		samples_prot = PROT_READ;
+
+	rc = cras_audio_shm_create(&header_info, &samples_info, samples_prot,
+				   &stream->shm);
 	if (rc < 0) {
 		syslog(LOG_ERR, "cras_client: Error configuring shm");
 		goto err_ret;
@@ -1445,10 +1452,12 @@ static int send_connect_message(struct cras_client *client,
 
 	cras_fill_connect_message(&serv_msg, stream->config->direction,
 				  stream->id, stream->config->stream_type,
+				  stream->config->client_type,
 				  stream->config->buffer_frames,
 				  stream->config->cb_threshold, stream->flags,
 				  stream->config->effects,
 				  stream->config->format, dev_idx);
+
 	rc = cras_send_with_fds(client->server_fd, &serv_msg, sizeof(serv_msg),
 				&sock[1], 1);
 	if (rc != sizeof(serv_msg)) {
@@ -1580,6 +1589,14 @@ static int client_thread_set_stream_volume(struct cras_client *client,
 	return 0;
 }
 
+/* Attach to the shm region containing the audio thread log. */
+static void attach_atlog_shm(struct cras_client *client, int fd)
+{
+	client->atlog_ro = (struct audio_thread_event_log *)mmap(
+		NULL, sizeof(*client->atlog_ro), PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+}
+
 /* Attach to the shm region containing the server state. */
 static int client_attach_shm(struct cras_client *client, int shm_fd)
 {
@@ -1690,6 +1707,14 @@ static int handle_message_from_server(struct cras_client *client)
 		if (client->debug_info_callback)
 			client->debug_info_callback(client);
 		client->debug_info_callback = NULL;
+		break;
+	case CRAS_CLIENT_ATLOG_FD_READY:
+		if (num_fds != 1 || server_fds[0] < 0)
+			return -EINVAL;
+		attach_atlog_shm(client, server_fds[0]);
+		if (client->atlog_access_callback)
+			client->atlog_access_callback(client);
+		client->atlog_access_callback = NULL;
 		break;
 	case CRAS_CLIENT_GET_HOTWORD_MODELS_READY: {
 		struct cras_client_get_hotword_models_ready *cmsg =
@@ -2026,24 +2051,43 @@ static int write_message_to_server(struct cras_client *client,
 		return 0;
 }
 
+/* Fills server socket file to connect by client's connection type. */
+static int fill_socket_file(struct cras_client *client,
+			    enum CRAS_CONNECTION_TYPE conn_type)
+{
+	int rc;
+
+	client->sock_file =
+		(const char *)calloc(CRAS_MAX_SOCKET_PATH_SIZE, sizeof(char));
+	if (client->sock_file == NULL)
+		return -ENOMEM;
+
+	rc = cras_fill_socket_path(conn_type, (char *)client->sock_file);
+	if (rc < 0) {
+		free((void *)client->sock_file);
+		return rc;
+	}
+	return 0;
+}
+
 /*
  * Exported Client Interface
  */
 
-int cras_client_create(struct cras_client **client)
+int cras_client_create_with_type(struct cras_client **client,
+				 enum CRAS_CONNECTION_TYPE conn_type)
 {
-	const char *sock_dir;
-	size_t sock_file_size;
 	int rc;
 	struct client_int *client_int;
 	pthread_condattr_t cond_attr;
 
+	if (!cras_validate_connection_type(conn_type)) {
+		syslog(LOG_ERR, "Input connection type is not supported.\n");
+		return -EINVAL;
+	}
+
 	/* Ignore SIGPIPE while using this API. */
 	signal(SIGPIPE, SIG_IGN);
-
-	sock_dir = cras_config_get_system_socket_file_dir();
-	if (!sock_dir)
-		return -ENOMEM;
 
 	client_int = (struct client_int *)calloc(1, sizeof(*client_int));
 	if (!client_int)
@@ -2083,22 +2127,19 @@ int cras_client_create(struct cras_client **client)
 		goto free_cond;
 	}
 
-	sock_file_size = strlen(sock_dir) + strlen(CRAS_SOCKET_FILE) + 2;
-	(*client)->sock_file = (const char *)malloc(sock_file_size);
-	if (!(*client)->sock_file) {
-		rc = -ENOMEM;
+	rc = fill_socket_file((*client), conn_type);
+	if (rc < 0) {
 		goto free_error;
 	}
-	snprintf((char *)(*client)->sock_file, sock_file_size, "%s/%s",
-		 sock_dir, CRAS_SOCKET_FILE);
 
 	rc = cras_file_wait_create((*client)->sock_file,
 				   CRAS_FILE_WAIT_FLAG_NONE,
 				   sock_file_wait_callback, *client,
 				   &(*client)->sock_file_wait);
-	if (rc != 0 && rc != -ENOENT) {
-		syslog(LOG_ERR, "cras_client: Could not setup watch for '%s'.",
-		       (*client)->sock_file);
+	if (rc < 0 && rc != -ENOENT) {
+		syslog(LOG_ERR,
+		       "cras_client: Could not setup watch for '%s': %s",
+		       (*client)->sock_file, strerror(-rc));
 		goto free_error;
 	}
 	(*client)->sock_file_exists = (rc == 0);
@@ -2137,6 +2178,11 @@ free_client:
 	return rc;
 }
 
+int cras_client_create(struct cras_client **client)
+{
+	return cras_client_create_with_type(client, CRAS_CONTROL);
+}
+
 void cras_client_destroy(struct cras_client *client)
 {
 	struct client_int *client_int;
@@ -2144,7 +2190,6 @@ void cras_client_destroy(struct cras_client *client)
 		return;
 	client_int = to_client_int(client);
 	client->server_connection_cb = NULL;
-	client->server_err_cb = NULL;
 	cras_client_stop(client);
 	server_disconnect(client);
 	close(client->server_event_fd);
@@ -2196,6 +2241,7 @@ struct cras_stream_params *cras_client_stream_params_create(
 	params->cb_threshold = cb_threshold;
 	params->effects = 0;
 	params->stream_type = stream_type;
+	params->client_type = CRAS_CLIENT_TYPE_UNKNOWN;
 	params->flags = flags;
 	params->user_data = user_data;
 	params->aud_cb = aud_cb;
@@ -2203,6 +2249,12 @@ struct cras_stream_params *cras_client_stream_params_create(
 	params->err_cb = err_cb;
 	memcpy(&(params->format), format, sizeof(*format));
 	return params;
+}
+
+void cras_client_stream_params_set_client_type(
+	struct cras_stream_params *params, enum CRAS_CLIENT_TYPE client_type)
+{
+	params->client_type = client_type;
 }
 
 void cras_client_stream_params_enable_aec(struct cras_stream_params *params)
@@ -2261,6 +2313,7 @@ struct cras_stream_params *cras_client_unified_params_create(
 	params->buffer_frames = block_size * 2;
 	params->cb_threshold = block_size;
 	params->stream_type = stream_type;
+	params->client_type = CRAS_CLIENT_TYPE_UNKNOWN;
 	params->flags = flags;
 	params->effects = 0;
 	params->user_data = user_data;
@@ -2696,14 +2749,6 @@ int cras_client_stop(struct cras_client *client)
 	return 0;
 }
 
-void cras_client_set_server_error_cb(struct cras_client *client,
-				     cras_server_error_cb_t err_cb,
-				     void *user_arg)
-{
-	client->server_err_cb = err_cb;
-	client->server_connection_user_arg = user_arg;
-}
-
 void cras_client_set_connection_status_cb(
 	struct cras_client *client, cras_connection_status_cb_t connection_cb,
 	void *user_arg)
@@ -3066,6 +3111,78 @@ int cras_client_update_audio_debug_info(
 	return write_message_to_server(client, &msg.header);
 }
 
+int cras_client_get_atlog_access(struct cras_client *client,
+				 void (*atlog_access_cb)(struct cras_client *))
+{
+	struct cras_get_atlog_fd msg;
+
+	if (client == NULL)
+		return -EINVAL;
+
+	if (client->atlog_access_callback != NULL)
+		return -EINVAL;
+	client->atlog_access_callback = atlog_access_cb;
+
+	cras_fill_get_atlog_fd(&msg);
+	return write_message_to_server(client, &msg.header);
+}
+
+int cras_client_read_atlog(struct cras_client *client, uint64_t *read_idx,
+			   uint64_t *missing,
+			   struct audio_thread_event_log *buf)
+{
+	struct audio_thread_event_log log;
+	uint64_t i, sync_write_pos, len = 0;
+	struct timespec timestamp, last_timestamp;
+
+	if (!client->atlog_ro)
+		return -EINVAL;
+
+	sync_write_pos = client->atlog_ro->sync_write_pos;
+	__sync_synchronize();
+	memcpy(&log, client->atlog_ro, sizeof(log));
+
+	if (sync_write_pos <= *read_idx)
+		return 0;
+
+	*missing = 0;
+	for (i = sync_write_pos - 1; i >= *read_idx; --i) {
+		uint64_t pos = i % log.len;
+		timestamp.tv_sec = log.log[pos].tag_sec & 0x00ffffff;
+		timestamp.tv_nsec = log.log[pos].nsec;
+
+		if (i != sync_write_pos - 1 &&
+		    timespec_after(&timestamp, &last_timestamp)) {
+			if (*read_idx)
+				*missing = i - *read_idx + 1;
+			*read_idx = i + 1;
+			break;
+		}
+		last_timestamp = timestamp;
+
+		if (!i)
+			break;
+	}
+
+	/* Copies the continuous part of log. */
+	if ((sync_write_pos - 1) % log.len < *read_idx % log.len) {
+		len = log.len - *read_idx % log.len;
+		memcpy(buf->log, &log.log[*read_idx % log.len],
+		       sizeof(struct audio_thread_event) * len);
+		memcpy(&buf->log[len], log.log,
+		       sizeof(struct audio_thread_event) *
+			       ((sync_write_pos - 1) % log.len + 1));
+		len = sync_write_pos - *read_idx;
+	} else {
+		len = sync_write_pos - *read_idx;
+		memcpy(buf->log, &log.log[*read_idx % log.len],
+		       sizeof(struct audio_thread_event) * len);
+	}
+
+	*read_idx = sync_write_pos;
+	return len;
+}
+
 int cras_client_update_bt_debug_info(
 	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
 {
@@ -3315,7 +3432,7 @@ int cras_client_get_aec_group_id(struct cras_client *client)
 	return aec_group_id;
 }
 
-int cras_client_set_bt_wbs_enabled(struct cras_client * client, bool enabled)
+int cras_client_set_bt_wbs_enabled(struct cras_client *client, bool enabled)
 {
 	struct cras_set_bt_wbs_enabled msg;
 

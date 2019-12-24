@@ -25,20 +25,22 @@
 //! use std::thread::{spawn, JoinHandle};
 //! type Result<T> = std::result::Result<T, Box<std::error::Error>>;
 //!
-//! use libcras::CrasClient;
-//! use audio_streams::StreamSource;
+//! use libcras::{CrasClient, CrasClientType};
+//! use audio_streams::{SampleFormat, StreamSource};
 //!
 //! const BUFFER_SIZE: usize = 256;
 //! const FRAME_RATE: usize = 44100;
 //! const NUM_CHANNELS: usize = 2;
+//! const FORMAT: SampleFormat = SampleFormat::S16LE;
 //!
 //! # fn main() -> Result<()> {
 //! #    let args: Vec<String> = env::args().collect();
 //! #    match args.len() {
 //! #        2 => {
 //!              let mut cras_client = CrasClient::new()?;
+//!              cras_client.set_client_type(CrasClientType::CRAS_CLIENT_TYPE_TEST);
 //!              let (_control, mut stream) = cras_client
-//!                  .new_playback_stream(NUM_CHANNELS, FRAME_RATE, BUFFER_SIZE)?;
+//!                  .new_playback_stream(NUM_CHANNELS, FORMAT, FRAME_RATE, BUFFER_SIZE)?;
 //!
 //!              // Plays 1000 * BUFFER_SIZE samples from the given file
 //!              let mut file = File::open(&args[1])?;
@@ -76,20 +78,22 @@
 //! use std::thread::{spawn, JoinHandle};
 //! type Result<T> = std::result::Result<T, Box<std::error::Error>>;
 //!
-//! use libcras::CrasClient;
-//! use audio_streams::StreamSource;
+//! use libcras::{CrasClient, CrasClientType};
+//! use audio_streams::{SampleFormat, StreamSource};
 //!
 //! const BUFFER_SIZE: usize = 256;
 //! const FRAME_RATE: usize = 44100;
 //! const NUM_CHANNELS: usize = 2;
+//! const FORMAT: SampleFormat = SampleFormat::S16LE;
 //!
 //! # fn main() -> Result<()> {
 //! #    let args: Vec<String> = env::args().collect();
 //! #    match args.len() {
 //! #        2 => {
 //!              let mut cras_client = CrasClient::new()?;
+//!              cras_client.set_client_type(CrasClientType::CRAS_CLIENT_TYPE_TEST);
 //!              let (_control, mut stream) = cras_client
-//!                  .new_capture_stream(NUM_CHANNELS, FRAME_RATE, BUFFER_SIZE)?;
+//!                  .new_capture_stream(NUM_CHANNELS, FORMAT, FRAME_RATE, BUFFER_SIZE)?;
 //!
 //!              // Capture 1000 * BUFFER_SIZE samples to the given file
 //!              let mut file = File::create(&args[1])?;
@@ -122,8 +126,10 @@ use std::{error, fmt};
 
 use audio_streams::{
     capture::{CaptureBufferStream, DummyCaptureStream},
-    BufferDrop, DummyStreamControl, PlaybackBufferStream, StreamControl, StreamSource,
+    BufferDrop, DummyStreamControl, PlaybackBufferStream, SampleFormat, StreamControl,
+    StreamSource,
 };
+pub use cras_sys::gen::CRAS_CLIENT_TYPE as CrasClientType;
 use cras_sys::gen::*;
 use sys_util::{PollContext, PollToken};
 
@@ -132,45 +138,35 @@ use crate::audio_socket::AudioSocket;
 mod cras_server_socket;
 use crate::cras_server_socket::CrasServerSocket;
 mod cras_shm;
+use crate::cras_shm::CrasServerState;
 mod cras_stream;
 use crate::cras_stream::{CrasCaptureData, CrasPlaybackData, CrasStream, CrasStreamData};
 mod cras_client_message;
 use crate::cras_client_message::*;
+pub mod cras_types;
+pub mod shm_streams;
 
 #[derive(Debug)]
-pub enum ErrorType {
+pub enum Error {
     CrasClientMessageError(cras_client_message::Error),
     CrasStreamError(cras_stream::Error),
     IoError(io::Error),
     SysUtilError(sys_util::Error),
-    NoClientId,
     MessageTypeError,
     UnexpectedExit,
-}
-
-#[derive(Debug)]
-pub struct Error {
-    error_type: ErrorType,
-}
-
-impl Error {
-    fn new(error_type: ErrorType) -> Self {
-        Self { error_type }
-    }
 }
 
 impl error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.error_type {
-            ErrorType::CrasClientMessageError(ref err) => err.fmt(f),
-            ErrorType::CrasStreamError(ref err) => err.fmt(f),
-            ErrorType::IoError(ref err) => err.fmt(f),
-            ErrorType::SysUtilError(ref err) => err.fmt(f),
-            ErrorType::NoClientId => write!(f, "client_id dose not exists"),
-            ErrorType::MessageTypeError => write!(f, "Message type error"),
-            ErrorType::UnexpectedExit => write!(f, "Unexpected exit"),
+        match self {
+            Error::CrasClientMessageError(ref err) => err.fmt(f),
+            Error::CrasStreamError(ref err) => err.fmt(f),
+            Error::IoError(ref err) => err.fmt(f),
+            Error::SysUtilError(ref err) => err.fmt(f),
+            Error::MessageTypeError => write!(f, "Message type error"),
+            Error::UnexpectedExit => write!(f, "Unexpected exit"),
         }
     }
 }
@@ -179,38 +175,40 @@ type Result<T> = std::result::Result<T, Error>;
 
 impl From<io::Error> for Error {
     fn from(io_err: io::Error) -> Self {
-        Self::new(ErrorType::IoError(io_err))
+        Error::IoError(io_err)
     }
 }
 
 impl From<sys_util::Error> for Error {
     fn from(sys_util_err: sys_util::Error) -> Self {
-        Self::new(ErrorType::SysUtilError(sys_util_err))
+        Error::SysUtilError(sys_util_err)
     }
 }
 
 impl From<cras_stream::Error> for Error {
     fn from(err: cras_stream::Error) -> Self {
-        Self::new(ErrorType::CrasStreamError(err))
+        Error::CrasStreamError(err)
     }
 }
 
 impl From<cras_client_message::Error> for Error {
     fn from(err: cras_client_message::Error) -> Self {
-        Self::new(ErrorType::CrasClientMessageError(err))
+        Error::CrasClientMessageError(err)
     }
 }
 
 /// A CRAS server client, which implements StreamSource. It can create audio streams connecting
 /// to CRAS server.
-pub struct CrasClient {
+pub struct CrasClient<'a> {
     server_socket: CrasServerSocket,
-    client_id: Option<u32>,
+    server_state: CrasServerState<'a>,
+    client_id: u32,
     next_stream_id: u32,
     cras_capture: bool,
+    client_type: CRAS_CLIENT_TYPE,
 }
 
-impl CrasClient {
+impl<'a> CrasClient<'a> {
     /// Blocks creating a `CrasClient` with registered `client_id`
     ///
     /// # Results
@@ -222,25 +220,24 @@ impl CrasClient {
     /// Returns error if error occurs while handling server message or message
     /// type is incorrect
     pub fn new() -> Result<Self> {
-        // Initializes a client
-        let server_socket = CrasServerSocket::new()?;
-        let mut cras_client = Self {
-            server_socket,
-            client_id: None,
-            next_stream_id: 0,
-            cras_capture: false,
-        };
+        // Create a connection to the server.
+        let mut server_socket = CrasServerSocket::new()?;
 
-        // Gets client ID from server
-        cras_client.client_id = Some({
-            match cras_client.handle_server_message()? {
-                ServerResult::Connected(res, _server_state_fd) => res as u32,
-                _ => {
-                    return Err(Error::new(ErrorType::MessageTypeError));
-                }
-            }
-        });
-        Ok(cras_client)
+        // Gets client ID and server state fd from server
+        if let ServerResult::Connected(client_id, server_state_fd) =
+            CrasClient::wait_for_message(&mut server_socket)?
+        {
+            Ok(Self {
+                server_socket,
+                server_state: CrasServerState::try_new(server_state_fd)?,
+                client_id,
+                next_stream_id: 0,
+                cras_capture: false,
+                client_type: CRAS_CLIENT_TYPE::CRAS_CLIENT_TYPE_UNKNOWN,
+            })
+        } else {
+            Err(Error::MessageTypeError)
+        }
     }
 
     /// Enables capturing audio through CRAS server.
@@ -248,31 +245,98 @@ impl CrasClient {
         self.cras_capture = true;
     }
 
+    /// Set the type of this client to report to CRAS when connecting streams.
+    pub fn set_client_type(&mut self, client_type: CRAS_CLIENT_TYPE) {
+        self.client_type = client_type;
+    }
+
+    /// Sets the system volume to `volume`.
+    ///
+    /// Send a message to the server to request setting the system volume
+    /// to `volume`. No response is returned from the server.
+    ///
+    /// # Errors
+    ///
+    /// If writing the message to the server socket failed.
+    pub fn set_system_volume(&mut self, volume: u32) -> Result<()> {
+        let header = cras_server_message {
+            length: mem::size_of::<cras_set_system_volume>() as u32,
+            id: CRAS_SERVER_MESSAGE_ID::CRAS_SERVER_SET_SYSTEM_VOLUME,
+        };
+        let msg = cras_set_system_volume { header, volume };
+
+        self.server_socket.send_server_message_with_fds(&msg, &[])?;
+        Ok(())
+    }
+
+    /// Sets the system mute status to `mute`.
+    ///
+    /// Send a message to the server to request setting the system mute
+    /// to `mute`. No response is returned from the server.
+    ///
+    /// # Errors
+    ///
+    /// If writing the message to the server socket failed.
+    pub fn set_system_mute(&mut self, mute: bool) -> Result<()> {
+        let header = cras_server_message {
+            length: mem::size_of::<cras_set_system_mute>() as u32,
+            id: CRAS_SERVER_MESSAGE_ID::CRAS_SERVER_SET_SYSTEM_MUTE,
+        };
+        let msg = cras_set_system_mute {
+            header,
+            mute: mute as i32,
+        };
+
+        self.server_socket.send_server_message_with_fds(&msg, &[])?;
+        Ok(())
+    }
+
+    /// Gets the system volume.
+    ///
+    /// Read the current value for system volume from the server shared memory.
+    pub fn get_system_volume(&self) -> u32 {
+        self.server_state.get_system_volume()
+    }
+
+    /// Gets the system mute.
+    ///
+    /// Read the current value for system mute from the server shared memory.
+    pub fn get_system_mute(&self) -> bool {
+        self.server_state.get_system_mute()
+    }
+
     // Gets next server_stream_id from client and increment stream_id counter.
-    fn next_server_stream_id(&mut self) -> Result<u32> {
+    fn next_server_stream_id(&mut self) -> u32 {
         let res = self.next_stream_id;
         self.next_stream_id += 1;
-        self.server_stream_id(&res)
+        self.server_stream_id(res)
     }
 
     // Gets server_stream_id from given stream_id
-    fn server_stream_id(&self, stream_id: &u32) -> Result<u32> {
-        Ok((self.client_id.ok_or(Error::new(ErrorType::NoClientId))? << 16) | stream_id)
+    fn server_stream_id(&self, stream_id: u32) -> u32 {
+        (self.client_id << 16) | stream_id
     }
 
     // Creates general stream with given parameters
-    fn create_stream<'a, T: BufferDrop + CrasStreamData<'a>>(
+    fn create_stream<'b, T: BufferDrop + CrasStreamData<'b>>(
         &mut self,
         block_size: u32,
         direction: CRAS_STREAM_DIRECTION,
         rate: usize,
         channel_num: usize,
-        format: snd_pcm_format_t,
-    ) -> Result<CrasStream<'a, T>> {
-        let stream_id = self.next_server_stream_id()?;
+        format: SampleFormat,
+    ) -> Result<CrasStream<'b, T>> {
+        let stream_id = self.next_server_stream_id();
+
+        let pcm_format = match format {
+            SampleFormat::U8 => snd_pcm_format_t::SND_PCM_FORMAT_U8,
+            SampleFormat::S16LE => snd_pcm_format_t::SND_PCM_FORMAT_S16_LE,
+            SampleFormat::S24LE => snd_pcm_format_t::SND_PCM_FORMAT_S24_LE,
+            SampleFormat::S32LE => snd_pcm_format_t::SND_PCM_FORMAT_S32_LE,
+        };
 
         // Prepares server message
-        let audio_format = cras_audio_format_packed::new(format, rate, channel_num);
+        let audio_format = cras_audio_format_packed::new(pcm_format, rate, channel_num);
         let msg_header = cras_server_message {
             length: mem::size_of::<cras_connect_message>() as u32,
             id: CRAS_SERVER_MESSAGE_ID::CRAS_SERVER_CONNECT_STREAM,
@@ -289,6 +353,9 @@ impl CrasClient {
             format: audio_format,
             dev_idx: CRAS_SPECIAL_DEVICE::NO_DEVICE as u32,
             effects: 0,
+            client_type: self.client_type,
+            client_shm_size: 0,
+            buffer_offsets: [0, 0],
         };
 
         // Creates AudioSocket pair
@@ -300,61 +367,60 @@ impl CrasClient {
             .send_server_message_with_fds(&server_cmsg, &socks)?;
 
         let audio_socket = AudioSocket::new(sock1);
-        let mut stream = CrasStream::new(
-            stream_id,
-            self.server_socket.try_clone()?,
-            block_size,
-            direction,
-            rate,
-            channel_num,
-            format,
-            audio_socket,
-        );
-
         loop {
-            let result = self.handle_server_message()?;
+            let result = CrasClient::wait_for_message(&mut self.server_socket)?;
             if let ServerResult::StreamConnected(_stream_id, header_fd, samples_fd) = result {
-                stream.init_shm(header_fd, samples_fd)?;
-                break;
+                return CrasStream::try_new(
+                    stream_id,
+                    self.server_socket.try_clone()?,
+                    block_size,
+                    direction,
+                    rate,
+                    channel_num,
+                    pcm_format,
+                    audio_socket,
+                    header_fd,
+                    samples_fd,
+                )
+                .map_err(Error::CrasStreamError);
             }
         }
-
-        Ok(stream)
     }
 
-    // Blocks handling the first server message received from server socket.
-    fn handle_server_message(&self) -> Result<ServerResult> {
+    // Blocks handling the first server message received from `socket`.
+    fn wait_for_message(socket: &mut CrasServerSocket) -> Result<ServerResult> {
         #[derive(PollToken)]
         enum Token {
             ServerMsg,
         }
-        let poll_ctx: PollContext<Token> = PollContext::new()
-            .and_then(|pc| pc.add(&self.server_socket, Token::ServerMsg).and(Ok(pc)))?;
+        let poll_ctx: PollContext<Token> =
+            PollContext::new().and_then(|pc| pc.add(socket, Token::ServerMsg).and(Ok(pc)))?;
 
         let events = poll_ctx.wait()?;
         // Check the first readable message
         let tokens: Vec<Token> = events.iter_readable().map(|e| e.token()).collect();
         tokens
             .get(0)
-            .ok_or_else(|| Error::new(ErrorType::UnexpectedExit))
+            .ok_or_else(|| Error::UnexpectedExit)
             .and_then(|ref token| {
                 match token {
-                    Token::ServerMsg => ServerResult::handle_server_message(&self.server_socket),
+                    Token::ServerMsg => ServerResult::handle_server_message(socket),
                 }
                 .map_err(Into::into)
             })
     }
 }
 
-impl StreamSource for CrasClient {
+impl<'a> StreamSource for CrasClient<'a> {
     fn new_playback_stream(
         &mut self,
         num_channels: usize,
+        format: SampleFormat,
         frame_rate: usize,
         buffer_size: usize,
     ) -> std::result::Result<
         (Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>),
-        Box<error::Error>,
+        Box<dyn error::Error>,
     > {
         Ok((
             Box::new(DummyStreamControl::new()),
@@ -363,7 +429,7 @@ impl StreamSource for CrasClient {
                 CRAS_STREAM_DIRECTION::CRAS_STREAM_OUTPUT,
                 frame_rate,
                 num_channels,
-                _snd_pcm_format::SND_PCM_FORMAT_S16_LE,
+                format,
             )?),
         ))
     }
@@ -371,11 +437,12 @@ impl StreamSource for CrasClient {
     fn new_capture_stream(
         &mut self,
         num_channels: usize,
+        format: SampleFormat,
         frame_rate: usize,
         buffer_size: usize,
     ) -> std::result::Result<
         (Box<dyn StreamControl>, Box<dyn CaptureBufferStream>),
-        Box<error::Error>,
+        Box<dyn error::Error>,
     > {
         if self.cras_capture {
             Ok((
@@ -385,7 +452,7 @@ impl StreamSource for CrasClient {
                     CRAS_STREAM_DIRECTION::CRAS_STREAM_INPUT,
                     frame_rate,
                     num_channels,
-                    _snd_pcm_format::SND_PCM_FORMAT_S16_LE,
+                    format,
                 )?),
             ))
         } else {
@@ -393,6 +460,7 @@ impl StreamSource for CrasClient {
                 Box::new(DummyStreamControl::new()),
                 Box::new(DummyCaptureStream::new(
                     num_channels,
+                    format,
                     frame_rate,
                     buffer_size,
                 )),

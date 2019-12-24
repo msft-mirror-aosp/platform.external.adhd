@@ -37,13 +37,10 @@ static void cras_bt_interface_added(DBusConnection *conn,
 				adapter, properties_array_iter, NULL);
 		} else {
 			BTLOG(btlog, BT_ADAPTER_ADDED, 0, 0);
-			adapter = cras_bt_adapter_create(object_path);
+			adapter = cras_bt_adapter_create(conn, object_path);
 			if (adapter) {
 				cras_bt_adapter_update_properties(
 					adapter, properties_array_iter, NULL);
-				cras_bt_register_endpoints(conn, adapter);
-				cras_bt_register_player(conn, adapter);
-				cras_bt_register_profiles(conn);
 
 				syslog(LOG_INFO, "Bluetooth Adapter: %s added",
 				       cras_bt_adapter_address(adapter));
@@ -53,6 +50,28 @@ static void cras_bt_interface_added(DBusConnection *conn,
 				       object_path);
 			}
 		}
+
+	} else if (strcmp(interface_name, BLUEZ_INTERFACE_MEDIA) == 0) {
+		struct cras_bt_adapter *adapter;
+
+		adapter = cras_bt_adapter_get(object_path);
+		if (adapter) {
+			cras_bt_register_endpoints(conn, adapter);
+			cras_bt_register_player(conn, adapter);
+
+			syslog(LOG_INFO,
+			       "Bluetooth Endpoint and/or Player: %s added",
+			       cras_bt_adapter_address(adapter));
+		} else {
+			syslog(LOG_WARNING,
+			       "Failed to create Bluetooth Endpoint and/or Player: %s",
+			       object_path);
+		}
+
+	} else if (strcmp(interface_name, BLUEZ_PROFILE_MGMT_INTERFACE) == 0) {
+		cras_bt_register_profiles(conn);
+
+		syslog(LOG_INFO, "Bluetooth Profile Manager added");
 
 	} else if (strcmp(interface_name, BLUEZ_INTERFACE_DEVICE) == 0) {
 		struct cras_bt_device *device;
@@ -137,7 +156,7 @@ static void cras_bt_interface_removed(DBusConnection *conn,
 		if (transport) {
 			syslog(LOG_INFO, "Bluetooth Transport: %s removed",
 			       cras_bt_transport_object_path(transport));
-			cras_bt_transport_destroy(transport);
+			cras_bt_transport_remove(transport);
 		}
 	}
 }

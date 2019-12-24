@@ -258,13 +258,15 @@ static int cras_iodev_output_event_sample_ready(struct cras_iodev *odev)
 {
 	if (odev->state == CRAS_IODEV_STATE_OPEN ||
 	    odev->state == CRAS_IODEV_STATE_NO_STREAM_RUN) {
+		int ramp_mute = odev->ramp_mute;
 		/* Starts ramping up if device should not be muted.
-		 * Both mute and volume are taken into consideration.
+		 * Both mute, ramp_mute and volume are taken into consideration.
 		 */
-		if (odev->ramp && !output_should_mute(odev))
+		if (odev->ramp && !output_should_mute(odev) && !ramp_mute) {
 			cras_iodev_start_ramp(
 				odev,
 				CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK);
+		}
 	}
 
 	if (odev->state == CRAS_IODEV_STATE_OPEN) {
@@ -684,7 +686,11 @@ void cras_iodev_set_node_plugged(struct cras_ionode *node, int plugged)
 	if (plugged) {
 		gettimeofday(&node->plugged_time, NULL);
 	} else if (node == node->dev->active_node) {
-		cras_iodev_list_disable_dev(node->dev, false);
+		/*
+		 * Remove normal and pinned streams, when node unplugged.
+		 * TODO(hychao): clean this up, per crbug.com/1006646
+		 */
+		cras_iodev_list_disable_dev(node->dev, true);
 	}
 	cras_iodev_list_notify_nodes_changed();
 }
@@ -1048,6 +1054,17 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 	int rc;
 	struct cras_loopback *loopback;
 
+	/* Calculate whether the final output was non-empty, if requested. */
+	if (is_non_empty) {
+		unsigned int i;
+		for (i = 0; i < nframes * cras_get_format_bytes(fmt); i++) {
+			if (frames[i]) {
+				*is_non_empty = 1;
+				break;
+			}
+		}
+	}
+
 	DL_FOREACH (iodev->loopbacks, loopback) {
 		if (loopback->type == LOOPBACK_POST_MIX_PRE_DSP)
 			loopback->hook_data(frames, nframes, iodev->format,
@@ -1074,9 +1091,6 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 	    ramp_action.type != CRAS_RAMP_ACTION_PARTIAL) {
 		const unsigned int frame_bytes = cras_get_format_bytes(fmt);
 		cras_mix_mute_buffer(frames, frame_bytes, nframes);
-
-		// Skip non-empty check, since we know it's empty.
-		is_non_empty = NULL;
 	}
 
 	/* Compute scaler for software volume if needed. */
@@ -1115,17 +1129,6 @@ int cras_iodev_put_output_buffer(struct cras_iodev *iodev, uint8_t *frames,
 					   frames, nframes);
 	if (iodev->rate_est)
 		rate_estimator_add_frames(iodev->rate_est, nframes);
-
-	// Calculate whether the final output was non-empty, if requested.
-	if (is_non_empty) {
-		unsigned int i;
-		for (i = 0; i < nframes * cras_get_format_bytes(fmt); i++) {
-			if (frames[i]) {
-				*is_non_empty = 1;
-				break;
-			}
-		}
-	}
 
 	return iodev->put_buffer(iodev, nframes);
 }
@@ -1247,7 +1250,7 @@ int cras_iodev_frames_queued(struct cras_iodev *iodev,
 
 	rc = iodev->frames_queued(iodev, hw_tstamp);
 	if (rc == -EPIPE)
-		cras_audio_thread_severe_underrun();
+		cras_audio_thread_event_severe_underrun();
 
 	if (rc < 0)
 		return rc;
@@ -1309,7 +1312,7 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 
 int cras_iodev_output_underrun(struct cras_iodev *odev)
 {
-	cras_audio_thread_underrun();
+	cras_audio_thread_event_underrun();
 	if (odev->output_underrun)
 		return odev->output_underrun(odev);
 	else
@@ -1436,10 +1439,16 @@ int cras_iodev_reset_request(struct cras_iodev *iodev)
 	return cras_device_monitor_reset_device(iodev->info.idx);
 }
 
-static void ramp_mute_callback(void *data)
+static void ramp_down_mute_callback(void *data)
 {
 	struct cras_iodev *odev = (struct cras_iodev *)data;
 	cras_device_monitor_set_device_mute_state(odev->info.idx);
+}
+
+static void ramp_mute_callback(void *data)
+{
+	struct cras_iodev *odev = (struct cras_iodev *)data;
+	cras_iodev_set_ramp_mute(odev, 0);
 }
 
 /* Used in audio thread. Check the docstrings of CRAS_IODEV_RAMP_REQUEST. */
@@ -1471,6 +1480,13 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 	case CRAS_IODEV_RAMP_REQUEST_DOWN_MUTE:
 		from = 1.0;
 		to = 0.0;
+		duration_secs = RAMP_MUTE_DURATION_SECS;
+		cb = ramp_down_mute_callback;
+		cb_data = (void *)odev;
+		break;
+	case CRAS_IODEV_RAMP_REQUEST_MUTE:
+		from = 0;
+		to = 0;
 		duration_secs = RAMP_MUTE_DURATION_SECS;
 		cb = ramp_mute_callback;
 		cb_data = (void *)odev;
@@ -1541,8 +1557,87 @@ int cras_iodev_set_mute(struct cras_iodev *iodev)
 	return 0;
 }
 
+int cras_iodev_set_ramp_mute(struct cras_iodev *odev, int ramp_mute)
+{
+	if (ramp_mute) {
+		if (output_should_mute(odev))
+			return 0;
+
+		cras_iodev_start_ramp(odev, CRAS_IODEV_RAMP_REQUEST_MUTE);
+	}
+	odev->ramp_mute = ramp_mute;
+	return 0;
+}
+
 void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
 					unsigned int hw_level)
 {
 	iodev->highest_hw_level = MAX(iodev->highest_hw_level, hw_level);
+}
+
+/*
+ * Makes an input device drop the given number of frames.
+ * Args:
+ *    iodev - The device.
+ *    frames - How many frames will be dropped in a device.
+ * Returns:
+ *    The number of frames have been dropped. Negative error code on failure.
+ */
+static int cras_iodev_drop_frames(struct cras_iodev *iodev, unsigned int frames)
+{
+	struct timespec hw_tstamp;
+	int i, rc;
+	unsigned int target_frames, dropped_frames = 0;
+
+	if (iodev->direction != CRAS_STREAM_INPUT)
+		return -EINVAL;
+
+	rc = cras_iodev_frames_queued(iodev, &hw_tstamp);
+	if (rc < 0)
+		return rc;
+
+	target_frames = MIN(frames, rc);
+
+	/*
+	 * Loop reading the buffer, at most twice. This is to cover when
+	 * circular buffer is at the end and returns partial of the target
+	 * frames.
+	 */
+	for (i = 0; (dropped_frames < target_frames) && (i < 2); i++) {
+		frames = target_frames - dropped_frames;
+		rc = iodev->get_buffer(iodev, &iodev->input_data->area,
+				       &frames);
+		if (rc < 0)
+			return rc;
+
+		rc = iodev->put_buffer(iodev, frames);
+		if (rc < 0)
+			return rc;
+		dropped_frames += frames;
+		/*
+		 * Tell rate estimator that some frames have been dropped to
+		 * avoid calculating the wrong rate.
+		 */
+		rate_estimator_add_frames(iodev->rate_est, -frames);
+	}
+
+	ATLOG(atlog, AUDIO_THREAD_DEV_DROP_FRAMES, iodev->info.idx,
+	      dropped_frames, 0);
+
+	return frames;
+}
+
+int cras_iodev_drop_frames_by_time(struct cras_iodev *iodev, struct timespec ts)
+{
+	int frames_to_set;
+	double est_rate;
+	int rc;
+
+	est_rate = iodev->format->frame_rate *
+		   cras_iodev_get_est_rate_ratio(iodev);
+	frames_to_set = cras_time_to_frames(&ts, est_rate);
+
+	rc = cras_iodev_drop_frames(iodev, frames_to_set);
+
+	return rc;
 }

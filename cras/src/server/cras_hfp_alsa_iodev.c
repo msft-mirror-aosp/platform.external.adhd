@@ -87,7 +87,7 @@ static int hfp_alsa_update_supported_formats(struct cras_iodev *iodev)
 
 	free(iodev->supported_channel_counts);
 	iodev->supported_channel_counts =
-			malloc(2 * sizeof(*iodev->supported_channel_counts));
+		malloc(2 * sizeof(*iodev->supported_channel_counts));
 	if (!iodev->supported_channel_counts)
 		return -ENOMEM;
 	iodev->supported_channel_counts[0] = 1;
@@ -95,7 +95,7 @@ static int hfp_alsa_update_supported_formats(struct cras_iodev *iodev)
 
 	free(iodev->supported_formats);
 	iodev->supported_formats =
-			malloc(2 * sizeof(*iodev->supported_formats));
+		malloc(2 * sizeof(*iodev->supported_formats));
 	if (!iodev->supported_formats)
 		return -ENOMEM;
 	iodev->supported_formats[0] = SND_PCM_FORMAT_S16_LE;
@@ -117,8 +117,8 @@ static int hfp_alsa_configure_dev(struct cras_iodev *iodev)
 	}
 
 	rc = cras_bt_device_get_sco(
-			hfp_alsa_io->device,
-			hfp_slc_get_selected_codec(hfp_alsa_io->slc));
+		hfp_alsa_io->device,
+		hfp_slc_get_selected_codec(hfp_alsa_io->slc));
 	if (rc < 0) {
 		syslog(LOG_ERR, "Failed to get sco: %d\n", rc);
 		return rc;
@@ -135,6 +135,7 @@ static int hfp_alsa_close_dev(struct cras_iodev *iodev)
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
 
+	hfp_set_call_status(hfp_alsa_io->slc, 0);
 	cras_bt_device_put_sco(hfp_alsa_io->device);
 	cras_iodev_free_format(iodev);
 	return aio->close_dev(aio);
@@ -158,8 +159,7 @@ static int hfp_alsa_delay_frames(const struct cras_iodev *iodev)
 }
 
 static int hfp_alsa_get_buffer(struct cras_iodev *iodev,
-		               struct cras_audio_area **area,
-		               unsigned *frames)
+			       struct cras_audio_area **area, unsigned *frames)
 {
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
@@ -184,8 +184,7 @@ static int hfp_alsa_flush_buffer(struct cras_iodev *iodev)
 }
 
 static void hfp_alsa_update_active_node(struct cras_iodev *iodev,
-					unsigned node_idx,
-					unsigned dev_enabled)
+					unsigned node_idx, unsigned dev_enabled)
 {
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
@@ -236,11 +235,10 @@ static int hfp_alsa_is_free_running(const struct cras_iodev *iodev)
 	return aio->is_free_running(aio);
 }
 
-struct cras_iodev *hfp_alsa_iodev_create(
-		struct cras_iodev *aio,
-		struct cras_bt_device *device,
-		struct hfp_slc_handle *slc,
-		enum cras_bt_device_profile profile)
+struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
+					 struct cras_bt_device *device,
+					 struct hfp_slc_handle *slc,
+					 enum cras_bt_device_profile profile)
 {
 	struct hfp_alsa_io *hfp_alsa_io;
 	struct cras_iodev *iodev;
@@ -262,14 +260,13 @@ struct cras_iodev *hfp_alsa_iodev_create(
 	name = cras_bt_device_name(device);
 	if (!name)
 		name = cras_bt_device_object_path(device);
-	snprintf(iodev->info.name, sizeof(iodev->info.name),
-		 "%s.HFP_PCM", name);
+	snprintf(iodev->info.name, sizeof(iodev->info.name), "%s.HFP_PCM",
+		 name);
 	iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] = 0;
-	iodev->info.stable_id = SuperFastHash(
-			cras_bt_device_object_path(device),
-			strlen(cras_bt_device_object_path(device)),
-			strlen(cras_bt_device_object_path(device)));
-	iodev->info.stable_id_new = iodev->info.stable_id;
+	iodev->info.stable_id =
+		SuperFastHash(cras_bt_device_object_path(device),
+			      strlen(cras_bt_device_object_path(device)),
+			      strlen(cras_bt_device_object_path(device)));
 
 	iodev->open_dev = hfp_alsa_open_dev;
 	iodev->update_supported_formats = hfp_alsa_update_supported_formats;
@@ -295,13 +292,21 @@ struct cras_iodev *hfp_alsa_iodev_create(
 	strcpy(node->name, iodev->info.name);
 
 	node->plugged = 1;
+	/* If headset mic uses legacy narrow band, i.e CVSD codec, report a
+	 * different node type so UI can set different plug priority. */
 	node->type = CRAS_NODE_TYPE_BLUETOOTH;
+	if ((hfp_slc_get_selected_codec(hfp_alsa_io->slc) ==
+	     HFP_CODEC_ID_CVSD) &&
+	    (iodev->direction == CRAS_STREAM_INPUT))
+		node->type = CRAS_NODE_TYPE_BLUETOOTH_NB_MIC;
 	node->volume = 100;
 	gettimeofday(&node->plugged_time, NULL);
 
-	cras_bt_device_append_iodev(device, iodev, profile);
+	/* Prepare active node before append, so bt_io can extract correct
+	 * info from hfp_alsa iodev and node. */
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
+	cras_bt_device_append_iodev(device, iodev, profile);
 
 	return iodev;
 }

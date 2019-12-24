@@ -10,6 +10,9 @@ AC_CANONICAL_HOST
 AM_INIT_AUTOMAKE([1.10 -Wall no-define])
 #AC_CONFIG_HEADERS([config.h])
 
+# To compile with full logs, use V=1 with make instead.
+AM_SILENT_RULES([yes])
+
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 AC_PROG_LIBTOOL
 AC_PROG_CC
@@ -48,7 +51,7 @@ AC_SUBST(SELINUX_CFLAGS)
 AC_SUBST(SELINUX_LIBS)
 
 # WEBRTC APM support
-AC_ARG_ENABLE([webrtc-apm], AS_HELP_STRING([--disable-webrtc-apm], [Disable webrtc-apm uses]), have_webrtc_apm=$enableval, have_webrtc_apm=yes)
+AC_ARG_ENABLE([webrtc-apm], AS_HELP_STRING([--enable-webrtc-apm], [Enable webrtc-apm uses]), have_webrtc_apm=$enableval, have_webrtc_apm=no)
 AM_CONDITIONAL(HAVE_WEBRTC_APM, test "$have_webrtc_apm" = "yes")
 if test "$have_webrtc_apm" = "yes"; then
     PKG_CHECK_MODULES([WEBRTC_APM], [ libwebrtc_apm ])
@@ -57,6 +60,13 @@ else
     WEBRTC_APM_LIBS=
 fi
 AC_SUBST(WEBRTC_APM_LIBS)
+
+# Build fuzzer binaries
+AC_ARG_ENABLE([fuzzer], AS_HELP_STRING([--enable-fuzzer], [Enable fuzzer build]), have_fuzzer=$enableval, have_fuzzer=no)
+AM_CONDITIONAL(HAVE_FUZZER, test "$have_fuzzer" = "yes")
+if test "$have_fuzzer" = "yes"; then
+    AC_DEFINE(HAVE_FUZZER, 1, [Define to build fuzzers.])
+fi
 
 PKG_CHECK_MODULES([SBC], [ sbc >= 1.0 ])
 AC_CHECK_LIB(asound, snd_pcm_ioplug_create,,
@@ -73,6 +83,23 @@ else
     METRICS_LIBS=
 fi
 AC_SUBST(METRICS_LIBS)
+
+# Check if the system copy of the cras rust library should be used. If not, make sure cargo and rustc are present to build it.
+AC_ARG_WITH([system-cras-rust],
+	    AS_HELP_STRING([--with-system-cras-rust], [Use the system provided cras_rust library]),
+	    with_system_rust=$enableval,
+	    with_system_rust=no)
+AM_CONDITIONAL(WITH_SYSTEM_RUST, test "$with_system_rust" = "yes")
+if test "$with_system_rust" = "no"; then
+    AC_CHECK_PROG(CARGO, [cargo], [yes], [no])
+    AS_IF(test x$CARGO = xno,
+        AC_MSG_ERROR([cargo is required to build cras rust lib.])
+    )
+    AC_CHECK_PROG(RUSTC, [rustc], [yes], [no])
+    AS_IF(test x$RUSTC = xno,
+        AC_MSG_ERROR([rustc is required to build cras rust lib.])
+    )
+fi
 
 # Determine ALSA plugin directory.
 test "x$prefix" = xNONE && prefix=$ac_default_prefix
