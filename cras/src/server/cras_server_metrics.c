@@ -20,6 +20,9 @@
 
 #define METRICS_NAME_BUFFER_SIZE 50
 
+const char kBusyloop[] = "Cras.Busyloop";
+const char kDeviceTypeInput[] = "Cras.DeviceTypeInput";
+const char kDeviceTypeOutput[] = "Cras.DeviceTypeOutput";
 const char kHighestDeviceDelayInput[] = "Cras.HighestDeviceDelayInput";
 const char kHighestDeviceDelayOutput[] = "Cras.HighestDeviceDelayOutput";
 const char kHighestInputHardwareLevel[] = "Cras.HighestInputHardwareLevel";
@@ -43,11 +46,14 @@ const char kMissedCallbackSecondTimeOutput[] =
 const char kNoCodecsFoundMetric[] = "Cras.NoCodecsFoundAtBoot";
 const char kStreamTimeoutMilliSeconds[] = "Cras.StreamTimeoutMilliSeconds";
 const char kStreamCallbackThreshold[] = "Cras.StreamCallbackThreshold";
+const char kStreamClientTypeInput[] = "Cras.StreamClientTypeInput";
+const char kStreamClientTypeOutput[] = "Cras.StreamClientTypeOutput";
 const char kStreamFlags[] = "Cras.StreamFlags";
 const char kStreamSamplingFormat[] = "Cras.StreamSamplingFormat";
 const char kStreamSamplingRate[] = "Cras.StreamSamplingRate";
 const char kUnderrunsPerDevice[] = "Cras.UnderrunsPerDevice";
 const char kHfpWidebandSpeechSupported[] = "Cras.HfpWidebandSpeechSupported";
+const char kHfpWidebandSpeechPacketLoss[] = "Cras.HfpWidebandSpeechPacketLoss";
 
 /*
  * Records missed callback frequency only when the runtime of stream is larger
@@ -55,9 +61,23 @@ const char kHfpWidebandSpeechSupported[] = "Cras.HfpWidebandSpeechSupported";
  */
 const double MISSED_CB_FREQUENCY_SECONDS_MIN = 10.0;
 
+const time_t CRAS_METRICS_SHORT_PERIOD_THRESHOLD_SECONDS = 600;
+const time_t CRAS_METRICS_LONG_PERIOD_THRESHOLD_SECONDS = 3600;
+
+static const char *get_timespec_period_str(struct timespec ts)
+{
+	if (ts.tv_sec < CRAS_METRICS_SHORT_PERIOD_THRESHOLD_SECONDS)
+		return "ShortPeriod";
+	if (ts.tv_sec < CRAS_METRICS_LONG_PERIOD_THRESHOLD_SECONDS)
+		return "MediumPeriod";
+	return "LongPeriod";
+}
+
 /* Type of metrics to log. */
 enum CRAS_SERVER_METRICS_TYPE {
+	BT_WIDEBAND_PACKET_LOSS,
 	BT_WIDEBAND_SUPPORTED,
+	BUSYLOOP,
 	DEVICE_RUNTIME,
 	HIGHEST_DEVICE_DELAY_INPUT,
 	HIGHEST_DEVICE_DELAY_OUTPUT,
@@ -76,23 +96,60 @@ enum CRAS_SERVER_METRICS_TYPE {
 	STREAM_CONFIG
 };
 
+enum CRAS_METRICS_DEVICE_TYPE {
+	/* Output devices. */
+	CRAS_METRICS_DEVICE_INTERNAL_SPEAKER,
+	CRAS_METRICS_DEVICE_HEADPHONE,
+	CRAS_METRICS_DEVICE_HDMI,
+	CRAS_METRICS_DEVICE_HAPTIC,
+	CRAS_METRICS_DEVICE_LINEOUT,
+	/* Input devices. */
+	CRAS_METRICS_DEVICE_INTERNAL_MIC,
+	CRAS_METRICS_DEVICE_FRONT_MIC,
+	CRAS_METRICS_DEVICE_REAR_MIC,
+	CRAS_METRICS_DEVICE_KEYBOARD_MIC,
+	CRAS_METRICS_DEVICE_MIC,
+	CRAS_METRICS_DEVICE_HOTWORD,
+	CRAS_METRICS_DEVICE_POST_MIX_LOOPBACK,
+	CRAS_METRICS_DEVICE_POST_DSP_LOOPBACK,
+	/* Devices supporting input and output function. */
+	CRAS_METRICS_DEVICE_USB,
+	CRAS_METRICS_DEVICE_A2DP,
+	CRAS_METRICS_DEVICE_HFP,
+	CRAS_METRICS_DEVICE_HSP,
+	CRAS_METRICS_DEVICE_BLUETOOTH,
+	CRAS_METRICS_DEVICE_NO_DEVICE,
+	CRAS_METRICS_DEVICE_NORMAL_FALLBACK,
+	CRAS_METRICS_DEVICE_ABNORMAL_FALLBACK,
+	CRAS_METRICS_DEVICE_SILENT_HOTWORD,
+	CRAS_METRICS_DEVICE_UNKNOWN,
+};
+
 struct cras_server_metrics_stream_config {
+	enum CRAS_STREAM_DIRECTION direction;
 	unsigned cb_threshold;
 	unsigned flags;
 	int format;
 	unsigned rate;
+	enum CRAS_CLIENT_TYPE client_type;
 };
 
 struct cras_server_metrics_device_data {
-	const char *type;
+	enum CRAS_METRICS_DEVICE_TYPE type;
 	enum CRAS_STREAM_DIRECTION direction;
 	struct timespec runtime;
+};
+
+struct cras_server_metrics_timespec_data {
+	struct timespec runtime;
+	unsigned count;
 };
 
 union cras_server_metrics_data {
 	unsigned value;
 	struct cras_server_metrics_stream_config stream_config;
 	struct cras_server_metrics_device_data device_data;
+	struct cras_server_metrics_timespec_data timespec_data;
 };
 
 /*
@@ -132,58 +189,156 @@ static int cras_server_metrics_message_send(struct cras_main_message *msg)
 	return cras_main_message_send(msg);
 }
 
-static const char *get_metrics_device_type_str(struct cras_iodev *iodev)
+static inline const char *
+metrics_device_type_str(enum CRAS_METRICS_DEVICE_TYPE device_type)
 {
+	switch (device_type) {
+	case CRAS_METRICS_DEVICE_INTERNAL_SPEAKER:
+		return "InternalSpeaker";
+	case CRAS_METRICS_DEVICE_HEADPHONE:
+		return "Headphone";
+	case CRAS_METRICS_DEVICE_HDMI:
+		return "HDMI";
+	case CRAS_METRICS_DEVICE_HAPTIC:
+		return "Haptic";
+	case CRAS_METRICS_DEVICE_LINEOUT:
+		return "Lineout";
+	/* Input devices. */
+	case CRAS_METRICS_DEVICE_INTERNAL_MIC:
+		return "InternalMic";
+	case CRAS_METRICS_DEVICE_FRONT_MIC:
+		return "FrontMic";
+	case CRAS_METRICS_DEVICE_REAR_MIC:
+		return "RearMic";
+	case CRAS_METRICS_DEVICE_KEYBOARD_MIC:
+		return "KeyboardMic";
+	case CRAS_METRICS_DEVICE_MIC:
+		return "Mic";
+	case CRAS_METRICS_DEVICE_HOTWORD:
+		return "Hotword";
+	case CRAS_METRICS_DEVICE_POST_MIX_LOOPBACK:
+		return "PostMixLoopback";
+	case CRAS_METRICS_DEVICE_POST_DSP_LOOPBACK:
+		return "PostDspLoopback";
+	/* Devices supporting input and output function. */
+	case CRAS_METRICS_DEVICE_USB:
+		return "USB";
+	case CRAS_METRICS_DEVICE_A2DP:
+		return "A2DP";
+	case CRAS_METRICS_DEVICE_HFP:
+		return "HFP";
+	case CRAS_METRICS_DEVICE_HSP:
+		return "HSP";
+	case CRAS_METRICS_DEVICE_BLUETOOTH:
+		return "Bluetooth";
+	case CRAS_METRICS_DEVICE_NO_DEVICE:
+		return "NoDevice";
+	/* Other dummy devices. */
+	case CRAS_METRICS_DEVICE_NORMAL_FALLBACK:
+		return "NormalFallback";
+	case CRAS_METRICS_DEVICE_ABNORMAL_FALLBACK:
+		return "AbnormalFallback";
+	case CRAS_METRICS_DEVICE_SILENT_HOTWORD:
+		return "SilentHotword";
+	case CRAS_METRICS_DEVICE_UNKNOWN:
+		return "Unknown";
+	default:
+		return "InvalidType";
+	}
+}
+
+static enum CRAS_METRICS_DEVICE_TYPE
+get_metrics_device_type(struct cras_iodev *iodev)
+{
+	/* Check whether it is a special device. */
+	if (iodev->info.idx < MAX_SPECIAL_DEVICE_IDX) {
+		switch (iodev->info.idx) {
+		case NO_DEVICE:
+			syslog(LOG_ERR, "The invalid device has been used.");
+			return CRAS_METRICS_DEVICE_NO_DEVICE;
+		case SILENT_RECORD_DEVICE:
+		case SILENT_PLAYBACK_DEVICE:
+			if (iodev->active_node->type ==
+			    CRAS_NODE_TYPE_FALLBACK_NORMAL)
+				return CRAS_METRICS_DEVICE_NORMAL_FALLBACK;
+			else
+				return CRAS_METRICS_DEVICE_ABNORMAL_FALLBACK;
+		case SILENT_HOTWORD_DEVICE:
+			return CRAS_METRICS_DEVICE_SILENT_HOTWORD;
+		}
+	}
+
 	switch (iodev->active_node->type) {
 	case CRAS_NODE_TYPE_INTERNAL_SPEAKER:
-		return "InternalSpeaker";
+		return CRAS_METRICS_DEVICE_INTERNAL_SPEAKER;
 	case CRAS_NODE_TYPE_HEADPHONE:
-		return "Headphone";
+		return CRAS_METRICS_DEVICE_HEADPHONE;
 	case CRAS_NODE_TYPE_HDMI:
-		return "HDMI";
+		return CRAS_METRICS_DEVICE_HDMI;
 	case CRAS_NODE_TYPE_HAPTIC:
-		return "Haptic";
+		return CRAS_METRICS_DEVICE_HAPTIC;
 	case CRAS_NODE_TYPE_LINEOUT:
-		return "Lineout";
+		return CRAS_METRICS_DEVICE_LINEOUT;
 	case CRAS_NODE_TYPE_MIC:
 		switch (iodev->active_node->position) {
 		case NODE_POSITION_INTERNAL:
-			return "InternalMic";
+			return CRAS_METRICS_DEVICE_INTERNAL_MIC;
 		case NODE_POSITION_FRONT:
-			return "FrontMic";
+			return CRAS_METRICS_DEVICE_FRONT_MIC;
 		case NODE_POSITION_REAR:
-			return "RearMic";
+			return CRAS_METRICS_DEVICE_REAR_MIC;
 		case NODE_POSITION_KEYBOARD:
-			return "KeyboardMic";
+			return CRAS_METRICS_DEVICE_KEYBOARD_MIC;
 		case NODE_POSITION_EXTERNAL:
 		default:
-			return "Mic";
+			return CRAS_METRICS_DEVICE_MIC;
 		}
 	case CRAS_NODE_TYPE_HOTWORD:
-		return "Hotword";
+		return CRAS_METRICS_DEVICE_HOTWORD;
 	case CRAS_NODE_TYPE_POST_MIX_PRE_DSP:
-		return "PostMixLoopback";
+		return CRAS_METRICS_DEVICE_POST_MIX_LOOPBACK;
 	case CRAS_NODE_TYPE_POST_DSP:
-		return "PostDspLoopback";
+		return CRAS_METRICS_DEVICE_POST_DSP_LOOPBACK;
 	case CRAS_NODE_TYPE_USB:
-		return "USB";
+		return CRAS_METRICS_DEVICE_USB;
 	case CRAS_NODE_TYPE_BLUETOOTH:
 #ifdef CRAS_DBUS
 		if (cras_bt_io_on_profile(iodev,
 					  CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE))
-			return "A2DP";
+			return CRAS_METRICS_DEVICE_A2DP;
 		if (cras_bt_io_on_profile(
 			    iodev, CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY))
-			return "HFP";
+			return CRAS_METRICS_DEVICE_HFP;
 		if (cras_bt_io_on_profile(
 			    iodev, CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY))
-			return "HSP";
+			return CRAS_METRICS_DEVICE_HSP;
 #endif
-		return "Bluetooth";
+		return CRAS_METRICS_DEVICE_BLUETOOTH;
 	case CRAS_NODE_TYPE_UNKNOWN:
 	default:
-		return "Unknown";
+		return CRAS_METRICS_DEVICE_UNKNOWN;
 	}
+}
+
+int cras_server_metrics_hfp_packet_loss(float packet_loss_ratio)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	/* Percentage is too coarse for packet loss, so we use number of bad
+	 * packets per thousand packets instead. */
+	data.value = (unsigned)(round(packet_loss_ratio * 1000));
+	init_server_metrics_msg(&msg, BT_WIDEBAND_PACKET_LOSS, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR,
+		       "Failed to send metrics message: BT_WIDEBAND_PACKET_LOSS");
+		return err;
+	}
+	return 0;
 }
 
 int cras_server_metrics_hfp_wideband_support(bool supported)
@@ -212,7 +367,7 @@ int cras_server_metrics_device_runtime(struct cras_iodev *iodev)
 	struct timespec now;
 	int err;
 
-	data.device_data.type = get_metrics_device_type_str(iodev);
+	data.device_data.type = get_metrics_device_type(iodev);
 	data.device_data.direction = iodev->direction;
 	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
 	subtract_timespecs(&now, &iodev->open_ts, &data.device_data.runtime);
@@ -506,10 +661,12 @@ int cras_server_metrics_stream_config(struct cras_rstream_config *config)
 	union cras_server_metrics_data data;
 	int err;
 
+	data.stream_config.direction = config->direction;
 	data.stream_config.cb_threshold = (unsigned)config->cb_threshold;
 	data.stream_config.flags = (unsigned)config->flags;
 	data.stream_config.format = (int)config->format->format;
 	data.stream_config.rate = (unsigned)config->format->frame_rate;
+	data.stream_config.client_type = config->client_type;
 
 	init_server_metrics_msg(&msg, STREAM_CONFIG, data);
 	err = cras_server_metrics_message_send(
@@ -523,6 +680,26 @@ int cras_server_metrics_stream_config(struct cras_rstream_config *config)
 	return 0;
 }
 
+int cras_server_metrics_busyloop(struct timespec *ts, unsigned count)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	data.timespec_data.runtime = *ts;
+	data.timespec_data.count = count;
+
+	init_server_metrics_msg(&msg, BUSYLOOP, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR, "Failed to send metrics message: BUSYLOOP");
+		return err;
+	}
+	return 0;
+}
+
 static void metrics_device_runtime(struct cras_server_metrics_device_data data)
 {
 	char metrics_name[METRICS_NAME_BUFFER_SIZE];
@@ -530,9 +707,25 @@ static void metrics_device_runtime(struct cras_server_metrics_device_data data)
 	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE,
 		 "Cras.%sDevice%sRuntime",
 		 data.direction == CRAS_STREAM_INPUT ? "Input" : "Output",
-		 data.type);
+		 metrics_device_type_str(data.type));
 	cras_metrics_log_histogram(metrics_name, (unsigned)data.runtime.tv_sec,
 				   0, 10000, 20);
+
+	/* Logs the usage of each device. */
+	if (data.direction == CRAS_STREAM_INPUT)
+		cras_metrics_log_sparse_histogram(kDeviceTypeInput, data.type);
+	else
+		cras_metrics_log_sparse_histogram(kDeviceTypeOutput, data.type);
+}
+
+static void metrics_busyloop(struct cras_server_metrics_timespec_data data)
+{
+	char metrics_name[METRICS_NAME_BUFFER_SIZE];
+
+	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE, "%s.%s", kBusyloop,
+		 get_timespec_period_str(data.runtime));
+
+	cras_metrics_log_histogram(metrics_name, data.count, 0, 1000, 20);
 }
 
 static void
@@ -550,6 +743,14 @@ metrics_stream_config(struct cras_server_metrics_stream_config config)
 
 	/* Logs stream sampling rate. */
 	cras_metrics_log_sparse_histogram(kStreamSamplingRate, config.rate);
+
+	/* Logs stream client type. */
+	if (config.direction == CRAS_STREAM_INPUT)
+		cras_metrics_log_sparse_histogram(kStreamClientTypeInput,
+						  config.client_type);
+	else
+		cras_metrics_log_sparse_histogram(kStreamClientTypeOutput,
+						  config.client_type);
 }
 
 static void handle_metrics_message(struct cras_main_message *msg, void *arg)
@@ -557,6 +758,11 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 	struct cras_server_metrics_message *metrics_msg =
 		(struct cras_server_metrics_message *)msg;
 	switch (metrics_msg->metrics_type) {
+	case BT_WIDEBAND_PACKET_LOSS:
+		cras_metrics_log_histogram(kHfpWidebandSpeechPacketLoss,
+					   metrics_msg->data.value, 0, 1000,
+					   20);
+		break;
 	case BT_WIDEBAND_SUPPORTED:
 		cras_metrics_log_sparse_histogram(kHfpWidebandSpeechSupported,
 						  metrics_msg->data.value);
@@ -636,6 +842,9 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 		break;
 	case STREAM_CONFIG:
 		metrics_stream_config(metrics_msg->data.stream_config);
+		break;
+	case BUSYLOOP:
+		metrics_busyloop(metrics_msg->data.timespec_data);
 		break;
 	default:
 		syslog(LOG_ERR, "Unknown metrics type %u",
