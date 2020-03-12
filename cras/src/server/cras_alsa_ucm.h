@@ -185,28 +185,6 @@ int ucm_get_min_buffer_level(struct cras_use_case_mgr *mgr,
  */
 unsigned int ucm_get_disable_software_volume(struct cras_use_case_mgr *mgr);
 
-/* Gets the value for minimum software gain.
- * Args:
- *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
- *    dev - The device to check for minimum software gain.
- *    gain - The pointer to the returned value.
- * Returns:
- *    0 on success, other error codes on failure.
- */
-int ucm_get_min_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
-			      long *gain);
-
-/* Gets the value for maximum software gain.
- * Args:
- *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
- *    dev - The device to check for maximum software gain.
- *    gain - The pointer to the returned value.
- * Returns:
- *    0 on success, other error codes on failure.
- */
-int ucm_get_max_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
-			      long *gain);
-
 /* Gets the value for default node gain.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
@@ -218,16 +196,16 @@ int ucm_get_max_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
 int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
 			      long *gain);
 
-/* Gets the value for intrinsic volume.
+/* Gets the value for intrinsic sensitivity.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
  *    dev - The device to query for intrinsic volume.
- *    vol - The pointer to the returned value.
+ *    sensitivity - The pointer to the returned value.
  * Returns:
  *    0 on success, other error codes on failure.
  */
-int ucm_get_intrinsic_volume(struct cras_use_case_mgr *mgr, const char *dev,
-			     long *vol);
+int ucm_get_intrinsic_sensitivity(struct cras_use_case_mgr *mgr,
+				  const char *dev, long *sensitivity);
 
 /* Gets the flag if an input device can preempt hotword recording.
  * Args:
@@ -417,6 +395,30 @@ const char *ucm_get_jack_name_for_dev(struct cras_use_case_mgr *mgr,
  */
 const char *ucm_get_jack_type_for_dev(struct cras_use_case_mgr *mgr,
 				      const char *dev);
+
+/* Gets the jack dev of this device on the card.
+ *
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for jack name.
+ * Returns:
+ *    A pointer to the allocated string containing the input jack name, or NULL
+ *    if no jack name is found.
+ */
+const char *ucm_get_jack_dev_for_dev(struct cras_use_case_mgr *mgr,
+				     const char *dev);
+
+/* Gets the jack control of this device on the card.
+ *
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for jack type.
+ * Returns:
+ *    A pointer to the allocated string containing the alsa jack name, or NULL
+ *    if no jack type is found or the found jack type is invalid.
+ */
+const char *ucm_get_jack_control_for_dev(struct cras_use_case_mgr *mgr,
+					 const char *dev);
 
 /* Gets the jack switch number for this device.
  * Some sound cards can detect multiple types of connections into the
