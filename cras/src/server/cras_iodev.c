@@ -258,13 +258,15 @@ static int cras_iodev_output_event_sample_ready(struct cras_iodev *odev)
 {
 	if (odev->state == CRAS_IODEV_STATE_OPEN ||
 	    odev->state == CRAS_IODEV_STATE_NO_STREAM_RUN) {
+		int ramp_mute = odev->ramp_mute;
 		/* Starts ramping up if device should not be muted.
-		 * Both mute and volume are taken into consideration.
+		 * Both mute, ramp_mute and volume are taken into consideration.
 		 */
-		if (odev->ramp && !output_should_mute(odev))
+		if (odev->ramp && !output_should_mute(odev) && !ramp_mute) {
 			cras_iodev_start_ramp(
 				odev,
 				CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK);
+		}
 	}
 
 	if (odev->state == CRAS_IODEV_STATE_OPEN) {
@@ -684,7 +686,11 @@ void cras_iodev_set_node_plugged(struct cras_ionode *node, int plugged)
 	if (plugged) {
 		gettimeofday(&node->plugged_time, NULL);
 	} else if (node == node->dev->active_node) {
-		cras_iodev_list_disable_dev(node->dev, false);
+		/*
+		 * Remove normal and pinned streams, when node unplugged.
+		 * TODO(hychao): clean this up, per crbug.com/1006646
+		 */
+		cras_iodev_list_disable_dev(node->dev, true);
 	}
 	cras_iodev_list_notify_nodes_changed();
 }
@@ -1433,10 +1439,16 @@ int cras_iodev_reset_request(struct cras_iodev *iodev)
 	return cras_device_monitor_reset_device(iodev->info.idx);
 }
 
-static void ramp_mute_callback(void *data)
+static void ramp_down_mute_callback(void *data)
 {
 	struct cras_iodev *odev = (struct cras_iodev *)data;
 	cras_device_monitor_set_device_mute_state(odev->info.idx);
+}
+
+static void ramp_mute_callback(void *data)
+{
+	struct cras_iodev *odev = (struct cras_iodev *)data;
+	cras_iodev_set_ramp_mute(odev, 0);
 }
 
 /* Used in audio thread. Check the docstrings of CRAS_IODEV_RAMP_REQUEST. */
@@ -1468,6 +1480,13 @@ int cras_iodev_start_ramp(struct cras_iodev *odev,
 	case CRAS_IODEV_RAMP_REQUEST_DOWN_MUTE:
 		from = 1.0;
 		to = 0.0;
+		duration_secs = RAMP_MUTE_DURATION_SECS;
+		cb = ramp_down_mute_callback;
+		cb_data = (void *)odev;
+		break;
+	case CRAS_IODEV_RAMP_REQUEST_MUTE:
+		from = 0;
+		to = 0;
 		duration_secs = RAMP_MUTE_DURATION_SECS;
 		cb = ramp_mute_callback;
 		cb_data = (void *)odev;
@@ -1538,6 +1557,18 @@ int cras_iodev_set_mute(struct cras_iodev *iodev)
 	return 0;
 }
 
+int cras_iodev_set_ramp_mute(struct cras_iodev *odev, int ramp_mute)
+{
+	if (ramp_mute) {
+		if (output_should_mute(odev))
+			return 0;
+
+		cras_iodev_start_ramp(odev, CRAS_IODEV_RAMP_REQUEST_MUTE);
+	}
+	odev->ramp_mute = ramp_mute;
+	return 0;
+}
+
 void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
 					unsigned int hw_level)
 {
@@ -1555,7 +1586,8 @@ void cras_iodev_update_highest_hw_level(struct cras_iodev *iodev,
 static int cras_iodev_drop_frames(struct cras_iodev *iodev, unsigned int frames)
 {
 	struct timespec hw_tstamp;
-	int rc;
+	int i, rc;
+	unsigned int target_frames, dropped_frames = 0;
 
 	if (iodev->direction != CRAS_STREAM_INPUT)
 		return -EINVAL;
@@ -1564,23 +1596,33 @@ static int cras_iodev_drop_frames(struct cras_iodev *iodev, unsigned int frames)
 	if (rc < 0)
 		return rc;
 
-	frames = MIN(frames, rc);
-
-	rc = iodev->get_buffer(iodev, &iodev->input_data->area, &frames);
-	if (rc < 0)
-		return rc;
-
-	rc = iodev->put_buffer(iodev, frames);
-	if (rc < 0)
-		return rc;
+	target_frames = MIN(frames, rc);
 
 	/*
-	 * Tell rate estimator that some frames have been dropped to avoid calculating
-	 * the wrong rate.
+	 * Loop reading the buffer, at most twice. This is to cover when
+	 * circular buffer is at the end and returns partial of the target
+	 * frames.
 	 */
-	rate_estimator_add_frames(iodev->rate_est, -frames);
+	for (i = 0; (dropped_frames < target_frames) && (i < 2); i++) {
+		frames = target_frames - dropped_frames;
+		rc = iodev->get_buffer(iodev, &iodev->input_data->area,
+				       &frames);
+		if (rc < 0)
+			return rc;
 
-	ATLOG(atlog, AUDIO_THREAD_DEV_DROP_FRAMES, iodev->info.idx, frames, 0);
+		rc = iodev->put_buffer(iodev, frames);
+		if (rc < 0)
+			return rc;
+		dropped_frames += frames;
+		/*
+		 * Tell rate estimator that some frames have been dropped to
+		 * avoid calculating the wrong rate.
+		 */
+		rate_estimator_add_frames(iodev->rate_est, -frames);
+	}
+
+	ATLOG(atlog, AUDIO_THREAD_DEV_DROP_FRAMES, iodev->info.idx,
+	      dropped_frames, 0);
 
 	return frames;
 }

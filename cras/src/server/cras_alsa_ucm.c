@@ -20,8 +20,6 @@ static const char edid_var[] = "EDIDFile";
 static const char cap_var[] = "CaptureControl";
 static const char mic_positions[] = "MicPositions";
 static const char override_type_name_var[] = "OverrideNodeType";
-static const char output_dsp_name_var[] = "OutputDspName";
-static const char input_dsp_name_var[] = "InputDspName";
 static const char dsp_name_var[] = "DspName";
 static const char mixer_var[] = "MixerName";
 static const char swap_mode_suffix[] = "Swap Mode";
@@ -34,8 +32,21 @@ static const char capture_device_name_var[] = "CapturePCM";
 static const char capture_device_rate_var[] = "CaptureRate";
 static const char capture_channel_map_var[] = "CaptureChannelMap";
 static const char coupled_mixers[] = "CoupledMixers";
+static const char dependent_device_name_var[] = "DependentPCM";
 static const char preempt_hotword_var[] = "PreemptHotword";
 static const char echo_reference_dev_name_var[] = "EchoReferenceDev";
+
+/*
+ * Set this value in a SectionDevice to specify the intrinsic volume in
+ * 0.01 dBFS. It currently only supports input devices. You should get the
+ * value by recording samples without either hardware or software gain. We are
+ * still working on building a standard process for measuring it. The value you
+ * see now in our UCM is just estimated value. If it is set, CRAS will enable
+ * software gain and use the value as a reference volume for calculating the
+ * appropriate software gain to apply to the device to meet our target volume.
+ */
+static const char intrinsic_volume_var[] = "IntrinsicVolume";
+
 /*
  * Set this value in a SectionDevice to specify the minimum software gain in
  * 0.01 dB and enable software gain on this node. It must be used with
@@ -336,6 +347,24 @@ ucm_get_capture_device_name_for_dev(struct cras_use_case_mgr *mgr,
 	return name;
 }
 
+/* Gets the value of DependentPCM property. This is used to structure two
+ * SectionDevices under one cras iodev to avoid two PCMs be open at the
+ * same time because of restriction in lower layer driver or hardware.
+ */
+static const char *
+ucm_get_dependent_device_name_for_dev(struct cras_use_case_mgr *mgr,
+				      const char *dev)
+{
+	const char *name = NULL;
+	int rc;
+
+	rc = get_var(mgr, dependent_device_name_var, dev, uc_verb(mgr), &name);
+	if (rc)
+		return NULL;
+
+	return name;
+}
+
 /* Get a list of mixer names specified in a UCM variable separated by ",".
  * E.g. "Left Playback,Right Playback".
  */
@@ -608,22 +637,6 @@ const char *ucm_get_edid_file_for_dev(struct cras_use_case_mgr *mgr,
 	return file_name;
 }
 
-const char *ucm_get_dsp_name_default(struct cras_use_case_mgr *mgr,
-				     int direction)
-{
-	const char *var = (direction == CRAS_STREAM_OUTPUT) ?
-				  output_dsp_name_var :
-				  input_dsp_name_var;
-	const char *dsp_name = NULL;
-	int rc;
-
-	rc = get_var(mgr, var, "", uc_verb(mgr), &dsp_name);
-	if (rc)
-		return NULL;
-
-	return dsp_name;
-}
-
 const char *ucm_get_dsp_name_for_dev(struct cras_use_case_mgr *mgr,
 				     const char *dev)
 {
@@ -701,6 +714,19 @@ int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
 	return 0;
 }
 
+int ucm_get_intrinsic_volume(struct cras_use_case_mgr *mgr, const char *dev,
+			     long *vol)
+{
+	int value;
+	int rc;
+
+	rc = get_int(mgr, intrinsic_volume_var, dev, uc_verb(mgr), &value);
+	if (rc)
+		return rc;
+	*vol = value;
+	return 0;
+}
+
 int ucm_get_preempt_hotword(struct cras_use_case_mgr *mgr, const char *dev)
 {
 	int value;
@@ -712,15 +738,24 @@ int ucm_get_preempt_hotword(struct cras_use_case_mgr *mgr, const char *dev)
 	return value;
 }
 
-const char *ucm_get_device_name_for_dev(struct cras_use_case_mgr *mgr,
-					const char *dev,
-					enum CRAS_STREAM_DIRECTION direction)
+static int get_device_index_from_target(const char *target_device_name);
+
+int ucm_get_alsa_dev_idx_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
+				 enum CRAS_STREAM_DIRECTION direction)
 {
+	const char *pcm_name = NULL;
+	int dev_idx = -1;
+
 	if (direction == CRAS_STREAM_OUTPUT)
-		return ucm_get_playback_device_name_for_dev(mgr, dev);
+		pcm_name = ucm_get_playback_device_name_for_dev(mgr, dev);
 	else if (direction == CRAS_STREAM_INPUT)
-		return ucm_get_capture_device_name_for_dev(mgr, dev);
-	return NULL;
+		pcm_name = ucm_get_capture_device_name_for_dev(mgr, dev);
+
+	if (pcm_name) {
+		dev_idx = get_device_index_from_target(pcm_name);
+		free((void *)pcm_name);
+	}
+	return dev_idx;
 }
 
 const char *
@@ -824,39 +859,37 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 	for (i = 0; i < num_devs; i += 2) {
 		enum CRAS_STREAM_DIRECTION dir = CRAS_STREAM_UNDEFINED;
 		int dev_idx = -1;
+		int dependent_dev_idx = -1;
 		const char *jack_name;
 		const char *jack_type;
 		const char *mixer_name;
 		struct mixer_name *m_name;
 		int rc;
-		const char *target_device_name;
+		const char *pcm_name;
+		const char *dependent_dev_name;
 
 		dev_name = strdup(list[i]);
 		if (!dev_name)
 			continue;
 
-		target_device_name =
-			ucm_get_playback_device_name_for_dev(mgr, dev_name);
-		if (target_device_name)
+		pcm_name = ucm_get_playback_device_name_for_dev(mgr, dev_name);
+		if (pcm_name) {
 			dir = CRAS_STREAM_OUTPUT;
-		else {
-			target_device_name =
-				ucm_get_capture_device_name_for_dev(mgr,
-								    dev_name);
-			if (target_device_name)
+		} else {
+			pcm_name = ucm_get_capture_device_name_for_dev(
+				mgr, dev_name);
+			if (pcm_name)
 				dir = CRAS_STREAM_INPUT;
 		}
-		if (target_device_name) {
-			dev_idx = get_device_index_from_target(
-				target_device_name);
-			free((void *)target_device_name);
-		}
+		if (pcm_name)
+			dev_idx = get_device_index_from_target(pcm_name);
 
 		if (dir == CRAS_STREAM_UNDEFINED) {
 			syslog(LOG_ERR,
 			       "UCM configuration for device '%s' missing"
 			       " PlaybackPCM or CapturePCM definition.",
 			       dev_name);
+			free((void *)pcm_name);
 			goto error_cleanup;
 		}
 
@@ -865,15 +898,27 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 			       "PlaybackPCM or CapturePCM for '%s' must be in"
 			       " the form 'hw:<card>,<number>'",
 			       dev_name);
+			free((void *)pcm_name);
 			goto error_cleanup;
+		}
+
+		dependent_dev_name =
+			ucm_get_dependent_device_name_for_dev(mgr, dev_name);
+		if (dependent_dev_name) {
+			dependent_dev_idx = get_device_index_from_target(
+				dependent_dev_name);
+			free((void *)dependent_dev_name);
 		}
 
 		jack_name = ucm_get_jack_name_for_dev(mgr, dev_name);
 		jack_type = ucm_get_jack_type_for_dev(mgr, dev_name);
 		mixer_name = ucm_get_mixer_name_for_dev(mgr, dev_name);
 
-		dev_sec = ucm_section_create(dev_name, dev_idx, dir, jack_name,
+		dev_sec = ucm_section_create(dev_name, pcm_name, dev_idx,
+					     dependent_dev_idx, dir, jack_name,
 					     jack_type);
+		if (pcm_name)
+			free((void *)pcm_name);
 		if (jack_name)
 			free((void *)jack_name);
 		if (jack_type)

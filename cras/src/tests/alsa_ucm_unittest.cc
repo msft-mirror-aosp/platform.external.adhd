@@ -368,9 +368,8 @@ TEST(AlsaUcm, GetDevForMixer) {
   free((void*)dev_name_in);
 }
 
-TEST(AlsaUcm, GetDeviceNameForDevice) {
+TEST(AlsaUcm, GetAlsaDeviceIndexForDevice) {
   struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
-  const char *input_dev_name, *output_dev_name;
   const char* devices[] = {"Dev1", "Comment for Dev1", "Dev2",
                            "Comment for Dev2"};
 
@@ -380,24 +379,17 @@ TEST(AlsaUcm, GetDeviceNameForDevice) {
   fake_list_size["_devices/HiFi"] = 4;
   std::string id_1 = "=CapturePCM/Dev1/HiFi";
   std::string id_2 = "=PlaybackPCM/Dev2/HiFi";
-  std::string value_1 = "DeviceName1";
-  std::string value_2 = "DeviceName2";
+  std::string value_1 = "PCMName,1";
+  std::string value_2 = "PCMName,2";
 
   snd_use_case_get_value[id_1] = value_1;
   snd_use_case_get_value[id_2] = value_2;
-  input_dev_name = ucm_get_device_name_for_dev(mgr, "Dev1", CRAS_STREAM_INPUT);
-  output_dev_name =
-      ucm_get_device_name_for_dev(mgr, "Dev2", CRAS_STREAM_OUTPUT);
-  ASSERT_TRUE(input_dev_name);
-  ASSERT_TRUE(output_dev_name);
-  EXPECT_EQ(0, strcmp(input_dev_name, value_1.c_str()));
-  EXPECT_EQ(0, strcmp(output_dev_name, value_2.c_str()));
+  EXPECT_EQ(1, ucm_get_alsa_dev_idx_for_dev(mgr, "Dev1", CRAS_STREAM_INPUT));
+  EXPECT_EQ(2, ucm_get_alsa_dev_idx_for_dev(mgr, "Dev2", CRAS_STREAM_OUTPUT));
 
   ASSERT_EQ(2, snd_use_case_get_called);
   EXPECT_EQ(snd_use_case_get_id[0], id_1);
   EXPECT_EQ(snd_use_case_get_id[1], id_2);
-  free((void*)input_dev_name);
-  free((void*)output_dev_name);
 }
 
 TEST(AlsaUcm, GetDeviceRateForDevice) {
@@ -842,6 +834,31 @@ TEST(AlsaUcm, DefaultNodeGain) {
   ASSERT_TRUE(ret);
 }
 
+TEST(AlsaUcm, IntrinsicVolume) {
+  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
+  long intrinsic_vol;
+  int ret;
+  std::string id = "=IntrinsicVolume/Internal Mic/HiFi";
+  std::string value = "-2000";
+
+  ResetStubData();
+
+  /* Value can be found in UCM. */
+  snd_use_case_get_value[id] = value;
+
+  ret = ucm_get_intrinsic_volume(mgr, "Internal Mic", &intrinsic_vol);
+
+  EXPECT_EQ(0, ret);
+  EXPECT_EQ(-2000, intrinsic_vol);
+
+  ResetStubData();
+
+  /* Value can not be found in UCM. */
+  ret = ucm_get_intrinsic_volume(mgr, "Internal Mic", &intrinsic_vol);
+
+  ASSERT_TRUE(ret);
+}
+
 TEST(AlsaUcm, UseFullySpecifiedUCMConfig) {
   struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
   int fully_specified_flag;
@@ -1088,18 +1105,22 @@ TEST(AlsaUcm, UcmSection) {
   struct mixer_name* controls = NULL;
   struct mixer_name* m_name;
   int dev_idx = 0;
+  int dependent_dev_idx = -1;
   size_t i;
   enum CRAS_STREAM_DIRECTION dir = CRAS_STREAM_OUTPUT;
   static const char* name = "Headphone";
+  static const char* pcm_name = "hw:0,1";
   static const char* jack_name = "my-card-name Headset Jack";
   static const char* jack_type = "gpio";
   static const char* mixer_name = "Control1";
   static const char* coupled_names[] = {"Coupled1", "Coupled2"};
 
-  section = ucm_section_create(NULL, 0, CRAS_STREAM_OUTPUT, NULL, NULL);
+  section =
+      ucm_section_create(NULL, NULL, 0, -1, CRAS_STREAM_OUTPUT, NULL, NULL);
   EXPECT_EQ(reinterpret_cast<struct ucm_section*>(NULL), section);
 
-  section = ucm_section_create(name, dev_idx, dir, jack_name, jack_type);
+  section = ucm_section_create(name, pcm_name, dev_idx, dependent_dev_idx, dir,
+                               jack_name, jack_type);
   EXPECT_NE(reinterpret_cast<struct ucm_section*>(NULL), section);
   EXPECT_NE(name, section->name);
   EXPECT_EQ(0, strcmp(name, section->name));
