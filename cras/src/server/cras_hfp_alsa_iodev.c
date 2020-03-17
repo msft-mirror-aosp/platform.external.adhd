@@ -135,6 +135,7 @@ static int hfp_alsa_close_dev(struct cras_iodev *iodev)
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
 
+	hfp_set_call_status(hfp_alsa_io->slc, 0);
 	cras_bt_device_put_sco(hfp_alsa_io->device);
 	cras_iodev_free_format(iodev);
 	return aio->close_dev(aio);
@@ -291,13 +292,21 @@ struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
 	strcpy(node->name, iodev->info.name);
 
 	node->plugged = 1;
+	/* If headset mic uses legacy narrow band, i.e CVSD codec, report a
+	 * different node type so UI can set different plug priority. */
 	node->type = CRAS_NODE_TYPE_BLUETOOTH;
+	if ((hfp_slc_get_selected_codec(hfp_alsa_io->slc) ==
+	     HFP_CODEC_ID_CVSD) &&
+	    (iodev->direction == CRAS_STREAM_INPUT))
+		node->type = CRAS_NODE_TYPE_BLUETOOTH_NB_MIC;
 	node->volume = 100;
 	gettimeofday(&node->plugged_time, NULL);
 
-	cras_bt_device_append_iodev(device, iodev, profile);
+	/* Prepare active node before append, so bt_io can extract correct
+	 * info from hfp_alsa iodev and node. */
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
+	cras_bt_device_append_iodev(device, iodev, profile);
 
 	return iodev;
 }

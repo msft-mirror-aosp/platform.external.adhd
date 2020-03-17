@@ -16,6 +16,8 @@ extern "C" {
 #include "cras_shm.h"
 }
 
+#include "metrics_stub.h"
+
 namespace {
 
 class RstreamTestSuite : public testing::Test {
@@ -376,7 +378,7 @@ unsigned int buffer_share_get_new_write_point(struct buffer_share* mix) {
   return 0;
 }
 
-int buffer_share_add_id(struct buffer_share* mix, unsigned int id) {
+int buffer_share_add_id(struct buffer_share* mix, unsigned int id, void* data) {
   return 0;
 }
 
@@ -392,6 +394,16 @@ unsigned int buffer_share_id_offset(const struct buffer_share* mix,
 void cras_system_state_stream_added(enum CRAS_STREAM_DIRECTION direction) {}
 
 void cras_system_state_stream_removed(enum CRAS_STREAM_DIRECTION direction) {}
+
+int cras_server_metrics_stream_create(
+    const struct cras_rstream_config* config) {
+  return 0;
+}
+
+int cras_server_metrics_stream_destroy(const struct cras_rstream* stream) {
+  return 0;
+}
+
 #ifdef HAVE_WEBRTC_APM
 struct cras_apm_list* cras_apm_list_create(void* stream_ptr, uint64_t effects) {
   return NULL;
@@ -409,8 +421,4 @@ struct cras_audio_format* cras_apm_list_get_format(struct cras_apm* apm) {
   return NULL;
 }
 #endif
-
-int cras_server_metrics_missed_cb_frequency(const struct cras_rstream* stream) {
-  return 0;
-}
 }
