@@ -79,12 +79,14 @@ static const struct timespec no_stream_fill_zeros_duration = {
  * This extends cras_ionode to include alsa-specific information.
  * Members:
  *    mixer_output - From cras_alsa_mixer.
+ *    pcm_name - PCM name for snd_pcm_open.
  *    volume_curve - Volume curve for this node.
  *    jack - The jack associated with the node.
  */
 struct alsa_output_node {
 	struct cras_ionode base;
 	struct mixer_control *mixer_output;
+	const char *pcm_name;
 	struct cras_volume_curve *volume_curve;
 	const struct cras_alsa_jack *jack;
 };
@@ -92,6 +94,7 @@ struct alsa_output_node {
 struct alsa_input_node {
 	struct cras_ionode base;
 	struct mixer_control *mixer_input;
+	const char *pcm_name;
 	const struct cras_alsa_jack *jack;
 	int8_t *channel_layout;
 };
@@ -124,8 +127,6 @@ struct alsa_input_node {
  * jack_list - List of alsa jack controls for this device.
  * ucm - CRAS use case manager, if configuration is found.
  * mmap_offset - offset returned from mmap_begin.
- * dsp_name_default - the default dsp name for the device. It can be overridden
- *     by the jack specific dsp name.
  * poll_fd - Descriptor used to block until data is ready.
  * dma_period_set_microsecs - If non-zero, the value to apply to the dma_period.
  * free_running - true if device is playing zeros in the buffer without
@@ -158,7 +159,6 @@ struct alsa_io {
 	struct cras_alsa_jack_list *jack_list;
 	struct cras_use_case_mgr *ucm;
 	snd_pcm_uframes_t mmap_offset;
-	const char *dsp_name_default;
 	int poll_fd;
 	unsigned int dma_period_set_microsecs;
 	int free_running;
@@ -266,6 +266,11 @@ static const struct {
 		.name = "SCO Line Out",
 		.type = CRAS_NODE_TYPE_BLUETOOTH,
 		.position = NODE_POSITION_EXTERNAL,
+	},
+	{
+		.name = "Echo Reference",
+		.type = CRAS_NODE_TYPE_ECHO_REFERENCE,
+		.position = NODE_POSITION_INTERNAL,
 	},
 };
 
@@ -375,8 +380,23 @@ static int open_dev(struct cras_iodev *iodev)
 	struct alsa_io *aio = (struct alsa_io *)iodev;
 	snd_pcm_t *handle;
 	int rc;
+	const char *pcm_name = NULL;
 
-	rc = cras_alsa_pcm_open(&handle, aio->dev, aio->alsa_stream);
+	if (aio->base.direction == CRAS_STREAM_OUTPUT) {
+		struct alsa_output_node *aout =
+			(struct alsa_output_node *)aio->base.active_node;
+		pcm_name = aout->pcm_name;
+	} else {
+		struct alsa_input_node *ain =
+			(struct alsa_input_node *)aio->base.active_node;
+		pcm_name = ain->pcm_name;
+	}
+
+	/* For legacy UCM path which doesn't have PlaybackPCM or CapturePCM. */
+	if (pcm_name == NULL)
+		pcm_name = aio->dev;
+
+	rc = cras_alsa_pcm_open(&handle, pcm_name, aio->alsa_stream);
 	if (rc < 0)
 		return rc;
 
@@ -757,12 +777,13 @@ static void set_alsa_capture_gain(struct cras_iodev *iodev)
 	/* Only set the volume if the dev is active. */
 	if (!has_handle(aio))
 		return;
-	gain = cras_iodev_adjust_active_node_gain(
-		iodev, cras_system_get_capture_gain());
 
 	/* Set hardware gain to 0dB if software gain is needed. */
 	if (cras_iodev_software_volume_needed(iodev))
 		gain = 0;
+	else
+		gain = cras_iodev_adjust_active_node_gain(
+			iodev, cras_system_get_capture_gain());
 
 	ain = get_active_input(aio);
 
@@ -837,6 +858,7 @@ static void free_alsa_iodev_resources(struct alsa_io *aio)
 {
 	struct cras_ionode *node;
 	struct alsa_output_node *aout;
+	struct alsa_input_node *ain;
 
 	free(aio->base.supported_rates);
 	free(aio->base.supported_channel_counts);
@@ -846,6 +868,10 @@ static void free_alsa_iodev_resources(struct alsa_io *aio)
 		if (aio->base.direction == CRAS_STREAM_OUTPUT) {
 			aout = (struct alsa_output_node *)node;
 			cras_volume_curve_destroy(aout->volume_curve);
+			free((void *)aout->pcm_name);
+		} else {
+			ain = (struct alsa_input_node *)node;
+			free((void *)ain->pcm_name);
 		}
 		cras_iodev_rm_node(&aio->base, node);
 		free(node->softvol_scalers);
@@ -853,7 +879,6 @@ static void free_alsa_iodev_resources(struct alsa_io *aio)
 		free(node);
 	}
 
-	free((void *)aio->dsp_name_default);
 	cras_iodev_free_resources(&aio->base);
 	free(aio->dev);
 	if (aio->dev_id)
@@ -1078,7 +1103,10 @@ static void set_input_node_software_volume_needed(struct alsa_input_node *input,
 	input->base.min_software_gain = DEFAULT_MIN_CAPTURE_GAIN;
 	input->base.max_software_gain = 0;
 
-	/* Enable software gain only if max software gain is specified in UCM. */
+	/* TODO(enshuo): Deprecate the max and min software gain when intrinsic
+	 * volume is done. */
+
+	/* Enable software gain if max software gain is specified in UCM. */
 	if (!aio->ucm)
 		return;
 
@@ -1132,6 +1160,29 @@ static void set_input_default_node_gain(struct alsa_input_node *input,
 		return;
 
 	input->base.capture_gain = default_node_gain;
+}
+
+static void set_input_node_intrinsic_volume(struct alsa_input_node *input,
+					    struct alsa_io *aio)
+{
+	long volume;
+	int rc;
+
+	input->base.intrinsic_volume = 0;
+
+	if (!aio->ucm)
+		return;
+
+	rc = ucm_get_intrinsic_volume(aio->ucm, input->base.name, &volume);
+	if (rc)
+		return;
+
+	input->base.intrinsic_volume = volume;
+	input->base.capture_gain = DEFAULT_CAPTURE_VOLUME_DBFS - volume;
+	syslog(LOG_INFO,
+	       "Use software gain %ld for %s because IntrinsicVolume %ld is"
+	       " specified in UCM",
+	       input->base.capture_gain, input->base.name, volume);
 }
 
 static void check_auto_unplug_output_node(struct alsa_io *aio,
@@ -1268,6 +1319,7 @@ static struct alsa_input_node *new_input(struct alsa_io *aio,
 	set_node_initial_state(&input->base, aio->card_type);
 	set_input_node_software_volume_needed(input, aio);
 	set_input_default_node_gain(input, aio);
+	set_input_node_intrinsic_volume(input, aio);
 
 	if (aio->ucm) {
 		/* Check mic positions only for internal mic. */
@@ -1387,8 +1439,7 @@ static const struct cras_alsa_jack *get_jack_from_node(struct cras_ionode *node)
 
 /*
  * Returns the dsp name specified in the ucm config. If there is a dsp name
- * specified for the active node, use that. Otherwise use the default dsp name
- * for the alsa_io device.
+ * specified for the active node, use that. Otherwise NULL should be returned.
  */
 static const char *get_active_dsp_name(struct alsa_io *aio)
 {
@@ -1397,7 +1448,7 @@ static const char *get_active_dsp_name(struct alsa_io *aio)
 	if (node == NULL)
 		return NULL;
 
-	return node->dsp_name ?: aio->dsp_name_default;
+	return node->dsp_name;
 }
 
 /*
@@ -2037,8 +2088,6 @@ alsa_iodev_create(size_t card_index, const char *card_name, size_t device_index,
 		unsigned int level;
 		int rc;
 
-		aio->dsp_name_default =
-			ucm_get_dsp_name_default(ucm, direction);
 		/* Set callback for swap mode if it is supported
 		 * in ucm modifier. */
 		if (ucm_swap_mode_exists(ucm))
@@ -2178,7 +2227,11 @@ int alsa_iodev_ucm_add_nodes_and_jacks(struct cras_iodev *iodev,
 
 	if (!aio || !section)
 		return -EINVAL;
-	if ((uint32_t)section->dev_idx != aio->device_index)
+
+	/* Allow this section to add as a new node only if the device id
+	 * or dependent device id matches this iodev. */
+	if (((uint32_t)section->dev_idx != aio->device_index) &&
+	    ((uint32_t)section->dependent_dev_idx != aio->device_index))
 		return -EINVAL;
 
 	/* This iodev is fully specified. Avoid automatic node creation. */
@@ -2197,10 +2250,12 @@ int alsa_iodev_ucm_add_nodes_and_jacks(struct cras_iodev *iodev,
 		output_node = new_output(aio, control, section->name);
 		if (!output_node)
 			return -ENOMEM;
+		output_node->pcm_name = strdup(section->pcm_name);
 	} else if (iodev->direction == CRAS_STREAM_INPUT) {
 		input_node = new_input(aio, control, section->name);
 		if (!input_node)
 			return -ENOMEM;
+		input_node->pcm_name = strdup(section->pcm_name);
 	}
 
 	if (section->jack_type && !strcmp(section->jack_type, "always"))
