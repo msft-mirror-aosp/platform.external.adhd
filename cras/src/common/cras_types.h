@@ -595,12 +595,15 @@ enum CRAS_NODE_TYPE {
 	CRAS_NODE_TYPE_HOTWORD,
 	CRAS_NODE_TYPE_POST_MIX_PRE_DSP,
 	CRAS_NODE_TYPE_POST_DSP,
+	/* Type for the legacy BT narrow band mic .*/
+	CRAS_NODE_TYPE_BLUETOOTH_NB_MIC,
 	/* These value can be used for both output and input nodes. */
 	CRAS_NODE_TYPE_USB,
 	CRAS_NODE_TYPE_BLUETOOTH,
 	CRAS_NODE_TYPE_FALLBACK_NORMAL,
 	CRAS_NODE_TYPE_FALLBACK_ABNORMAL,
 	CRAS_NODE_TYPE_UNKNOWN,
+	CRAS_NODE_TYPE_ECHO_REFERENCE,
 };
 
 /* Position values to described where a node locates on the system.
