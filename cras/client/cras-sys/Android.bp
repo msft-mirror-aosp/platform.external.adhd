@@ -5,6 +5,9 @@ rust_library_rlib {
     defaults: ["crosvm_defaults"],
     host_supported: true,
     crate_name: "cras_sys",
-    rlibs: ["libdata_model"],
+    rlibs: [
+        "libaudio_streams",
+        "libdata_model",
+    ],
     srcs: ["src/lib.rs"],
 }

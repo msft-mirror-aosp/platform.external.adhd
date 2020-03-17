@@ -6,4 +6,8 @@ rust_library_rlib {
     host_supported: true,
     crate_name: "audio_streams",
     srcs: ["src/audio_streams.rs"],
+    rlibs: [
+        "libsync_rust",
+        "libsys_util",
+    ],
 }
