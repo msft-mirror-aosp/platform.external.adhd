@@ -41,6 +41,7 @@ COMMON_CPPFLAGS = -O2 -Wall -Werror -Wno-error=cpp
 COMMON_SIMD_CPPFLAGS = -O3 -Wall -Werror -Wno-error=cpp
 
 bin_PROGRAMS = cras cras_test_client cras_monitor cras_router
+noinst_PROGRAMS =
 
 if HAVE_DBUS
 CRAS_DBUS_SOURCES = \
@@ -157,7 +158,6 @@ cras_server_SOURCES = \
 	server/server_stream.c \
 	server/stream_list.c \
 	server/test_iodev.c \
-	server/rate_estimator.c \
 	server/softvol_curve.c
 
 libcrasserver_la_SOURCES = \
@@ -165,8 +165,10 @@ libcrasserver_la_SOURCES = \
 libcrasserver_la_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/dsp -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config -I$(top_srcdir)/src/plc \
+	-I$(top_srcdir)/src/server/rust/src/headers \
 	$(DBUS_CFLAGS) $(SBC_CFLAGS) $(SELINUX_CFLAGS)
 libcrasserver_la_LIBADD = \
+	$(CRAS_RUST) \
 	libcrasmix.la \
 	$(CRAS_SSE4_2) \
 	$(CRAS_AVX) \
@@ -193,6 +195,7 @@ cras_LDADD = \
 	$(CRAS_AVX) \
 	$(CRAS_AVX2) \
 	$(CRAS_FMA) \
+	$(CRAS_RUST) \
 	-lpthread -lasound -lrt -liniparser -ludev -ldl -lm -lspeexdsp \
 	$(METRICS_LIBS) \
 	$(SBC_LIBS) \
@@ -298,6 +301,20 @@ libasound_module_pcm_cras_la_LIBADD = -lasound libcras.la
 libasound_module_ctl_cras_la_SOURCES = alsa_plugin/ctl_cras.c
 libasound_module_ctl_cras_la_LIBADD = -lasound libcras.la
 
+if !WITH_SYSTEM_RUST
+RUST_FILES = \
+	server/rust/Cargo.toml \
+	server/rust/src/rate_estimator_bindings.rs \
+	server/rust/src/rate_estimator.rs
+
+CRAS_RUST = libcras_rust.a
+$(CRAS_RUST): $(RUST_FILES)
+	cargo build --release --manifest-path server/rust/Cargo.toml
+	cp server/rust/target/release/libcras_rust.a .
+else
+CRAS_RUST = -lcras_rust
+endif
+
 # Inject a dependency between the installation rules of libcras and its modules.
 # This avoids a race when the modules are relinked before libcras is actually
 # installed.
@@ -309,6 +326,39 @@ hide_install=install
 $(hide_install)-asound_module_pcm_crasLTLIBRARIES: install-libLTLIBRARIES
 $(hide_install)-asound_module_ctl_crasLTLIBRARIES: install-libLTLIBRARIES
 
+# ==== Fuzzer section
+if HAVE_FUZZER
+FUZZERS = \
+	cras_rclient_message_fuzzer
+noinst_PROGRAMS += $(FUZZERS)
+
+cras_rclient_message_fuzzer_SOURCES = \
+	fuzz/rclient_message.cc
+
+cras_rclient_message_fuzzer_CPPFLAGS = $(COMMON_CPPFLAGS) \
+	-I$(top_srcdir)/src/common \
+	-I$(top_srcdir)/src/dsp -I$(top_srcdir)/src/server \
+	-I$(top_srcdir)/src/server/config -I$(top_srcdir)/src/plc \
+	$(DBUS_CFLAGS) $(SBC_CFLAGS)
+
+cras_rclient_message_fuzzer_LDFLAGS = $(FUZZER_LDFLAGS)
+
+cras_rclient_message_fuzzer_LDADD = \
+	libcrasmix.la \
+	libcrasserver.la \
+	$(CRAS_SSE4_2) \
+	$(CRAS_AVX) \
+	$(CRAS_AVX2) \
+	$(CRAS_FMA) \
+	$(CRAS_RUST) \
+	-lpthread -lasound -lrt -liniparser -ludev -ldl -lm -lspeexdsp \
+	$(METRICS_LIBS) \
+	$(SBC_LIBS) \
+	$(DBUS_LIBS) \
+	$(WEBRTC_APM_LIBS)
+endif
+
+# ==== Tests section
 if HAVE_DBUS
 DBUS_TESTS = \
 	a2dp_info_unittest \
@@ -597,7 +647,8 @@ audio_thread_unittest_SOURCES = tests/audio_thread_unittest.cc \
 	server/dev_io.c tests/empty_audio_stub.cc tests/metrics_stub.cc \
 	common/cras_shm.c
 audio_thread_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
-	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server
+	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server \
+	-I$(top_srcdir)/src/server/rust/src/headers
 audio_thread_unittest_LDADD = -lgtest -lpthread -lrt
 
 audio_thread_monitor_unittest_SOURCES = tests/audio_thread_monitor_unittest.cc
@@ -668,6 +719,7 @@ dev_io_unittest_CPPFLAGS = \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config \
+	-I$(top_srcdir)/src/server/rust/src/headers \
 	$(SELINUX_CFLAGS)
 dev_io_unittest_LDADD = \
 	libcrasmix.la \
@@ -826,7 +878,8 @@ input_data_unittest_LDADD = -lgtest -lpthread
 iodev_unittest_SOURCES = tests/iodev_unittest.cc \
 	server/cras_iodev.c common/cras_shm.c
 iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
-	 -I$(top_srcdir)/src/server
+	-I$(top_srcdir)/src/server \
+	-I$(top_srcdir)/src/server/rust/src/headers
 iodev_unittest_LDADD = -lgtest -lpthread -lrt
 
 mix_unittest_SOURCES = tests/mix_unittest.cc server/cras_mix.c
@@ -862,10 +915,11 @@ ramp_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server
 ramp_unittest_LDADD = -lgtest -lpthread
 
-rate_estimator_unittest_SOURCES = tests/rate_estimator_unittest.cc server/rate_estimator.c
+rate_estimator_unittest_SOURCES = tests/rate_estimator_unittest.cc
 rate_estimator_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
-	 -I$(top_srcdir)/src/server
-rate_estimator_unittest_LDADD = -lgtest -lpthread
+	 -I$(top_srcdir)/src/server \
+	 -I$(top_srcdir)/src/server/rust/src/headers
+rate_estimator_unittest_LDADD = $(CRAS_RUST) -lgtest -ldl -lpthread
 
 control_rclient_unittest_SOURCES = tests/control_rclient_unittest.cc
 control_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
@@ -886,7 +940,7 @@ capture_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 capture_rclient_unittest_LDADD = -lgtest -lpthread
 
 rstream_unittest_SOURCES = tests/rstream_unittest.cc server/cras_rstream.c \
-	common/cras_shm.c $(CRAS_SELINUX_UNITTEST_SOURCES)
+	common/cras_shm.c tests/metrics_stub.cc $(CRAS_SELINUX_UNITTEST_SOURCES)
 rstream_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	 -I$(top_srcdir)/src/server $(SELINUX_CFLAGS)
 rstream_unittest_LDADD = $(SELINUX_LIBS) \
@@ -946,6 +1000,7 @@ timing_unittest_CPPFLAGS = \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config \
+	-I$(top_srcdir)/src/server/rust/src/headers \
 	$(SELINUX_CFLAGS)
 timing_unittest_LDADD = \
 	libcrasmix.la \
