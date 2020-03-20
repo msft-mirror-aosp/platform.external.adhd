@@ -16,6 +16,9 @@ extern const char kNoCodecsFoundMetric[];
 /* Logs if connected HFP headset supports wideband speech. */
 int cras_server_metrics_hfp_wideband_support(bool supported);
 
+/* Logs the selected codec in HFP wideband connection. */
+int cras_server_metrics_hfp_wideband_selected_codec(int codec);
+
 /* Logs the number of packet loss per 1000 packets under HFP capture. */
 int cras_server_metrics_hfp_packet_loss(float packet_loss_ratio);
 
@@ -37,14 +40,14 @@ int cras_server_metrics_longest_fetch_delay(unsigned delay_msec);
 /* Logs the number of underruns of a device. */
 int cras_server_metrics_num_underruns(unsigned num_underruns);
 
-/* Logs the frequency of missed callback. */
-int cras_server_metrics_missed_cb_frequency(const struct cras_rstream *stream);
-
 /* Logs the missed callback event. */
 int cras_server_metrics_missed_cb_event(const struct cras_rstream *stream);
 
-/* Logs the stream configurations from clients. */
-int cras_server_metrics_stream_config(struct cras_rstream_config *config);
+/* Logs information when a stream creates. */
+int cras_server_metrics_stream_create(const struct cras_rstream_config *config);
+
+/* Logs information when a stream destroys. */
+int cras_server_metrics_stream_destroy(const struct cras_rstream *stream);
 
 /* Logs the number of busyloops for different time periods. */
 int cras_server_metrics_busyloop(struct timespec *ts, unsigned count);

@@ -220,10 +220,14 @@ static const char *node_type_to_str(struct cras_ionode *node)
 		return "USB";
 	case CRAS_NODE_TYPE_BLUETOOTH:
 		return "BLUETOOTH";
+	case CRAS_NODE_TYPE_BLUETOOTH_NB_MIC:
+		return "BLUETOOTH_NB_MIC";
 	case CRAS_NODE_TYPE_FALLBACK_NORMAL:
 		return "FALLBACK_NORMAL";
 	case CRAS_NODE_TYPE_FALLBACK_ABNORMAL:
 		return "FALLBACK_ABNORMAL";
+	case CRAS_NODE_TYPE_ECHO_REFERENCE:
+		return "ECHO_REFERENCE";
 	case CRAS_NODE_TYPE_UNKNOWN:
 	default:
 		return "UNKNOWN";
@@ -335,7 +339,7 @@ static void remove_all_streams_from_dev(struct cras_iodev *dev)
 	DL_FOREACH (stream_list_get(stream_list), rstream) {
 		if (rstream->apm_list == NULL)
 			continue;
-		cras_apm_list_remove(rstream->apm_list, dev);
+		cras_apm_list_remove_apm(rstream->apm_list, dev);
 	}
 }
 
@@ -519,13 +523,26 @@ static int stream_added_cb(struct cras_rstream *rstream);
 
 static void resume_devs()
 {
+	struct enabled_dev *edev;
 	struct cras_rstream *rstream;
 
+	int has_output_stream = 0;
 	stream_list_suspended = 0;
 	DL_FOREACH (stream_list_get(stream_list), rstream) {
 		if ((rstream->flags & HOTWORD_STREAM) == HOTWORD_STREAM)
 			continue;
 		stream_added_cb(rstream);
+		if (rstream->direction == CRAS_STREAM_OUTPUT)
+			has_output_stream++;
+	}
+
+	/* To remove the short popped noise caused by applications that can not
+         * stop playback "right away" after resume, we mute all output devices
+         * for a short time if there is any output stream.*/
+	if (has_output_stream) {
+		DL_FOREACH (enabled_devs[CRAS_STREAM_OUTPUT], edev) {
+			cras_iodev_set_ramp_mute(edev->dev, 1);
+		}
 	}
 }
 
@@ -616,8 +633,8 @@ static int add_stream_to_open_devs(struct cras_rstream *stream,
 	int i;
 	if (stream->apm_list) {
 		for (i = 0; i < num_iodevs; i++)
-			cras_apm_list_add(stream->apm_list, iodevs[i],
-					  iodevs[i]->format);
+			cras_apm_list_add_apm(stream->apm_list, iodevs[i],
+					      iodevs[i]->format);
 	}
 	return audio_thread_add_stream(audio_thread, stream, iodevs,
 				       num_iodevs);
@@ -638,19 +655,33 @@ static int init_and_attach_streams(struct cras_iodev *dev)
 	/* If there are active streams to attach to this device,
 	 * open it. */
 	DL_FOREACH (stream_list_get(stream_list), stream) {
+		bool can_attach = 0;
+
 		if (stream->direction != dir)
 			continue;
 		/*
-		 * Don't attach this stream if (1) this stream pins to a
-		 * different device, or (2) this is a normal stream, but
-		 * device is not enabled.
+		 * For normal stream, if device is enabled by UI then it can
+		 * attach to this dev.
 		 */
-		if (stream->is_pinned) {
-			if (stream->pinned_dev_idx != dev->info.idx)
-				continue;
-		} else if (!dev_enabled) {
-			continue;
+		if (!stream->is_pinned) {
+			can_attach = dev_enabled;
 		}
+		/*
+		 * If this is a pinned stream, attach it if its pinned dev id
+		 * matches this device or any fallback dev. Note that attaching
+		 * a pinned stream to fallback device is temporary. When the
+		 * fallback dev gets disabled in possibly_disable_fallback()
+		 * the check stream_list_has_pinned_stream() is key to allow
+		 * all streams to be removed from fallback and close it.
+		 */
+		else if ((stream->pinned_dev_idx == dev->info.idx) ||
+			 (SILENT_PLAYBACK_DEVICE == dev->info.idx) ||
+			 (SILENT_RECORD_DEVICE == dev->info.idx)) {
+			can_attach = 1;
+		}
+
+		if (!can_attach)
+			continue;
 
 		rc = init_device(dev, stream);
 		if (rc) {
@@ -1508,12 +1539,26 @@ void cras_iodev_list_select_node(enum CRAS_STREAM_DIRECTION direction,
 	if (!new_node_already_enabled)
 		possibly_enable_fallback(direction, false);
 
-	/* Disable all devices except for fallback device, and the new device,
-	 * provided it is already enabled. */
 	DL_FOREACH (enabled_devs[direction], edev) {
-		if (edev->dev != fallback_devs[direction] &&
-		    !(new_node_already_enabled && edev->dev == new_dev)) {
+		/* Don't disable fallback devices. */
+		if (edev->dev == fallback_devs[direction])
+			continue;
+		/*
+		 * Disable enabled device if it's not the new one, use non-force
+		 * disable call so we don't interrupt existing pinned streams on
+		 * it.
+		 */
+		if (edev->dev != new_dev) {
 			disable_device(edev, false);
+		}
+		/*
+		 * Otherwise if this happens to be the new device but about to
+		 * select to a different node (on the same dev). Force disable
+		 * this device to avoid any pinned stream occupies it in audio
+		 * thread and cause problem in later update_active_node call.
+		 */
+		else if (!new_node_already_enabled) {
+			disable_device(edev, true);
 		}
 	}
 
