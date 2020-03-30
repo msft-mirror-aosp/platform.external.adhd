@@ -20,7 +20,6 @@ extern "C" {
 }
 static unsigned int cras_make_fd_nonblocking_called;
 static unsigned int cras_observer_remove_called;
-static unsigned int cras_server_metrics_stream_config_called;
 static int stream_list_add_called;
 static int stream_list_add_return;
 static unsigned int stream_list_rm_called;
@@ -31,7 +30,6 @@ static unsigned int cras_rstream_config_init_with_message_called;
 void ResetStubData() {
   cras_make_fd_nonblocking_called = 0;
   cras_observer_remove_called = 0;
-  cras_server_metrics_stream_config_called = 0;
   stream_list_add_called = 0;
   stream_list_add_return = 0;
   stream_list_rm_called = 0;
@@ -110,7 +108,7 @@ TEST_F(CCRMessageSuite, StreamConnectMessage) {
   cras_fill_connect_message(&msg, CRAS_STREAM_INPUT, stream_id,
                             CRAS_STREAM_TYPE_DEFAULT, CRAS_CLIENT_TYPE_UNKNOWN,
                             480, 240, /*flags=*/0, /*effects=*/0, fmt,
-                            NO_DEVICE, /*client_shm_size=*/0);
+                            NO_DEVICE);
   ASSERT_EQ(stream_id, msg.stream_id);
 
   fd_ = 100;
@@ -138,8 +136,7 @@ TEST_F(CCRMessageSuite, StreamConnectMessageInvalidDirection) {
       continue;
     cras_fill_connect_message(&msg, dir, stream_id, CRAS_STREAM_TYPE_DEFAULT,
                               CRAS_CLIENT_TYPE_UNKNOWN, 480, 240, /*flags=*/0,
-                              /*effects=*/0, fmt, NO_DEVICE,
-                              /*client_shm_size=*/0);
+                              /*effects=*/0, fmt, NO_DEVICE);
     ASSERT_EQ(stream_id, msg.stream_id);
 
     fd_ = 100;
@@ -167,7 +164,7 @@ TEST_F(CCRMessageSuite, StreamConnectMessageInvalidClientId) {
   cras_fill_connect_message(&msg, CRAS_STREAM_INPUT, stream_id,
                             CRAS_STREAM_TYPE_DEFAULT, CRAS_CLIENT_TYPE_UNKNOWN,
                             480, 240, /*flags=*/0, /*effects=*/0, fmt,
-                            NO_DEVICE, /*client_shm_size=*/0);
+                            NO_DEVICE);
   ASSERT_EQ(stream_id, msg.stream_id);
 
   fd_ = 100;
@@ -187,7 +184,7 @@ TEST_F(CCRMessageSuite, StreamConnectMessageInvalidClientId) {
 
 /*
  * TODO(yuhsaun): Remove this test when there are no client uses the old
- * craslib. (CRAS_PROTO_VER = 3)
+ * craslib. (CRAS_PROTO_VER = 5)
  */
 TEST_F(CCRMessageSuite, StreamConnectMessageOldProtocal) {
   struct cras_client_stream_connected out_msg;
@@ -196,7 +193,7 @@ TEST_F(CCRMessageSuite, StreamConnectMessageOldProtocal) {
   struct cras_connect_message_old msg;
   cras_stream_id_t stream_id = 0x10002;
 
-  msg.proto_version = 3;
+  msg.proto_version = 5;
   msg.direction = CRAS_STREAM_INPUT;
   msg.stream_id = stream_id;
   msg.stream_type = CRAS_STREAM_TYPE_DEFAULT;
@@ -206,6 +203,8 @@ TEST_F(CCRMessageSuite, StreamConnectMessageOldProtocal) {
   msg.effects = 0;
   pack_cras_audio_format(&msg.format, &fmt);
   msg.dev_idx = NO_DEVICE;
+  msg.client_shm_size = 0;
+  msg.client_type = CRAS_CLIENT_TYPE_TEST;
   msg.header.id = CRAS_SERVER_CONNECT_STREAM;
   msg.header.length = sizeof(struct cras_connect_message_old);
 
@@ -265,11 +264,6 @@ void cras_observer_remove(struct cras_observer_client* client) {
 }
 
 unsigned int cras_rstream_get_effects(const struct cras_rstream* stream) {
-  return 0;
-}
-
-int cras_server_metrics_stream_config(struct cras_rstream_config* config) {
-  cras_server_metrics_stream_config_called++;
   return 0;
 }
 

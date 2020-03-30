@@ -8,6 +8,7 @@
 
 #include "cras_bt_io.h"
 #include "cras_bt_device.h"
+#include "cras_hfp_iodev.h"
 #include "cras_utf8.h"
 #include "cras_iodev.h"
 #include "cras_iodev_list.h"
@@ -216,12 +217,14 @@ static int close_dev(struct cras_iodev *iodev)
 	if (!dev)
 		return -EINVAL;
 
-	/* Force back to A2DP if closing HFP. */
-	if (device_using_profile(
+	/* If input iodev is in open state and being closed, switch profile
+	 * from HFP to A2DP. */
+	if (cras_iodev_is_open(iodev) &&
+	    device_using_profile(
 		    btio->device,
 		    CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY |
 			    CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY) &&
-	    iodev->direction == CRAS_STREAM_INPUT &&
+	    (iodev->direction == CRAS_STREAM_INPUT) &&
 	    cras_bt_device_has_a2dp(btio->device)) {
 		cras_bt_device_set_active_profile(
 			btio->device, CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE);
@@ -329,6 +332,18 @@ leave:
 		dev->update_active_node(dev, node_idx, dev_enabled);
 }
 
+static int output_underrun(struct cras_iodev *odev)
+{
+	/*
+	 * Currently CRAS detects output underrun in a way that doesn't
+	 * apply to bluetooth use case. Override this handle function
+	 * for bt_io so audio thread won't fill zero.
+	 * TODO(hychao): when we figure out how to detect clock drift on
+	 * headset, implement this function.
+	 */
+	return 0;
+}
+
 static int no_stream(struct cras_iodev *iodev, int enable)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
@@ -408,6 +423,7 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->update_supported_formats = update_supported_formats;
 	iodev->update_active_node = update_active_node;
 	iodev->no_stream = no_stream;
+	iodev->output_underrun = output_underrun;
 	iodev->is_free_running = is_free_running;
 	iodev->start = start;
 
@@ -429,13 +445,24 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 		return NULL;
 	active->base.dev = iodev;
 	active->base.idx = btio->next_node_id++;
-	active->base.type = CRAS_NODE_TYPE_BLUETOOTH;
+	active->base.type = dev->active_node->type;
 	active->base.volume = 100;
 	active->base.plugged = 1;
 	active->base.stable_id =
 		SuperFastHash(cras_bt_device_object_path(device),
 			      strlen(cras_bt_device_object_path(device)),
 			      strlen(cras_bt_device_object_path(device)));
+	/*
+	 * If the same headset is connected in wideband mode, we shall assign
+	 * a separate stable_id so the node priority/preference mechanism in
+	 * Chrome UI doesn't break.
+	 */
+	if ((active->base.type == CRAS_NODE_TYPE_BLUETOOTH) &&
+	    (dev->direction == CRAS_STREAM_INPUT))
+		active->base.stable_id =
+			SuperFastHash((const char *)&active->base.type,
+				      sizeof(active->base.type),
+				      active->base.stable_id);
 	active->profile = profile;
 	active->profile_dev = dev;
 	gettimeofday(&active->base.plugged_time, NULL);
@@ -545,6 +572,20 @@ int cras_bt_io_on_profile(struct cras_iodev *bt_iodev,
 {
 	struct bt_node *btnode = (struct bt_node *)bt_iodev->active_node;
 	return !!(profile & btnode->profile);
+}
+
+enum cras_bt_device_profile
+cras_bt_io_profile_to_log(struct cras_iodev *bt_iodev)
+{
+	struct bt_node *btnode = (struct bt_node *)bt_iodev->active_node;
+
+	if (btnode->profile & CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE)
+		return CRAS_BT_DEVICE_PROFILE_A2DP_SOURCE;
+
+	if (hfp_iodev_is_hsp(btnode->profile_dev))
+		return CRAS_BT_DEVICE_PROFILE_HSP_AUDIOGATEWAY;
+	else
+		return CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY;
 }
 
 unsigned int cras_bt_io_try_remove(struct cras_iodev *bt_iodev,

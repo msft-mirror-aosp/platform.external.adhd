@@ -348,6 +348,65 @@ TEST_F(IoDevTestSuite, SetSuspendResume) {
   EXPECT_EQ(3, cras_observer_notify_active_node_called);
 }
 
+/* Check that after resume, all output devices enter ramp mute state if there is
+ * any output stream. */
+TEST_F(IoDevTestSuite, RampMuteAfterResume) {
+  struct cras_rstream rstream, rstream2;
+  struct cras_rstream* stream_list = NULL;
+  int rc;
+
+  memset(&rstream, 0, sizeof(rstream));
+
+  cras_iodev_list_init();
+
+  d1_.direction = CRAS_STREAM_OUTPUT;
+  rc = cras_iodev_list_add_output(&d1_);
+  ASSERT_EQ(0, rc);
+
+  d2_.direction = CRAS_STREAM_INPUT;
+  rc = cras_iodev_list_add_input(&d2_);
+  ASSERT_EQ(0, rc);
+
+  audio_thread_add_open_dev_called = 0;
+  cras_iodev_list_add_active_node(CRAS_STREAM_OUTPUT,
+                                  cras_make_node_id(d1_.info.idx, 1));
+
+  rstream.direction = CRAS_STREAM_OUTPUT;
+  DL_APPEND(stream_list, &rstream);
+  stream_add_cb(&rstream);
+  EXPECT_EQ(1, audio_thread_add_stream_called);
+  EXPECT_EQ(1, audio_thread_add_open_dev_called);
+
+  rstream2.direction = CRAS_STREAM_INPUT;
+  DL_APPEND(stream_list, &rstream2);
+  stream_add_cb(&rstream2);
+
+  /* Suspend and resume */
+  observer_ops->suspend_changed(NULL, 1);
+  stream_list_get_ret = stream_list;
+  observer_ops->suspend_changed(NULL, 0);
+
+  /* Test only output device that has stream will be muted after resume */
+  EXPECT_EQ(1, d1_.ramp_mute);
+  EXPECT_EQ(0, d2_.ramp_mute);
+
+  /* Reset d1 ramp_mute and remove output stream to test again */
+  d1_.ramp_mute = 0;
+  DL_DELETE(stream_list, &rstream);
+  stream_list_get_ret = stream_list;
+  stream_rm_cb(&rstream);
+
+  /* Suspend and resume */
+  observer_ops->suspend_changed(NULL, 1);
+  stream_list_get_ret = stream_list;
+  observer_ops->suspend_changed(NULL, 0);
+
+  EXPECT_EQ(0, d1_.ramp_mute);
+  EXPECT_EQ(0, d2_.ramp_mute);
+
+  cras_iodev_list_deinit();
+}
+
 TEST_F(IoDevTestSuite, InitDevFailShouldEnableFallback) {
   int rc;
   struct cras_rstream rstream;
@@ -1733,6 +1792,11 @@ int cras_iodev_close(struct cras_iodev* iodev) {
   return 0;
 }
 
+int cras_iodev_set_ramp_mute(struct cras_iodev* odev, int ramp_mute) {
+  odev->ramp_mute = ramp_mute;
+  return 0;
+}
+
 int cras_iodev_set_format(struct cras_iodev* iodev,
                           const struct cras_audio_format* fmt) {
   return 0;
@@ -1870,12 +1934,12 @@ int audio_thread_dev_start_ramp(struct audio_thread* thread,
 }
 
 #ifdef HAVE_WEBRTC_APM
-struct cras_apm* cras_apm_list_add(struct cras_apm_list* list,
-                                   void* dev_ptr,
-                                   const struct cras_audio_format* fmt) {
+struct cras_apm* cras_apm_list_add_apm(struct cras_apm_list* list,
+                                       void* dev_ptr,
+                                       const struct cras_audio_format* fmt) {
   return NULL;
 }
-void cras_apm_list_remove(struct cras_apm_list* list, void* dev_ptr) {}
+void cras_apm_list_remove_apm(struct cras_apm_list* list, void* dev_ptr) {}
 int cras_apm_list_init(const char* device_config_dir) {
   return 0;
 }
