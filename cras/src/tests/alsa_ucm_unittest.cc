@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 #include <gtest/gtest.h>
-#include <iniparser.h>
 #include <stdio.h>
 #include <syslog.h>
 
@@ -759,56 +758,6 @@ TEST(AlsaUcm, FreeMixerNames) {
   mixer_name_free(mixer_names_1);
 }
 
-TEST(AlsaUcm, MaxSoftwareGain) {
-  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
-  long max_software_gain;
-  int ret;
-  std::string id = "=MaxSoftwareGain/Internal Mic/HiFi";
-  std::string value = "2000";
-
-  ResetStubData();
-
-  /* Value can be found in UCM. */
-  snd_use_case_get_value[id] = value;
-
-  ret = ucm_get_max_software_gain(mgr, "Internal Mic", &max_software_gain);
-
-  EXPECT_EQ(0, ret);
-  EXPECT_EQ(2000, max_software_gain);
-
-  ResetStubData();
-
-  /* Value can not be found in UCM. */
-  ret = ucm_get_max_software_gain(mgr, "Internal Mic", &max_software_gain);
-
-  ASSERT_TRUE(ret);
-}
-
-TEST(AlsaUcm, MinSoftwareGain) {
-  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
-  long min_software_gain;
-  int ret;
-  std::string id = "=MinSoftwareGain/Internal Mic/HiFi";
-  std::string value = "2000";
-
-  ResetStubData();
-
-  /* Value can be found in UCM. */
-  snd_use_case_get_value[id] = value;
-
-  ret = ucm_get_min_software_gain(mgr, "Internal Mic", &min_software_gain);
-
-  EXPECT_EQ(0, ret);
-  EXPECT_EQ(2000, min_software_gain);
-
-  ResetStubData();
-
-  /* Value can not be found in UCM. */
-  ret = ucm_get_min_software_gain(mgr, "Internal Mic", &min_software_gain);
-
-  ASSERT_TRUE(ret);
-}
-
 TEST(AlsaUcm, DefaultNodeGain) {
   struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
   long default_node_gain;
@@ -834,11 +783,11 @@ TEST(AlsaUcm, DefaultNodeGain) {
   ASSERT_TRUE(ret);
 }
 
-TEST(AlsaUcm, IntrinsicVolume) {
+TEST(AlsaUcm, IntrinsicSensitivity) {
   struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
   long intrinsic_vol;
   int ret;
-  std::string id = "=IntrinsicVolume/Internal Mic/HiFi";
+  std::string id = "=IntrinsicSensitivity/Internal Mic/HiFi";
   std::string value = "-2000";
 
   ResetStubData();
@@ -846,7 +795,7 @@ TEST(AlsaUcm, IntrinsicVolume) {
   /* Value can be found in UCM. */
   snd_use_case_get_value[id] = value;
 
-  ret = ucm_get_intrinsic_volume(mgr, "Internal Mic", &intrinsic_vol);
+  ret = ucm_get_intrinsic_sensitivity(mgr, "Internal Mic", &intrinsic_vol);
 
   EXPECT_EQ(0, ret);
   EXPECT_EQ(-2000, intrinsic_vol);
@@ -854,7 +803,7 @@ TEST(AlsaUcm, IntrinsicVolume) {
   ResetStubData();
 
   /* Value can not be found in UCM. */
-  ret = ucm_get_intrinsic_volume(mgr, "Internal Mic", &intrinsic_vol);
+  ret = ucm_get_intrinsic_sensitivity(mgr, "Internal Mic", &intrinsic_vol);
 
   ASSERT_TRUE(ret);
 }
@@ -1023,6 +972,54 @@ TEST(AlsaUcm, GetJackNameForDevice) {
   snd_use_case_get_value[id_1] = value_1;
   jack_name_1 = ucm_get_jack_name_for_dev(mgr, "Dev1");
   jack_name_2 = ucm_get_jack_name_for_dev(mgr, "Dev2");
+
+  EXPECT_EQ(0, strcmp(jack_name_1, value_1.c_str()));
+  EXPECT_EQ(NULL, jack_name_2);
+
+  free((void*)jack_name_1);
+  free((void*)jack_name_2);
+}
+
+TEST(AlsaUcm, GetJackDevForDevice) {
+  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
+  const char *jack_name_1, *jack_name_2;
+  const char* devices[] = {"Dev1", "Comment for Dev1", "Dev2",
+                           "Comment for Dev2"};
+
+  ResetStubData();
+
+  fake_list["_devices/HiFi"] = devices;
+  fake_list_size["_devices/HiFi"] = 4;
+  std::string id_1 = "=JackDev/Dev1/HiFi";
+  std::string value_1 = "JackDev1";
+
+  snd_use_case_get_value[id_1] = value_1;
+  jack_name_1 = ucm_get_jack_dev_for_dev(mgr, "Dev1");
+  jack_name_2 = ucm_get_jack_dev_for_dev(mgr, "Dev2");
+
+  EXPECT_EQ(0, strcmp(jack_name_1, value_1.c_str()));
+  EXPECT_EQ(NULL, jack_name_2);
+
+  free((void*)jack_name_1);
+  free((void*)jack_name_2);
+}
+
+TEST(AlsaUcm, GetJackControlForDevice) {
+  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
+  const char *jack_name_1, *jack_name_2;
+  const char* devices[] = {"Dev1", "Comment for Dev1", "Dev2",
+                           "Comment for Dev2"};
+
+  ResetStubData();
+
+  fake_list["_devices/HiFi"] = devices;
+  fake_list_size["_devices/HiFi"] = 4;
+  std::string id_1 = "=JackControl/Dev1/HiFi";
+  std::string value_1 = "JackControl1";
+
+  snd_use_case_get_value[id_1] = value_1;
+  jack_name_1 = ucm_get_jack_control_for_dev(mgr, "Dev1");
+  jack_name_2 = ucm_get_jack_control_for_dev(mgr, "Dev2");
 
   EXPECT_EQ(0, strcmp(jack_name_1, value_1.c_str()));
   EXPECT_EQ(NULL, jack_name_2);
