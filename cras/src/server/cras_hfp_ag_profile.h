@@ -7,14 +7,30 @@
 #define CRAS_HFP_AG_PROFILE_H_
 
 #include <dbus/dbus.h>
+#include <stdbool.h>
 
 #include "cras_bt_device.h"
 #include "cras_hfp_slc.h"
 
-/* The bitmap of HFP AG feature supported by CRAS */
-#define CRAS_AG_SUPPORTED_FEATURES (AG_ENHANCED_CALL_STATUS)
+/*
+ * For service record profile, 'SupportedFearues' attribute bit mapping
+ * for HFP AG. Bits 0 to 4 are identical to the unsolicited result code
+ * of +BRSF command.
+ */
+#define FEATURES_AG_THREE_WAY_CALLING 0x0001
+#define FEATURES_AG_EC_ANDOR_NR 0x0002
+#define FEATURES_AG_VOICE_RECOGNITION 0x0004
+#define FEATURES_AG_INBAND_RINGTONE 0x0008
+#define FEATURES_AG_ATTACH_NUMBER_TO_VOICETAG 0x0010
+#define FEATURES_AG_WIDE_BAND_SPEECH 0x0020
 
 struct hfp_slc_handle;
+
+/* Re-registers HFP to the next version. Currently on HFP 1.5 and next is 1.7.
+ * Args:
+ *    enabled - True to register HFP 1.7 otherwise to HFP 1.5
+ */
+int cras_hfp_ag_profile_next_handsfree(DBusConnection *conn, bool enabled);
 
 /* Adds a profile instance for HFP AG (Hands-Free Profile Audio Gateway). */
 int cras_hfp_ag_profile_create(DBusConnection *conn);

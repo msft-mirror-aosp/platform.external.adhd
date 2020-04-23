@@ -15,6 +15,8 @@
 
 static const char jack_var[] = "JackName";
 static const char jack_type_var[] = "JackType";
+static const char jack_control_var[] = "JackControl";
+static const char jack_dev_var[] = "JackDev";
 static const char jack_switch_var[] = "JackSwitch";
 static const char edid_var[] = "EDIDFile";
 static const char cap_var[] = "CaptureControl";
@@ -37,27 +39,16 @@ static const char preempt_hotword_var[] = "PreemptHotword";
 static const char echo_reference_dev_name_var[] = "EchoReferenceDev";
 
 /*
- * Set this value in a SectionDevice to specify the intrinsic volume in
- * 0.01 dBFS. It currently only supports input devices. You should get the
+ * Set this value in a SectionDevice to specify the intrinsic sensitivity in
+ * 0.01 dBFS/Pa. It currently only supports input devices. You should get the
  * value by recording samples without either hardware or software gain. We are
  * still working on building a standard process for measuring it. The value you
  * see now in our UCM is just estimated value. If it is set, CRAS will enable
- * software gain and use the value as a reference volume for calculating the
+ * software gain and use the value as a reference for calculating the
  * appropriate software gain to apply to the device to meet our target volume.
  */
-static const char intrinsic_volume_var[] = "IntrinsicVolume";
+static const char intrinsic_sensitivity_var[] = "IntrinsicSensitivity";
 
-/*
- * Set this value in a SectionDevice to specify the minimum software gain in
- * 0.01 dB and enable software gain on this node. It must be used with
- * MaxSoftwareGain. If not, the value will be ignored.
- */
-static const char min_software_gain[] = "MinSoftwareGain";
-/*
- * Set this value in a SectionDevice to specify the maximum software gain in
- * 0.01 dB and enable software gain on this node.
- */
-static const char max_software_gain[] = "MaxSoftwareGain";
 /*
  * Set this value in a SectionDevice to specify the default node gain in
  * 0.01 dB.
@@ -581,6 +572,11 @@ char *ucm_get_dev_for_jack(struct cras_use_case_mgr *mgr, const char *jack,
 
 	section_names = ucm_get_devices_for_var(mgr, jack_var, jack, direction);
 
+	/* Temp work around for UCM refactor */
+	if (!section_names)
+		section_names = ucm_get_devices_for_var(mgr, jack_dev_var, jack,
+							direction);
+
 	DL_FOREACH (section_names, c) {
 		if (!strcmp(c->name, "Mic")) {
 			/* Skip mic section for output */
@@ -675,32 +671,6 @@ unsigned int ucm_get_disable_software_volume(struct cras_use_case_mgr *mgr)
 	return value;
 }
 
-int ucm_get_min_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
-			      long *gain)
-{
-	int value;
-	int rc;
-
-	rc = get_int(mgr, min_software_gain, dev, uc_verb(mgr), &value);
-	if (rc)
-		return rc;
-	*gain = value;
-	return 0;
-}
-
-int ucm_get_max_software_gain(struct cras_use_case_mgr *mgr, const char *dev,
-			      long *gain)
-{
-	int value;
-	int rc;
-
-	rc = get_int(mgr, max_software_gain, dev, uc_verb(mgr), &value);
-	if (rc)
-		return rc;
-	*gain = value;
-	return 0;
-}
-
 int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
 			      long *gain)
 {
@@ -714,16 +684,16 @@ int ucm_get_default_node_gain(struct cras_use_case_mgr *mgr, const char *dev,
 	return 0;
 }
 
-int ucm_get_intrinsic_volume(struct cras_use_case_mgr *mgr, const char *dev,
-			     long *vol)
+int ucm_get_intrinsic_sensitivity(struct cras_use_case_mgr *mgr,
+				  const char *dev, long *sensitivity)
 {
 	int value;
 	int rc;
 
-	rc = get_int(mgr, intrinsic_volume_var, dev, uc_verb(mgr), &value);
+	rc = get_int(mgr, intrinsic_sensitivity_var, dev, uc_verb(mgr), &value);
 	if (rc)
 		return rc;
-	*vol = value;
+	*sensitivity = value;
 	return 0;
 }
 
@@ -860,8 +830,10 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 		enum CRAS_STREAM_DIRECTION dir = CRAS_STREAM_UNDEFINED;
 		int dev_idx = -1;
 		int dependent_dev_idx = -1;
-		const char *jack_name;
-		const char *jack_type;
+		const char *jack_name = NULL;
+		const char *jack_type = NULL;
+		const char *jack_dev;
+		const char *jack_control;
 		const char *mixer_name;
 		struct mixer_name *m_name;
 		int rc;
@@ -912,13 +884,29 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 
 		jack_name = ucm_get_jack_name_for_dev(mgr, dev_name);
 		jack_type = ucm_get_jack_type_for_dev(mgr, dev_name);
+		jack_dev = ucm_get_jack_dev_for_dev(mgr, dev_name);
+		jack_control = ucm_get_jack_control_for_dev(mgr, dev_name);
 		mixer_name = ucm_get_mixer_name_for_dev(mgr, dev_name);
+
+		if (!jack_name) {
+			if (jack_dev) {
+				jack_name = strdup(jack_dev);
+				jack_type = strdup("gpio");
+			} else if (jack_control) {
+				jack_name = strdup(jack_control);
+				jack_type = strdup("hctl");
+			}
+		}
 
 		dev_sec = ucm_section_create(dev_name, pcm_name, dev_idx,
 					     dependent_dev_idx, dir, jack_name,
 					     jack_type);
 		if (pcm_name)
 			free((void *)pcm_name);
+		if (jack_dev)
+			free((void *)jack_dev);
+		if (jack_control)
+			free((void *)jack_control);
 		if (jack_name)
 			free((void *)jack_name);
 		if (jack_type)
@@ -1139,13 +1127,39 @@ const char *ucm_get_jack_type_for_dev(struct cras_use_case_mgr *mgr,
 	if (rc)
 		return NULL;
 
-	if (strcmp(name, "hctl") && strcmp(name, "gpio") &&
-	    strcmp(name, "always")) {
+	if (strcmp(name, "hctl") && strcmp(name, "gpio")) {
 		syslog(LOG_ERR, "Unknown jack type: %s", name);
 		if (name)
 			free((void *)name);
 		return NULL;
 	}
+
+	return name;
+}
+
+const char *ucm_get_jack_control_for_dev(struct cras_use_case_mgr *mgr,
+					 const char *dev)
+{
+	const char *name = NULL;
+	int rc;
+
+	rc = get_var(mgr, jack_control_var, dev, uc_verb(mgr), &name);
+	if (rc)
+		return NULL;
+
+	return name;
+}
+
+const char *ucm_get_jack_dev_for_dev(struct cras_use_case_mgr *mgr,
+				     const char *dev)
+{
+	const char *name = NULL;
+	int rc;
+
+	rc = get_var(mgr, jack_dev_var, dev, uc_verb(mgr), &name);
+	if (rc)
+		return NULL;
+
 	return name;
 }
 
