@@ -9,6 +9,7 @@ rust_test_host {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
+        "libaudio_streams",
         "libdata_model",
     ],
 }
@@ -17,8 +18,9 @@ rust_library_host_rlib {
     name: "libcras_sys",
     defaults: ["crosvm_defaults"],
     crate_name: "cras_sys",
-    srcs: ["src/lib.rs"],
     rlibs: [
+        "libaudio_streams",
         "libdata_model",
     ],
+    srcs: ["src/lib.rs"],
 }
