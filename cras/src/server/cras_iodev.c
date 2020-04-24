@@ -81,7 +81,7 @@ static int default_no_stream_playback(struct cras_iodev *odev)
 
 	/* If underrun happened, handle underrun and get hw_level again. */
 	if (hw_level == 0) {
-		rc = cras_iodev_output_underrun(odev);
+		rc = cras_iodev_output_underrun(odev, hw_level, 0);
 		if (rc < 0)
 			return rc;
 
@@ -714,6 +714,19 @@ void cras_iodev_set_active_node(struct cras_iodev *iodev,
 	cras_iodev_list_notify_active_node_changed(iodev->direction);
 }
 
+bool cras_iodev_is_aec_use_case(const struct cras_ionode *node)
+{
+	if ((node->type == CRAS_NODE_TYPE_INTERNAL_SPEAKER) ||
+	    (node->type == CRAS_NODE_TYPE_ECHO_REFERENCE))
+		return true;
+
+	if (node->type == CRAS_NODE_TYPE_MIC)
+		return (node->position == NODE_POSITION_INTERNAL) ||
+		       (node->position == NODE_POSITION_FRONT);
+
+	return false;
+}
+
 float cras_iodev_get_software_volume_scaler(struct cras_iodev *iodev)
 {
 	unsigned int volume;
@@ -728,13 +741,10 @@ float cras_iodev_get_software_volume_scaler(struct cras_iodev *iodev)
 
 float cras_iodev_get_software_gain_scaler(const struct cras_iodev *iodev)
 {
-	float scaler = 1.0f;
-	if (cras_iodev_software_volume_needed(iodev)) {
-		long gain = cras_iodev_adjust_active_node_gain(
-			iodev, cras_system_get_capture_gain());
-		scaler = convert_softvol_scaler_from_dB(gain);
-	}
-	return scaler;
+	if (cras_iodev_software_volume_needed(iodev))
+		return convert_softvol_scaler_from_dB(
+			iodev->active_node->capture_gain);
+	return 1.0f;
 }
 
 int cras_iodev_get_valid_frames(struct cras_iodev *odev,
@@ -931,6 +941,7 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 	iodev->min_cb_level = MIN(iodev->buffer_size / 2, cb_level);
 	iodev->max_cb_level = 0;
 	iodev->largest_cb_level = 0;
+	iodev->num_underruns = 0;
 
 	iodev->reset_request_pending = 0;
 	iodev->state = CRAS_IODEV_STATE_OPEN;
@@ -940,10 +951,12 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 	if (iodev->direction == CRAS_STREAM_OUTPUT) {
 		/* If device supports start ops, device can be in open state.
 		 * Otherwise, device starts running right after opening. */
-		if (iodev->start)
+		if (iodev->start) {
 			iodev->state = CRAS_IODEV_STATE_OPEN;
-		else
+		} else {
 			iodev->state = CRAS_IODEV_STATE_NO_STREAM_RUN;
+			cras_iodev_fill_odev_zeros(iodev, iodev->min_cb_level);
+		}
 	} else {
 		iodev->input_data = input_data_create(iodev);
 		/* If this is the echo reference dev, its ext_dsp_module will
@@ -962,8 +975,8 @@ int cras_iodev_open(struct cras_iodev *iodev, unsigned int cb_level,
 		/*
 		 * The device specific gain scaler to be used in audio thread.
 		 * It's expected to stick to 1.0f if device has hardware gain
-		 * control. For alsa device, this gain value can be configured
-		 * through UCM labels DefaultNodeGain.
+		 * control. For alsa device, this gain value will be configured
+		 * based on UCM labels IntrinsicSensitivity.
 		 */
 		iodev->software_gain_scaler =
 			cras_iodev_get_software_gain_scaler(iodev);
@@ -1310,8 +1323,12 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 	return 0;
 }
 
-int cras_iodev_output_underrun(struct cras_iodev *odev)
+int cras_iodev_output_underrun(struct cras_iodev *odev, unsigned int hw_level,
+			       unsigned int frames_written)
 {
+	ATLOG(atlog, AUDIO_THREAD_UNDERRUN, odev->info.idx, hw_level,
+	      frames_written);
+	odev->num_underruns++;
 	cras_audio_thread_event_underrun();
 	if (odev->output_underrun)
 		return odev->output_underrun(odev);
@@ -1332,9 +1349,10 @@ int cras_iodev_odev_should_wake(const struct cras_iodev *odev)
 		odev->state == CRAS_IODEV_STATE_NO_STREAM_RUN);
 }
 
-unsigned int cras_iodev_frames_to_play_in_sleep(struct cras_iodev *odev,
-						unsigned int *hw_level,
-						struct timespec *hw_tstamp)
+unsigned int
+cras_iodev_default_frames_to_play_in_sleep(struct cras_iodev *odev,
+					   unsigned int *hw_level,
+					   struct timespec *hw_tstamp)
 {
 	int rc = cras_iodev_frames_queued(odev, hw_tstamp);
 	unsigned int level = (rc < 0) ? 0 : rc;
@@ -1377,6 +1395,19 @@ unsigned int cras_iodev_frames_to_play_in_sleep(struct cras_iodev *odev,
 		return 0;
 }
 
+unsigned int cras_iodev_frames_to_play_in_sleep(struct cras_iodev *odev,
+						unsigned int *hw_level,
+						struct timespec *hw_tstamp)
+{
+	/* Use odev's own implementation, if not supported then fall back
+	 * to default behavior below. */
+	if (odev->frames_to_play_in_sleep)
+		return odev->frames_to_play_in_sleep(odev, hw_level, hw_tstamp);
+	else
+		return cras_iodev_default_frames_to_play_in_sleep(
+			odev, hw_level, hw_tstamp);
+}
+
 int cras_iodev_default_no_stream_playback(struct cras_iodev *odev, int enable)
 {
 	if (enable)
@@ -1409,9 +1440,7 @@ int cras_iodev_prepare_output_before_write_samples(struct cras_iodev *odev)
 
 unsigned int cras_iodev_get_num_underruns(const struct cras_iodev *iodev)
 {
-	if (iodev->get_num_underruns)
-		return iodev->get_num_underruns(iodev);
-	return 0;
+	return iodev->num_underruns;
 }
 
 unsigned int cras_iodev_get_num_severe_underruns(const struct cras_iodev *iodev)
@@ -1559,6 +1588,9 @@ int cras_iodev_set_mute(struct cras_iodev *iodev)
 
 int cras_iodev_set_ramp_mute(struct cras_iodev *odev, int ramp_mute)
 {
+	if (!odev->ramp)
+		return 0;
+
 	if (ramp_mute) {
 		if (output_should_mute(odev))
 			return 0;

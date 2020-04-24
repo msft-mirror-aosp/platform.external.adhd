@@ -8,6 +8,10 @@ rust_test_host {
     relative_install_path: "audio_streams_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    rlibs: [
+        "libsync_rust",
+        "libsys_util",
+    ],
 }
 
 rust_library_host_rlib {
@@ -15,4 +19,8 @@ rust_library_host_rlib {
     defaults: ["crosvm_defaults"],
     crate_name: "audio_streams",
     srcs: ["src/audio_streams.rs"],
+    rlibs: [
+        "libsync_rust",
+        "libsys_util",
+    ],
 }

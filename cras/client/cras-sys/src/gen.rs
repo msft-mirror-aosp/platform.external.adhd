@@ -23,9 +23,11 @@ pub const CRAS_MAX_IONODES: u32 = 20;
 pub const CRAS_MAX_ATTACHED_CLIENTS: u32 = 20;
 pub const CRAS_MAX_AUDIO_THREAD_SNAPSHOTS: u32 = 10;
 pub const CRAS_MAX_HOTWORD_MODEL_NAME_SIZE: u32 = 12;
+pub const MAX_DEBUG_DEVS: u32 = 4;
+pub const MAX_DEBUG_STREAMS: u32 = 8;
 pub const CRAS_BT_EVENT_LOG_SIZE: u32 = 1024;
 pub const CRAS_SERVER_STATE_VERSION: u32 = 2;
-pub const CRAS_PROTO_VER: u32 = 6;
+pub const CRAS_PROTO_VER: u32 = 7;
 pub const CRAS_SERV_MAX_MSG_SIZE: u32 = 256;
 pub const CRAS_CLIENT_MAX_MSG_SIZE: u32 = 256;
 pub const CRAS_MAX_HOTWORD_MODELS: u32 = 243;
@@ -705,14 +707,47 @@ pub enum CRAS_CLIENT_TYPE {
     CRAS_CLIENT_TYPE_CROSVM = 6,
     CRAS_CLIENT_TYPE_SERVER_STREAM = 7,
 }
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum CRAS_STREAM_EFFECT {
-    APM_ECHO_CANCELLATION = 1,
-    APM_NOISE_SUPRESSION = 2,
-    APM_GAIN_CONTROL = 4,
-    APM_VOICE_DETECTION = 8,
+impl CRAS_STREAM_EFFECT {
+    pub const APM_ECHO_CANCELLATION: CRAS_STREAM_EFFECT = CRAS_STREAM_EFFECT(1);
 }
+impl CRAS_STREAM_EFFECT {
+    pub const APM_NOISE_SUPRESSION: CRAS_STREAM_EFFECT = CRAS_STREAM_EFFECT(2);
+}
+impl CRAS_STREAM_EFFECT {
+    pub const APM_GAIN_CONTROL: CRAS_STREAM_EFFECT = CRAS_STREAM_EFFECT(4);
+}
+impl CRAS_STREAM_EFFECT {
+    pub const APM_VOICE_DETECTION: CRAS_STREAM_EFFECT = CRAS_STREAM_EFFECT(8);
+}
+impl ::std::ops::BitOr<CRAS_STREAM_EFFECT> for CRAS_STREAM_EFFECT {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, other: Self) -> Self {
+        CRAS_STREAM_EFFECT(self.0 | other.0)
+    }
+}
+impl ::std::ops::BitOrAssign for CRAS_STREAM_EFFECT {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: CRAS_STREAM_EFFECT) {
+        self.0 |= rhs.0;
+    }
+}
+impl ::std::ops::BitAnd<CRAS_STREAM_EFFECT> for CRAS_STREAM_EFFECT {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, other: Self) -> Self {
+        CRAS_STREAM_EFFECT(self.0 & other.0)
+    }
+}
+impl ::std::ops::BitAndAssign for CRAS_STREAM_EFFECT {
+    #[inline]
+    fn bitand_assign(&mut self, rhs: CRAS_STREAM_EFFECT) {
+        self.0 &= rhs.0;
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct CRAS_STREAM_EFFECT(pub u32);
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct cras_attached_client_info {
@@ -2356,6 +2391,7 @@ pub enum CRAS_NODE_TYPE {
     CRAS_NODE_TYPE_FALLBACK_NORMAL = 12,
     CRAS_NODE_TYPE_FALLBACK_ABNORMAL = 13,
     CRAS_NODE_TYPE_UNKNOWN = 14,
+    CRAS_NODE_TYPE_ECHO_REFERENCE = 15,
 }
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -2513,14 +2549,14 @@ pub struct cras_connect_message {
     pub dev_idx: u32,
     pub effects: u64,
     pub client_type: CRAS_CLIENT_TYPE,
-    pub client_shm_size: u32,
-    pub buffer_offsets: [u32; 2usize],
+    pub client_shm_size: u64,
+    pub buffer_offsets: [u64; 2usize],
 }
 #[test]
 fn bindgen_test_layout_cras_connect_message() {
     assert_eq!(
         ::std::mem::size_of::<cras_connect_message>(),
-        87usize,
+        99usize,
         concat!("Size of: ", stringify!(cras_connect_message))
     );
     assert_eq!(
@@ -2674,7 +2710,7 @@ fn bindgen_test_layout_cras_connect_message() {
         unsafe {
             &(*(::std::ptr::null::<cras_connect_message>())).buffer_offsets as *const _ as usize
         },
-        79usize,
+        83usize,
         concat!(
             "Offset of field: ",
             stringify!(cras_connect_message),
@@ -4587,13 +4623,13 @@ pub struct cras_audio_shm_header {
     pub callback_pending: i32,
     pub num_overruns: u32,
     pub ts: cras_timespec,
-    pub buffer_offset: [u32; 2usize],
+    pub buffer_offset: [u64; 2usize],
 }
 #[test]
 fn bindgen_test_layout_cras_audio_shm_header() {
     assert_eq!(
         ::std::mem::size_of::<cras_audio_shm_header>(),
-        80usize,
+        88usize,
         concat!("Size of: ", stringify!(cras_audio_shm_header))
     );
     assert_eq!(
