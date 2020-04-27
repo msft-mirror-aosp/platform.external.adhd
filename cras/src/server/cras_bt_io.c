@@ -70,7 +70,7 @@ static struct cras_ionode *add_profile_dev(struct cras_iodev *bt_iodev,
 	n->base.type = CRAS_NODE_TYPE_BLUETOOTH;
 	n->base.volume = 100;
 	n->base.stable_id = dev->info.stable_id;
-	n->base.max_software_gain = 0;
+	n->base.capture_gain = 0;
 	gettimeofday(&n->base.plugged_time, NULL);
 
 	strcpy(n->base.name, dev->info.name);
@@ -206,6 +206,11 @@ static int configure_dev(struct cras_iodev *iodev)
 
 	iodev->buffer_size = dev->buffer_size;
 	iodev->min_buffer_level = dev->min_buffer_level;
+	if (dev->start)
+		dev->state = CRAS_IODEV_STATE_OPEN;
+	else
+		dev->state = CRAS_IODEV_STATE_NO_STREAM_RUN;
+
 	return 0;
 }
 
@@ -235,6 +240,7 @@ static int close_dev(struct cras_iodev *iodev)
 	if (rc < 0)
 		return rc;
 	cras_iodev_free_format(iodev);
+	dev->state = CRAS_IODEV_STATE_CLOSE;
 	return 0;
 }
 
@@ -332,21 +338,27 @@ leave:
 		dev->update_active_node(dev, node_idx, dev_enabled);
 }
 
-static int output_underrun(struct cras_iodev *odev)
+static int output_underrun(struct cras_iodev *iodev)
 {
-	/*
-	 * Currently CRAS detects output underrun in a way that doesn't
-	 * apply to bluetooth use case. Override this handle function
-	 * for bt_io so audio thread won't fill zero.
-	 * TODO(hychao): when we figure out how to detect clock drift on
-	 * headset, implement this function.
-	 */
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev)
+		return -EINVAL;
+
+	if (dev->output_underrun) {
+		dev->min_cb_level = iodev->min_cb_level;
+		dev->max_cb_level = iodev->max_cb_level;
+		dev->buffer_size = iodev->buffer_size;
+		return dev->output_underrun(dev);
+	}
+
 	return 0;
 }
 
 static int no_stream(struct cras_iodev *iodev, int enable)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
+	int rc;
+
 	if (!dev)
 		return -EINVAL;
 
@@ -361,8 +373,15 @@ static int no_stream(struct cras_iodev *iodev, int enable)
 		dev->min_cb_level = iodev->min_cb_level;
 		dev->max_cb_level = iodev->max_cb_level;
 		dev->buffer_size = iodev->buffer_size;
-		return dev->no_stream(dev, enable);
+		rc = dev->no_stream(dev, enable);
+		if (rc < 0)
+			return rc;
 	}
+	if (enable)
+		dev->state = CRAS_IODEV_STATE_NO_STREAM_RUN;
+	else
+		dev->state = CRAS_IODEV_STATE_NORMAL_RUN;
+
 	return 0;
 }
 
@@ -381,12 +400,30 @@ static int is_free_running(const struct cras_iodev *iodev)
 static int start(const struct cras_iodev *iodev)
 {
 	struct cras_iodev *dev = active_profile_dev(iodev);
+	int rc;
+
 	if (!dev)
 		return -EINVAL;
 
-	if (dev->start)
-		return dev->start(dev);
+	if (dev->start) {
+		rc = dev->start(dev);
+		if (rc)
+			return rc;
+	}
+	dev->state = CRAS_IODEV_STATE_NORMAL_RUN;
 	return 0;
+}
+
+static unsigned int frames_to_play_in_sleep(struct cras_iodev *iodev,
+					    unsigned int *hw_level,
+					    struct timespec *hw_tstamp)
+{
+	struct cras_iodev *dev = active_profile_dev(iodev);
+	if (!dev || !dev->frames_to_play_in_sleep)
+		return cras_iodev_default_frames_to_play_in_sleep(
+			iodev, hw_level, hw_tstamp);
+
+	return dev->frames_to_play_in_sleep(dev, hw_level, hw_tstamp);
 }
 
 struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
@@ -426,6 +463,7 @@ struct cras_iodev *cras_bt_io_create(struct cras_bt_device *device,
 	iodev->output_underrun = output_underrun;
 	iodev->is_free_running = is_free_running;
 	iodev->start = start;
+	iodev->frames_to_play_in_sleep = frames_to_play_in_sleep;
 
 	/* Input also checks |software_volume_needed| flag for using software
 	 * gain. Keep it as false for BT input.
