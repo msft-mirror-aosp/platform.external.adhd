@@ -18,9 +18,9 @@ struct cras_card_config {
 	dictionary *ini;
 };
 
-static struct cras_volume_curve *
-create_simple_step_curve(const struct cras_card_config *card_config,
-			 const char *control_name)
+static struct cras_volume_curve *create_simple_step_curve(
+		const struct cras_card_config *card_config,
+		const char *control_name)
 {
 	char ini_key[MAX_KEY_LEN + 1];
 	int max_volume;
@@ -36,9 +36,9 @@ create_simple_step_curve(const struct cras_card_config *card_config,
 	return cras_volume_curve_create_simple_step(max_volume, volume_step);
 }
 
-static struct cras_volume_curve *
-create_explicit_curve(const struct cras_card_config *card_config,
-		      const char *control_name)
+static struct cras_volume_curve *create_explicit_curve(
+		const struct cras_card_config *card_config,
+		const char *control_name)
 {
 	unsigned int i;
 	char ini_key[MAX_KEY_LEN + 1];
@@ -91,7 +91,8 @@ void cras_card_config_destroy(struct cras_card_config *card_config)
 }
 
 struct cras_volume_curve *cras_card_config_get_volume_curve_for_control(
-	const struct cras_card_config *card_config, const char *control_name)
+		const struct cras_card_config *card_config,
+		const char *control_name)
 {
 	char ini_key[MAX_KEY_LEN + 1];
 	const char *curve_type;

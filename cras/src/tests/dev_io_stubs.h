@@ -2,19 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <memory>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
 
-#include <memory>
-
 extern "C" {
-#include "cras_iodev.h"
-#include "cras_rstream.h"
-#include "cras_shm.h"
-#include "cras_types.h"
 #include "dev_io.h"
 #include "dev_stream.h"
+#include "cras_rstream.h"
+#include "cras_iodev.h"
+#include "cras_shm.h"
+#include "cras_types.h"
 #include "utlist.h"
 }
 
@@ -28,17 +27,15 @@ using IodevPtr = std::unique_ptr<cras_iodev, decltype(free)*>;
 using IonodePtr = std::unique_ptr<cras_ionode, decltype(free)*>;
 using OpendevPtr = std::unique_ptr<open_dev, decltype(free)*>;
 using RstreamPtr = std::unique_ptr<cras_rstream, decltype(free)*>;
-
-void destroy_shm(struct cras_audio_shm* shm);
-using ShmPtr = std::unique_ptr<cras_audio_shm, decltype(destroy_shm)*>;
-ShmPtr create_shm(size_t cb_threshold);
+using ShmPtr = std::unique_ptr<cras_audio_shm_area, decltype(free)*>;
 
 // Holds the rstream and devstream pointers for an attached stream.
 struct Stream {
-  Stream(ShmPtr shm, RstreamPtr rstream, DevStreamPtr dstream)
-      : shm(std::move(shm)),
-        rstream(std::move(rstream)),
-        dstream(std::move(dstream)) {}
+  Stream(ShmPtr shm, RstreamPtr rstream, DevStreamPtr dstream) :
+    shm(std::move(shm)),
+    rstream(std::move(rstream)),
+    dstream(std::move(dstream)) {
+  }
   ShmPtr shm;
   RstreamPtr rstream;
   DevStreamPtr dstream;
@@ -47,19 +44,23 @@ using StreamPtr = std::unique_ptr<Stream>;
 
 // Holds the iodev and ionode pointers for an attached device.
 struct Device {
-  Device(IodevPtr dev, IonodePtr node, OpendevPtr odev)
-      : dev(std::move(dev)), node(std::move(node)), odev(std::move(odev)) {}
+  Device(IodevPtr dev, IonodePtr node, OpendevPtr odev) :
+    dev(std::move(dev)),
+    node(std::move(node)),
+    odev(std::move(odev)) {
+  }
   IodevPtr dev;
   IonodePtr node;
   OpendevPtr odev;
 };
 using DevicePtr = std::unique_ptr<Device>;
 
+ShmPtr create_shm(size_t cb_threshold);
 RstreamPtr create_rstream(cras_stream_id_t id,
                           CRAS_STREAM_DIRECTION direction,
                           size_t cb_threshold,
                           const cras_audio_format* format,
-                          cras_audio_shm* shm);
+                          cras_audio_shm_area* shm);
 DevStreamPtr create_dev_stream(unsigned int dev_id, cras_rstream* rstream);
 StreamPtr create_stream(cras_stream_id_t id,
                         unsigned int dev_id,

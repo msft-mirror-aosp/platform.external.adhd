@@ -3,7 +3,7 @@
 # found in the LICENSE file.
 
 # Unified build config.
-device_config_dir="$(cros_config /audio/main cras-config-dir)"
+device_config_dir="$(cros_config --abspath /audio/main cras-config-dir)"
 internal_ucm_suffix="$(cros_config /audio/main ucm-suffix)"
 
 # Handle legacy config.
@@ -23,8 +23,6 @@ if [ -z "${device_config_dir}" ]; then
   if [ -f /etc/cras/get_internal_ucm_suffix ]; then
     internal_ucm_suffix="$(sh /etc/cras/get_internal_ucm_suffix)"
   fi
-else
-  device_config_dir="/etc/cras/${device_config_dir}"
 fi
 
 if [ -n "${device_config_dir}" ]; then
@@ -36,14 +34,12 @@ if [ -n "${internal_ucm_suffix}" ]; then
 fi
 
 # Leave cras in the init pid namespace as it uses its PID as an IPC identifier.
-exec minijail0 -u cras -g cras -G --uts -v -l \
-        -T static \
-        -P /mnt/empty \
+exec minijail0 -u cras -g cras -G -n --uts -v -l \
+        -P /var/empty \
         -b /,/ \
         -k 'tmpfs,/run,tmpfs,MS_NODEV|MS_NOEXEC|MS_NOSUID,mode=755,size=10M' \
         -b /run/cras,/run/cras,1 \
         -b /run/dbus,/run/dbus,1 \
-        -b /run/systemd/journal \
         -b /run/udev,/run/udev \
         -b /dev,/dev \
         -b /dev/shm,/dev/shm,1 \
@@ -51,9 +47,7 @@ exec minijail0 -u cras -g cras -G --uts -v -l \
         -b /sys,/sys \
         -k 'tmpfs,/var,tmpfs,MS_NODEV|MS_NOEXEC|MS_NOSUID,mode=755,size=10M' \
         -b /var/lib/metrics/,/var/lib/metrics/,1 \
-        -- \
-        /sbin/minijail0 -n \
-        -S /usr/share/policy/cras-seccomp.policy \
+	-S /usr/share/policy/cras-seccomp.policy \
         -- \
         /usr/bin/cras \
         ${DSP_CONFIG} ${DEVICE_CONFIG_DIR} ${DISABLE_PROFILE} \

@@ -15,22 +15,15 @@ extern "C" {
 
 /* Represents an ALSA UCM section. */
 struct ucm_section {
-	/* Section name. */
-	const char *name;
-	/* Device PCM index. */
-	int dev_idx;
-	/* Output or Input. */
-	enum CRAS_STREAM_DIRECTION dir;
-	/* Associated jack's name. */
-	const char *jack_name;
-	/* Associated jack's type. */
-	const char *jack_type;
-	/* Switch number for jack from linux/input.h, or -1. */
-	int jack_switch;
-	/* MixerName value. */
-	const char *mixer_name;
-	/* CoupledMixers value. */
-	struct mixer_name *coupled;
+	const char *name;                /* Section name. */
+	int dev_idx;                     /* Device PCM index. */
+	enum CRAS_STREAM_DIRECTION dir;  /* Output or Input. */
+	const char *jack_name;           /* Associated jack's name. */
+	const char *jack_type;           /* Associated jack's type. */
+	int jack_switch;                 /* Switch number for jack from
+	                                  * linux/input.h, or -1. */
+	const char *mixer_name;          /* MixerName value. */
+	struct mixer_name *coupled;      /* CoupledMixers value. */
 	struct ucm_section *prev, *next;
 };
 
@@ -46,7 +39,8 @@ struct ucm_section {
  * Returns:
  *    A valid pointer on success, NULL for memory allocation error.
  */
-struct ucm_section *ucm_section_create(const char *name, int dev_idx,
+struct ucm_section *ucm_section_create(const char *name,
+				       int dev_idx,
 				       enum CRAS_STREAM_DIRECTION dir,
 				       const char *jack_name,
 				       const char *jack_type);
@@ -60,7 +54,8 @@ struct ucm_section *ucm_section_create(const char *name, int dev_idx,
  * Returns:
  *    0 for success, -EINVAL for invalid arguments, or -ENOMEM.
  */
-int ucm_section_set_mixer_name(struct ucm_section *section, const char *name);
+int ucm_section_set_mixer_name(struct ucm_section *section,
+			       const char *name);
 
 /* Add a single coupled control to this section.
  * Control has the same direction as the section.
@@ -73,7 +68,8 @@ int ucm_section_set_mixer_name(struct ucm_section *section, const char *name);
  * Returns:
  *    0 for success, -EINVAL for invalid arguments, or -ENOMEM.
  */
-int ucm_section_add_coupled(struct ucm_section *section, const char *name,
+int ucm_section_add_coupled(struct ucm_section *section,
+			    const char *name,
 			    mixer_name_type type);
 
 /* Concatenate a list of coupled controls to this section.

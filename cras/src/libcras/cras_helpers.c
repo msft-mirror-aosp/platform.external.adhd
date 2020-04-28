@@ -17,11 +17,14 @@ struct buffer_data {
 	unsigned int len;
 };
 
-static int
-play_buffer_callback(struct cras_client *client, cras_stream_id_t stream_id,
-		     uint8_t *captured_samples, uint8_t *playback_samples,
-		     unsigned int frames, const struct timespec *captured_time,
-		     const struct timespec *playback_time, void *user_arg)
+static int play_buffer_callback(struct cras_client *client,
+				cras_stream_id_t stream_id,
+				uint8_t *captured_samples,
+				uint8_t *playback_samples,
+				unsigned int frames,
+				const struct timespec *captured_time,
+				const struct timespec *playback_time,
+				void *user_arg)
 {
 	struct buffer_data *data = (struct buffer_data *)user_arg;
 	int to_copy = data->len - data->offset;
@@ -41,7 +44,8 @@ play_buffer_callback(struct cras_client *client, cras_stream_id_t stream_id,
 }
 
 static int play_buffer_error(struct cras_client *client,
-			     cras_stream_id_t stream_id, int error,
+			     cras_stream_id_t stream_id,
+			     int error,
 			     void *user_arg)
 {
 	free(user_arg);
@@ -102,11 +106,16 @@ client_start_error:
 	return rc;
 }
 
-int cras_helper_add_stream_simple(
-	struct cras_client *client, enum CRAS_STREAM_DIRECTION direction,
-	void *user_data, cras_unified_cb_t unified_cb, cras_error_cb_t err_cb,
-	snd_pcm_format_t format, unsigned int frame_rate,
-	unsigned int num_channels, int dev_idx, cras_stream_id_t *stream_id_out)
+int cras_helper_add_stream_simple(struct cras_client *client,
+				  enum CRAS_STREAM_DIRECTION direction,
+				  void *user_data,
+				  cras_unified_cb_t unified_cb,
+				  cras_error_cb_t err_cb,
+				  snd_pcm_format_t format,
+				  unsigned int frame_rate,
+				  unsigned int num_channels,
+				  int dev_idx,
+				  cras_stream_id_t *stream_id_out)
 {
 	struct cras_audio_format *aud_format;
 	struct cras_stream_params *params;
@@ -116,10 +125,9 @@ int cras_helper_add_stream_simple(
 	if (!aud_format)
 		return -ENOMEM;
 
-	params = cras_client_unified_params_create(CRAS_STREAM_OUTPUT, 2048,
-						   CRAS_STREAM_TYPE_DEFAULT, 0,
-						   user_data, unified_cb,
-						   err_cb, aud_format);
+	params = cras_client_unified_params_create(CRAS_STREAM_OUTPUT,
+			2048, CRAS_STREAM_TYPE_DEFAULT, 0, user_data,
+			unified_cb, err_cb, aud_format);
 	if (!params) {
 		rc = -ENOMEM;
 		goto done_add_stream;
@@ -136,9 +144,12 @@ done_add_stream:
 	return rc;
 }
 
-int cras_helper_play_buffer(struct cras_client *client, const void *buffer,
-			    unsigned int frames, snd_pcm_format_t format,
-			    unsigned int frame_rate, unsigned int num_channels,
+int cras_helper_play_buffer(struct cras_client *client,
+			    const void *buffer,
+			    unsigned int frames,
+			    snd_pcm_format_t format,
+			    unsigned int frame_rate,
+			    unsigned int num_channels,
 			    int dev_idx)
 {
 	struct buffer_data *data;
@@ -152,8 +163,6 @@ int cras_helper_play_buffer(struct cras_client *client, const void *buffer,
 	data->len = frames * data->frame_bytes;
 
 	return cras_helper_add_stream_simple(client, CRAS_STREAM_OUTPUT, data,
-					     play_buffer_callback,
-					     play_buffer_error, format,
-					     frame_rate, num_channels, dev_idx,
-					     &stream_id);
+			play_buffer_callback, play_buffer_error, format,
+			frame_rate, num_channels, dev_idx, &stream_id);
 }

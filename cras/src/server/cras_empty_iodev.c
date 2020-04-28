@@ -19,47 +19,54 @@
 #define EMPTY_FRAME_SIZE 4
 #define EMPTY_FRAMES (EMPTY_BUFFER_SIZE / EMPTY_FRAME_SIZE)
 
-static size_t empty_supported_rates[] = { 44100, 48000, 0 };
+static size_t empty_supported_rates[] = {
+	44100, 48000, 0
+};
 
-static size_t empty_supported_channel_counts[] = { 1, 2, 0 };
+static size_t empty_supported_channel_counts[] = {
+	1, 2, 0
+};
 
 static snd_pcm_format_t empty_supported_formats[] = {
-	SND_PCM_FORMAT_S16_LE, SND_PCM_FORMAT_S24_LE, SND_PCM_FORMAT_S32_LE,
-	SND_PCM_FORMAT_S24_3LE, 0
+	SND_PCM_FORMAT_S16_LE,
+	SND_PCM_FORMAT_S24_LE,
+	SND_PCM_FORMAT_S32_LE,
+	SND_PCM_FORMAT_S24_3LE,
+	0
 };
 
 struct empty_iodev {
 	struct cras_iodev base;
+	int open;
 	uint8_t *audio_buffer;
-	uint64_t read_frames, written_frames;
-	struct timespec dev_start_time;
+	unsigned int buffer_level;
+	struct timespec last_buffer_access;
 };
 
-/*
- * Current level of the audio buffer.  This is made up based on what has been
- * read/written and how long it has been since the start. Simulates audio
- * hardware running at the given sample rate.
+/* Current level of the audio buffer.  This is made up based on what has been
+ * read/written and how long it has been since then.  Simulates audio hardware
+ * running at the given sample rate.
  */
 static unsigned int current_level(const struct cras_iodev *iodev)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
-	uint64_t frames_since_start, nframes;
+	unsigned int frames, frames_since_last;
 
 	if (iodev->active_node->type == CRAS_NODE_TYPE_HOTWORD)
 		return 0;
 
-	frames_since_start = cras_frames_since_time(
-		&empty_iodev->dev_start_time, iodev->format->frame_rate);
+	frames = empty_iodev->buffer_level;
+	frames_since_last = cras_frames_since_time(
+			&empty_iodev->last_buffer_access,
+			iodev->format->frame_rate);
 
-	if (iodev->direction == CRAS_STREAM_INPUT) {
-		nframes = frames_since_start - empty_iodev->read_frames;
-		return MIN(nframes, EMPTY_FRAMES);
-	}
+	if (iodev->direction == CRAS_STREAM_INPUT)
+		return (frames + frames_since_last) % EMPTY_FRAMES;
 
 	/* output */
-	if (empty_iodev->written_frames <= frames_since_start)
+	if (frames <= frames_since_last)
 		return 0;
-	return empty_iodev->written_frames - frames_since_start;
+	return frames - frames_since_last;
 }
 
 /*
@@ -82,6 +89,7 @@ static int close_dev(struct cras_iodev *iodev)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
 
+	empty_iodev->open = 0;
 	free(empty_iodev->audio_buffer);
 	empty_iodev->audio_buffer = NULL;
 	cras_iodev_free_audio_area(iodev);
@@ -96,16 +104,17 @@ static int configure_dev(struct cras_iodev *iodev)
 		return -EINVAL;
 
 	cras_iodev_init_audio_area(iodev, iodev->format->num_channels);
+	empty_iodev->open = 1;
 	empty_iodev->audio_buffer = calloc(1, EMPTY_BUFFER_SIZE);
-	empty_iodev->read_frames = 0;
-	empty_iodev->written_frames = 0;
+	empty_iodev->buffer_level = 0;
 
-	clock_gettime(CLOCK_MONOTONIC_RAW, &empty_iodev->dev_start_time);
+	clock_gettime(CLOCK_MONOTONIC_RAW, &empty_iodev->last_buffer_access);
 
 	return 0;
 }
 
-static int get_buffer(struct cras_iodev *iodev, struct cras_audio_area **area,
+static int get_buffer(struct cras_iodev *iodev,
+		      struct cras_audio_area **area,
 		      unsigned *frames)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
@@ -121,28 +130,30 @@ static int get_buffer(struct cras_iodev *iodev, struct cras_audio_area **area,
 
 	iodev->area->frames = *frames;
 	cras_audio_area_config_buf_pointers(iodev->area, iodev->format,
-					    empty_iodev->audio_buffer);
+			empty_iodev->audio_buffer);
 	*area = iodev->area;
 	return 0;
 }
 
-/*
- * Returns -EPIPE if there are not enough frames or spaces in device buffer.
- * It matches other alsa-based devices.
- */
 static int put_buffer(struct cras_iodev *iodev, unsigned frames)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
 
-	if (iodev->direction == CRAS_STREAM_INPUT) {
-		if (current_level(iodev) < frames)
-			return -EPIPE;
-		empty_iodev->read_frames += frames;
+	empty_iodev->buffer_level = current_level(iodev);
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &empty_iodev->last_buffer_access);
+
+	if (iodev->direction == CRAS_STREAM_OUTPUT) {
+		empty_iodev->buffer_level += frames;
+		empty_iodev->buffer_level %= EMPTY_FRAMES;
 	} else {
-		if (EMPTY_FRAMES - current_level(iodev) < frames)
-			return -EPIPE;
-		empty_iodev->written_frames += frames;
+		/* Input */
+		if (empty_iodev->buffer_level > frames)
+			empty_iodev->buffer_level -= frames;
+		else
+			empty_iodev->buffer_level = 0;
 	}
+
 	return 0;
 }
 
@@ -150,12 +161,12 @@ static int flush_buffer(struct cras_iodev *iodev)
 {
 	struct empty_iodev *empty_iodev = (struct empty_iodev *)iodev;
 
-	if (iodev->direction == CRAS_STREAM_INPUT)
-		empty_iodev->read_frames = 0;
-	else
-		empty_iodev->written_frames = 0;
-
-	clock_gettime(CLOCK_MONOTONIC_RAW, &empty_iodev->dev_start_time);
+	empty_iodev->buffer_level = current_level(iodev);
+	if (iodev->direction == CRAS_STREAM_INPUT) {
+		empty_iodev->buffer_level = 0;
+		clock_gettime(CLOCK_MONOTONIC_RAW,
+			      &empty_iodev->last_buffer_access);
+	}
 	return 0;
 }
 
@@ -211,20 +222,23 @@ struct cras_iodev *empty_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 	/* Finally add it to the appropriate iodev list. */
 	if (direction == CRAS_STREAM_INPUT) {
 		if (node->type == CRAS_NODE_TYPE_HOTWORD) {
-			snprintf(iodev->info.name, ARRAY_SIZE(iodev->info.name),
+			snprintf(iodev->info.name,
+				 ARRAY_SIZE(iodev->info.name),
 				 "Silent hotword device.");
 			iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] =
 				'\0';
 			iodev->info.idx = SILENT_HOTWORD_DEVICE;
 		} else {
-			snprintf(iodev->info.name, ARRAY_SIZE(iodev->info.name),
+			snprintf(iodev->info.name,
+				 ARRAY_SIZE(iodev->info.name),
 				 "Silent record device.");
 			iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] =
 				'\0';
 			iodev->info.idx = SILENT_RECORD_DEVICE;
 		}
 	} else {
-		snprintf(iodev->info.name, ARRAY_SIZE(iodev->info.name),
+		snprintf(iodev->info.name,
+			 ARRAY_SIZE(iodev->info.name),
 			 "Silent playback device.");
 		iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] = '\0';
 		iodev->info.idx = SILENT_PLAYBACK_DEVICE;

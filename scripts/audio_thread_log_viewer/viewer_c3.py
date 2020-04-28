@@ -11,7 +11,6 @@ import argparse
 import collections
 import logging
 import string
-import time
 
 page_content = string.Template("""
 <html meta charset="UTF8">
@@ -54,30 +53,17 @@ page_content = string.Template("""
     }
   </style>
   <script type="text/javascript">
-    var selected = null;
     draw_chart = function() {
       var chart = c3.generate({
         data: {
           x: 'time',
           columns: [
-            ['time',                   $times],
-            ['buffer_level',           $buffer_levels],
+              ['time',                   $times],
+              ['buffer_level',           $buffer_levels],
           ],
           type: 'bar',
           types: {
-            buffer_level: 'line',
-          },
-          onclick: function (d, i) {
-            elm = document.getElementById(d.x.toFixed(9));
-            if (selected)
-              selected.style.color = '';
-            if (elm === null) {
-              console.error("Can not find element by ID %s", d.x.toFixed(9));
-              return;
-            }
-            elm.style.color = 'blue';
-            elm.scrollIntoView();
-            selected = elm;
+              buffer_level: 'line',
           },
         },
         zoom: {
@@ -151,22 +137,7 @@ page_content = string.Template("""
 """)
 
 
-def StrToTimestamp(s):
-    """Converts a time string to a timestamp.
-
-    @param s: A time string like "2019-07-02T15:30:46.684190644".
-
-    @returns: Returns a timestamp string like "55846.684190644".
-
-    """
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    t = time.strptime(s[:-10], fmt)
-    # Ignore date to avoid a long timestamp.
-    ts = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec
-    return "{:d}.{}".format(ts, s[-9:])
-
-
-Tag = collections.namedtuple('Tag', ['time', 'text', 'position', 'class_name'])
+Tag = collections.namedtuple('Tag', {'time', 'text', 'position', 'class_name'})
 """
 The tuple for tags shown on the plot on certain time.
 text is the tag to show, position is the tag position, which is one of
@@ -440,9 +411,9 @@ class EventLogParser(object):
         """Parses one line of event log.
 
         Split a line like
-        2019-07-02T15:30:46.683829810 cras atlog  WRITE_STREAMS_FETCH_STREAM     id:1e0000 cbth:512 delay:1136
+        169536.504763588  WRITE_STREAMS_FETCH_STREAM     id:0 cbth:512 delay:1136
         into time, name, and props where
-        time = '54946.683829810'
+        time = '169536.504763588'
         name = 'WRITE_STREAMS_FETCH_STREAM'
         props = {
             'id': 0,
@@ -456,11 +427,11 @@ class EventLogParser(object):
 
         """
         line_split = line.split()
-        time, name = StrToTimestamp(line_split[0]), line_split[3]
+        time, name = line_split[0], line_split[1]
         logging.debug('time: %s, name: %s', time, name)
         props = {}
-        for index in xrange(4, len(line_split)):
-            key, value = line_split[index].split(':')[:2]
+        for index in xrange(2, len(line_split)):
+            key, value = line_split[index].split(':')
             props[key] = value
         logging.debug('props: %s', props)
         return self._CreateEventData(time, name, props)
@@ -538,15 +509,7 @@ class AudioThreadLogParser(object):
         @returns: A string for filled page.
 
         """
-        logs = []
-        for s in self.content:
-            if 'atlog' in s:
-                time = StrToTimestamp(s.split()[0])
-                logs.append('<label id="{}">{}</label>'.format(time, s))
-            else:
-                logs.append(s)
-        logs = '\n'.join(logs)
-
+        logs = '\n<br>'.join(self.content)
         return page_template.substitute(logs=logs)
 
 

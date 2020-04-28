@@ -5,6 +5,7 @@
 
 #include <dbus/dbus.h>
 
+
 /* Appends a key-value pair to the dbus message.
  * Args:
  *    key - the key (a string)
@@ -14,5 +15,6 @@
  * Returns:
  *    false if not enough memory.
 */
-dbus_bool_t append_key_value(DBusMessageIter *iter, const char *key, int type,
-			     const char *type_string, void *value);
+dbus_bool_t append_key_value(DBusMessageIter *iter, const char *key,
+			     int type, const char *type_string,
+			     void *value);

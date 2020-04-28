@@ -3,11 +3,10 @@
 // found in the LICENSE file.
 
 #include <gtest/gtest.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <string>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
 #include "cras_util.h"
@@ -209,6 +208,7 @@ TEST(Util, TimeToFrames) {
 }
 
 TEST(Util, FramesToMs) {
+
   EXPECT_EQ(500, cras_frames_to_ms(24000, 48000));
   EXPECT_EQ(0, cras_frames_to_ms(1, 48000));
   EXPECT_EQ(10, cras_frames_to_ms(480, 48000));
@@ -246,7 +246,7 @@ TEST(Util, TimespecToMs) {
 
 TEST(Util, FramesSinceTime) {
   struct timespec t, tn;
-  uint64_t frames;
+  unsigned int frames;
 
   t.tv_sec = 0;
   t.tv_nsec = 500000000;
@@ -310,12 +310,13 @@ TEST(Util, CrasPoll) {
 /* Stubs */
 extern "C" {
 
-int clock_gettime(clockid_t clk_id, struct timespec* tp) {
+int clock_gettime(clockid_t clk_id, struct timespec *tp) {
   std::vector<struct timespec>::iterator i = time_now.begin();
   if (i != time_now.end()) {
     *tp = *i;
     time_now.erase(i);
-  } else
+  }
+  else
     memset(tp, 0, sizeof(*tp));
   return 0;
 }
@@ -324,7 +325,7 @@ int clock_gettime(clockid_t clk_id, struct timespec* tp) {
 
 }  //  namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

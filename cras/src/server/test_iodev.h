@@ -26,7 +26,8 @@ void test_iodev_destroy(struct cras_iodev *iodev);
 
 /* Handle a test commdn to the given iodev. */
 void test_iodev_command(struct cras_iodev *iodev,
-			enum CRAS_TEST_IODEV_CMD command, unsigned int data_len,
+			enum CRAS_TEST_IODEV_CMD command,
+			unsigned int data_len,
 			const uint8_t *data);
 
 #endif /* TEST_IODEV_H_ */

@@ -32,18 +32,18 @@ int cras_apm_list_deinit();
  *    stream_ptr - Pointer to the stream.
  *    effects - Bit map specifying the enabled effects on this stream.
  */
-struct cras_apm_list *cras_apm_list_create(void *stream_ptr, uint64_t effects);
+struct cras_apm_list *cras_apm_list_create(void *stream_ptr,
+					   uint64_t effects);
 
 /*
- * Creates a cras_apm associated to given dev_ptr and adds it to the list.
- * If there already exists an APM instance linked to dev_ptr, we assume
- * the open format is unchanged so just return it.
+ * Creates a cras_apm and adds it to the list.
  * Args:
  *    list - The list holding APM instances.
  *    dev_ptr - Pointer to the iodev to add new APM for.
  *    fmt - Format of the audio data used for this cras_apm.
  */
-struct cras_apm *cras_apm_list_add(struct cras_apm_list *list, void *dev_ptr,
+struct cras_apm *cras_apm_list_add(struct cras_apm_list *list,
+				   void *dev_ptr,
 				   const struct cras_audio_format *fmt);
 
 /*
@@ -52,7 +52,8 @@ struct cras_apm *cras_apm_list_add(struct cras_apm_list *list, void *dev_ptr,
  *    list - The list holding APM instances.
  *    dev_ptr - The iodev as key to look up associated APM.
  */
-struct cras_apm *cras_apm_list_get(struct cras_apm_list *list, void *dev_ptr);
+struct cras_apm *cras_apm_list_get(struct cras_apm_list *list,
+				   void *dev_ptr);
 
 /*
  * Gets the effects bit map of the APM list.
@@ -80,7 +81,8 @@ void cras_apm_list_remove(struct cras_apm_list *list, void *dev_ptr);
  *    offset - Offset in |input| to note the data position to start
  *        reading.
  */
-int cras_apm_list_process(struct cras_apm *apm, struct float_buffer *input,
+int cras_apm_list_process(struct cras_apm *apm,
+			  struct float_buffer *input,
 			  unsigned int offset);
 
 /* Gets the APM processed data in the form of audio area.
@@ -114,8 +116,10 @@ struct cras_audio_format *cras_apm_list_get_format(struct cras_apm *apm);
  *    start - True to set debug recording start, otherwise stop.
  *    fd - File descriptor to aec dump destination.
  */
-void cras_apm_list_set_aec_dump(struct cras_apm_list *list, void *dev_ptr,
-				int start, int fd);
+void cras_apm_list_set_aec_dump(struct cras_apm_list *list,
+				void *dev_ptr,
+			        int start,
+			        int fd);
 
 #else
 
@@ -136,9 +140,10 @@ static inline struct cras_apm_list *cras_apm_list_create(void *stream_ptr,
 {
 	return NULL;
 }
-static inline struct cras_apm *
-cras_apm_list_add(struct cras_apm_list *list, void *dev_ptr,
-		  const struct cras_audio_format *fmt)
+static inline struct cras_apm *cras_apm_list_add(
+		struct cras_apm_list *list,
+		void *dev_ptr,
+		const struct cras_audio_format *fmt)
 {
 	return NULL;
 }
@@ -167,8 +172,8 @@ static inline int cras_apm_list_process(struct cras_apm *apm,
 	return 0;
 }
 
-static inline struct cras_audio_area *
-cras_apm_list_get_processed(struct cras_apm *apm)
+static inline struct cras_audio_area *cras_apm_list_get_processed(
+		struct cras_apm *apm)
 {
 	return NULL;
 }
@@ -178,14 +183,16 @@ static inline void cras_apm_list_put_processed(struct cras_apm *apm,
 {
 }
 
-static inline struct cras_audio_format *
-cras_apm_list_get_format(struct cras_apm *apm)
+static inline struct cras_audio_format *cras_apm_list_get_format(
+		struct cras_apm *apm)
 {
 	return NULL;
 }
 
 static inline void cras_apm_list_set_aec_dump(struct cras_apm_list *list,
-					      void *dev_ptr, int start, int fd)
+					      void *dev_ptr,
+					      int start,
+					      int fd)
 {
 }
 

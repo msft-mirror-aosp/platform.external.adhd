@@ -9,7 +9,7 @@
 namespace {
 
 TEST(ExprTest, UnparsibleExpression) {
-  struct cras_expr_expression* expr;
+  struct cras_expr_expression *expr;
 
   /* un-parsable input */
   expr = cras_expr_expression_parse("#");
@@ -22,7 +22,7 @@ TEST(ExprTest, UnparsibleExpression) {
 }
 
 TEST(ExprTest, LiteralExpression) {
-  struct cras_expr_expression* expr;
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
   struct cras_expr_env env = CRAS_EXPR_ENV_INIT;
   int integer = 0;
@@ -59,7 +59,7 @@ TEST(ExprTest, LiteralExpression) {
 }
 
 TEST(ExprTest, Variable) {
-  struct cras_expr_expression* expr;
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
   struct cras_expr_env env = CRAS_EXPR_ENV_INIT;
   int integer = 0;
@@ -137,7 +137,7 @@ TEST(ExprTest, Compound) {
 }
 
 TEST(ExprTest, Environment) {
-  struct cras_expr_expression* expr;
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
   struct cras_expr_env env1 = CRAS_EXPR_ENV_INIT;
   struct cras_expr_env env2 = CRAS_EXPR_ENV_INIT;
@@ -173,10 +173,9 @@ TEST(ExprTest, Environment) {
   cras_expr_env_free(&env2);
 }
 
-static void expect_int(int expected,
-                       const char* str,
-                       struct cras_expr_env* env) {
-  struct cras_expr_expression* expr;
+static void expect_int(int expected, const char *str, struct cras_expr_env *env)
+{
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
 
   expr = cras_expr_expression_parse(str);
@@ -186,10 +185,10 @@ static void expect_int(int expected,
   cras_expr_expression_free(expr);
 }
 
-static void expect_boolean(char expected,
-                           const char* str,
-                           struct cras_expr_env* env) {
-  struct cras_expr_expression* expr;
+static void expect_boolean(char expected, const char *str,
+                           struct cras_expr_env *env)
+{
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
 
   expr = cras_expr_expression_parse(str);
@@ -200,7 +199,7 @@ static void expect_boolean(char expected,
 }
 
 TEST(ExprTest, Builtin) {
-  struct cras_expr_expression* expr;
+  struct cras_expr_expression *expr;
   struct cras_expr_value value = CRAS_EXPR_VALUE_INIT;
   struct cras_expr_env env = CRAS_EXPR_ENV_INIT;
 
@@ -242,7 +241,7 @@ TEST(ExprTest, Builtin) {
 
 }  //  namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
