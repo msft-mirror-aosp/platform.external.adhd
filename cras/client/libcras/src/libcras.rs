@@ -131,7 +131,10 @@ use audio_streams::{
     StreamDirection, StreamEffect, StreamSource,
 };
 use cras_sys::gen::*;
-pub use cras_sys::gen::{CRAS_CLIENT_TYPE as CrasClientType, CRAS_NODE_TYPE as CrasNodeType};
+pub use cras_sys::gen::{
+    CRAS_CLIENT_TYPE as CrasClientType, CRAS_NODE_TYPE as CrasNodeType,
+    CRAS_STREAM_EFFECT as CrasStreamEffect,
+};
 pub use cras_sys::{AudioDebugInfo, CrasIodevInfo, CrasIonodeInfo};
 use sys_util::{PollContext, PollToken, SharedMemory};
 
@@ -139,6 +142,7 @@ mod audio_socket;
 use crate::audio_socket::AudioSocket;
 mod cras_server_socket;
 use crate::cras_server_socket::CrasServerSocket;
+pub use crate::cras_server_socket::CrasSocketType;
 mod cras_shm;
 use crate::cras_shm::CrasServerState;
 pub mod cras_shm_stream;
@@ -224,9 +228,18 @@ impl<'a> CrasClient<'a> {
     /// Returns error if error occurs while handling server message or message
     /// type is incorrect
     pub fn new() -> Result<Self> {
-        // Create a connection to the server.
-        let mut server_socket = CrasServerSocket::new()?;
+        Self::with_type(CrasSocketType::Legacy)
+    }
 
+    /// Tries to create a `CrasClient` with a given `CrasSocketType`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if error occurs while handling server message or message
+    /// type is incorrect.
+    pub fn with_type(socket_type: CrasSocketType) -> Result<Self> {
+        // Create a connection to the server.
+        let mut server_socket = CrasServerSocket::with_type(socket_type)?;
         // Gets client ID and server state fd from server
         if let ServerResult::Connected(client_id, server_state_fd) =
             CrasClient::wait_for_message(&mut server_socket)?
@@ -578,7 +591,7 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
         format: SampleFormat,
         frame_rate: usize,
         buffer_size: usize,
-        effects: StreamEffect,
+        effects: &[StreamEffect],
         client_shm: &SharedMemory,
         buffer_offsets: [u64; 2],
     ) -> std::result::Result<Box<dyn ShmStream>, Box<dyn error::Error>> {
@@ -612,7 +625,7 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
             flags: 0,
             format: audio_format,
             dev_idx: CRAS_SPECIAL_DEVICE::NO_DEVICE as u32,
-            effects: CRAS_STREAM_EFFECT::from(effects).into(),
+            effects: effects.into_iter().collect::<CrasStreamEffect>().into(),
             client_type: self.client_type,
             client_shm_size: client_shm.size(),
             buffer_offsets,

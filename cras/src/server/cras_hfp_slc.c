@@ -189,6 +189,10 @@ static int call_waiting_notify(struct hfp_slc_handle *handle, const char *buf)
  */
 static int cli_notification(struct hfp_slc_handle *handle, const char *cmd)
 {
+	if (strlen(cmd) < 9) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
 	handle->cli_active = (cmd[8] == '1');
 	return hfp_send(handle, AT_CMD("OK"));
 }
@@ -316,7 +320,8 @@ static int bluetooth_codec_selection(struct hfp_slc_handle *handle,
  */
 static void choose_codec_and_init_slc(struct hfp_slc_handle *handle)
 {
-	if (handle->hf_supports_codec_negotiation &&
+	if (hfp_slc_get_ag_codec_negotiation_supported(handle) &&
+	    handle->hf_supports_codec_negotiation &&
 	    handle->hf_codec_supported[HFP_CODEC_ID_MSBC]) {
 		/* Sets preferred codec to mSBC, and schedule callback to
 		 * select preferred codec until reply received or timeout.
@@ -428,6 +433,10 @@ static int apple_supported_features(struct hfp_slc_handle *handle,
 	snprintf(buf, 64, AT_CMD("+XAPL=iPhone,%d"),
 		 CRAS_APL_SUPPORTED_FEATURES);
 	err = hfp_send(handle, buf);
+	if (err)
+		goto error_out;
+
+	err = hfp_send(handle, AT_CMD("OK"));
 	free(tokens);
 	return err;
 
@@ -619,6 +628,11 @@ static int report_indicators(struct hfp_slc_handle *handle, const char *cmd)
 	int err;
 	char buf[64];
 
+	if (strlen(cmd) < 8) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
+
 	if (cmd[7] == '=') {
 		/* Indicator update test command "AT+CIND=?" */
 		err = hfp_send(handle, AT_CMD(INDICATOR_UPDATE_RSP));
@@ -650,7 +664,7 @@ static int report_indicators(struct hfp_slc_handle *handle, const char *cmd)
 static int indicator_activation(struct hfp_slc_handle *handle, const char *cmd)
 {
 	/* AT+BIA=[[<indrep 1>][,[<indrep 2>][,...[,[<indrep n>]]]]] */
-	syslog(LOG_ERR, "Bluetooth indicator activation command %s", cmd);
+	syslog(LOG_INFO, "Bluetooth indicator activation command %s", cmd);
 	return hfp_send(handle, AT_CMD("OK"));
 }
 
@@ -660,18 +674,25 @@ static int indicator_activation(struct hfp_slc_handle *handle, const char *cmd)
 static int indicator_support(struct hfp_slc_handle *handle, const char *cmd)
 {
 	char *tokens, *key;
-	int err;
-	if (cmd[8] == '=') {
+	int err, cmd_len;
+
+	cmd_len = strlen(cmd);
+	if (cmd_len < 8)
+		goto error_out;
+
+	if (cmd[7] == '=') {
 		/* AT+BIND=? (Read AG supported indicators) */
-		if (cmd[9] == '?') {
+		if (cmd_len > 8 && cmd[8] == '?') {
 			/* +BIND: (<a>,<b>,<c>,...,<n>) (Response to AT+BIND=?)
 			 * <a> ... <n>: 0-65535, entered as decimal unsigned
 			 * integer values without leading zeros, referencing an
-			 * HF indicator assigned number. 2 is for Battery Level.
+			 * HF indicator assigned number.
+			 * 1 is for Enhanced Driver Status.
+			 * 2 is for Battery Level.
 			 * For the list of HF indicator assigned number, you can
 			 * check the  Bluetooth SIG Assigned Numbers web page.
 			 */
-			err = hfp_send(handle, AT_CMD("+BIND:2"));
+			err = hfp_send(handle, AT_CMD("+BIND: (1,2)"));
 			if (err < 0)
 				return err;
 		}
@@ -690,7 +711,7 @@ static int indicator_support(struct hfp_slc_handle *handle, const char *cmd)
 		}
 	}
 	/* AT+BIND? (Read AG enabled/disabled status of indicators) */
-	else if (cmd[8] == '?') {
+	else if (cmd[7] == '?') {
 		/* +BIND: <a>,<state> (Unsolicited or Response to AT+BIND?)
 		 * This response enables the AG to notify the HF which HF
 		 * indicators are supported and their state, enabled or
@@ -701,14 +722,28 @@ static int indicator_support(struct hfp_slc_handle *handle, const char *cmd)
 		 * indicator
 		 * 1 = enabled, value changes may be sent for this indicator
 		 */
-		err = hfp_send(handle, AT_CMD("+BIND:2,1"));
+
+		/* We support 1:enhanced driver status but disable it just for
+		 * passing PTS test case HFP/AG/SLC/BV-09-I
+		 */
+		err = hfp_send(handle, AT_CMD("+BIND: 1,0"));
 		if (err < 0)
 			return err;
+
+		err = hfp_send(handle, AT_CMD("+BIND: 2,1"));
+		if (err < 0)
+			return err;
+	} else {
+		goto error_out;
 	}
 	/* This OK reply is required after both +BIND AT commands. It also
 	 * covers the AT+BIND= <a>,<b>,...,<n> case.
 	 */
 	return hfp_send(handle, AT_CMD("OK"));
+
+error_out:
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	return hfp_send(handle, AT_CMD("ERROR"));
 }
 
 /* AT+BIEV command reports updated values of enabled HF indicators to the AG.
@@ -765,14 +800,20 @@ static int signal_gain_setting(struct hfp_slc_handle *handle, const char *cmd)
 	int gain;
 
 	if (strlen(cmd) < 8) {
-		syslog(LOG_ERR, "Invalid gain setting command %s", cmd);
-		return -EINVAL;
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
 	}
 
 	/* Map 0 to the smallest non-zero scale 6/100, and 15 to
 	 * 100/100 full. */
 	if (cmd[5] == 'S') {
 		gain = atoi(&cmd[7]);
+		if (gain < 0 || gain > 15) {
+			syslog(LOG_ERR,
+			       "signal_gain_setting: gain %d is not between 0 and 15",
+			       gain);
+			return hfp_send(handle, AT_CMD("ERROR"));
+		}
 		cras_bt_device_update_hardware_volume(handle->device,
 						      (gain + 1) * 100 / 16);
 	}
@@ -798,8 +839,10 @@ static int supported_features(struct hfp_slc_handle *handle, const char *cmd)
 	char response[128];
 	char *tokens, *features;
 
-	if (strlen(cmd) < 9)
-		return -EINVAL;
+	if (strlen(cmd) < 9) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
 
 	handle->hf_supports_codec_negotiation = 0;
 
@@ -1135,6 +1178,11 @@ int hfp_event_set_service(struct hfp_slc_handle *handle, int avail)
 	 * Since the value must be either 1 or 0. (service presence or not) */
 	handle->service = !!avail;
 	return hfp_send_ind_event_report(handle, SERVICE_IND_INDEX, avail);
+}
+
+int hfp_slc_get_ag_codec_negotiation_supported(struct hfp_slc_handle *handle)
+{
+	return handle->ag_supported_features & AG_CODEC_NEGOTIATION;
 }
 
 int hfp_slc_get_hf_codec_negotiation_supported(struct hfp_slc_handle *handle)

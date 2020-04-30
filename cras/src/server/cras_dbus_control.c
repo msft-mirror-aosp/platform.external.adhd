@@ -92,7 +92,10 @@
 	"    <method name=\"RemoveActiveOutputNode\">\n"                        \
 	"      <arg name=\"node_id\" type=\"t\" direction=\"in\"/>\n"           \
 	"    </method>\n"                                                       \
-	"    <method name=\"NextHandsfreeProfile\">\n"                          \
+	"    <method name=\"SetNextHandsfreeProfile\">\n"                       \
+	"      <arg name=\"toggle\" type=\"b\" direction=\"in\"/>\n"            \
+	"    </method>\n"                                                       \
+	"    <method name=\"SetFixA2dpPacketSize\">\n"                          \
 	"      <arg name=\"toggle\" type=\"b\" direction=\"in\"/>\n"            \
 	"    </method>\n"                                                       \
 	"    <method name=\"GetNumberOfActiveStreams\">\n"                      \
@@ -724,9 +727,9 @@ handle_rm_active_node(DBusConnection *conn, DBusMessage *message, void *arg,
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
-static DBusHandlerResult handle_next_handsfree_profile(DBusConnection *conn,
-						       DBusMessage *message,
-						       void *arg)
+static DBusHandlerResult handle_set_next_handsfree_profile(DBusConnection *conn,
+							   DBusMessage *message,
+							   void *arg)
 {
 	int rc;
 	dbus_bool_t enabled;
@@ -740,6 +743,24 @@ static DBusHandlerResult handle_next_handsfree_profile(DBusConnection *conn,
 	 */
 	cras_hfp_ag_profile_next_handsfree(conn, enabled);
 	cras_system_set_bt_wbs_enabled(enabled);
+
+	send_empty_reply(conn, message);
+
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult handle_set_fix_a2dp_packet_size(DBusConnection *conn,
+							 DBusMessage *message,
+							 void *arg)
+{
+	int rc;
+	dbus_bool_t enabled = FALSE;
+
+	rc = get_single_arg(message, DBUS_TYPE_BOOLEAN, &enabled);
+	if (rc)
+		return rc;
+
+	cras_system_set_bt_fix_a2dp_packet_size_enabled(enabled);
 
 	send_empty_reply(conn, message);
 
@@ -1069,8 +1090,11 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 		return handle_rm_active_node(conn, message, arg,
 					     CRAS_STREAM_OUTPUT);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
-					       "NextHandsfreeProfile")) {
-		return handle_next_handsfree_profile(conn, message, arg);
+					       "SetNextHandsfreeProfile")) {
+		return handle_set_next_handsfree_profile(conn, message, arg);
+	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
+					       "SetFixA2dpPacketSize")) {
+		return handle_set_fix_a2dp_packet_size(conn, message, arg);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
 					       "GetNumberOfActiveStreams")) {
 		return handle_get_num_active_streams(conn, message, arg);
