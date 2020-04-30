@@ -13,6 +13,7 @@
 #include "cras_bt_constants.h"
 #include "cras_bt_player.h"
 #include "cras_dbus_util.h"
+#include "cras_utf8.h"
 #include "utlist.h"
 
 static void cras_bt_on_player_registered(DBusPendingCall *pending_call,
@@ -198,6 +199,18 @@ static void cras_bt_player_append_metadata(DBusMessageIter *iter,
 			DBUS_TYPE_VARIANT_AS_STRING
 				DBUS_DICT_ENTRY_END_CHAR_AS_STRING,
 		&array);
+	if (!is_utf8_string(title)) {
+		syslog(LOG_INFO, "Non-utf8 title: %s", title);
+		title = "";
+	}
+	if (!is_utf8_string(album)) {
+		syslog(LOG_INFO, "Non-utf8 album: %s", album);
+		album = "";
+	}
+	if (!is_utf8_string(artist)) {
+		syslog(LOG_INFO, "Non-utf8 artist: %s", artist);
+		artist = "";
+	}
 
 	append_key_value(&array, "xesam:title", DBUS_TYPE_STRING,
 			 DBUS_TYPE_STRING_AS_STRING, &title);
@@ -281,6 +294,9 @@ int cras_bt_player_update_playback_status(DBusConnection *conn,
 	DBusMessageIter iter, dict;
 	const char *playerInterface = BLUEZ_INTERFACE_MEDIA_PLAYER;
 
+	if (!player.playback_status)
+		return -ENXIO;
+
 	/* Verify the string value matches one of the possible status defined in
 	 * bluez/profiles/audio/avrcp.c
 	 */
@@ -331,8 +347,16 @@ int cras_bt_player_update_identity(DBusConnection *conn, const char *identity)
 	DBusMessageIter iter, dict;
 	const char *playerInterface = BLUEZ_INTERFACE_MEDIA_PLAYER;
 
+	if (!player.identity)
+		return -ENXIO;
+
 	if (!identity)
 		return -EINVAL;
+
+	if (!is_utf8_string(identity)) {
+		syslog(LOG_INFO, "Non-utf8 identity: %s", identity);
+		identity = "";
+	}
 
 	if (!strcasecmp(player.identity, identity))
 		return 0;
@@ -408,13 +432,16 @@ int cras_bt_player_update_position(DBusConnection *conn,
 }
 
 int cras_bt_player_update_metadata(DBusConnection *conn, const char *title,
-				   const char *album, const char *artist,
+				   const char *artist, const char *album,
 				   const dbus_int64_t length)
 {
 	DBusMessage *msg;
 	DBusMessageIter iter, array, dict;
 	const char *property = "Metadata";
 	const char *playerInterface = BLUEZ_INTERFACE_MEDIA_PLAYER;
+
+	if (!player.metadata)
+		return -ENXIO;
 
 	msg = dbus_message_new_signal(CRAS_DEFAULT_PLAYER,
 				      DBUS_INTERFACE_PROPERTIES,
