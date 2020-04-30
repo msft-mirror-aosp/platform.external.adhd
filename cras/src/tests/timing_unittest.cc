@@ -93,10 +93,9 @@ class TimingSuite : public testing::Test {
     // Set response for frames_queued.
     iodev_stub_frames_queued(dev->dev.get(), dev_level, *level_timestamp);
 
-    struct timespec dev_time, now;
+    struct timespec dev_time;
     dev_time.tv_sec = level_timestamp->tv_sec + 500;  // Far in the future.
-    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-    dev_io_next_output_wake(&dev_list_, &dev_time, &now);
+    dev_io_next_output_wake(&dev_list_, &dev_time);
     return dev_time;
   }
 };
@@ -1161,6 +1160,12 @@ int input_data_put_for_stream(struct input_data* data,
                               struct buffer_share* offsets,
                               unsigned int frames) {
   return 0;
+}
+
+float input_data_get_software_gain_scaler(struct input_data* data,
+                                          float idev_sw_gain_scaler,
+                                          struct cras_rstream* stream) {
+  return 1.0;
 }
 
 struct cras_audio_format* cras_rstream_post_processing_format(

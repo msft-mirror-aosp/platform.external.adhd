@@ -40,11 +40,6 @@
  *    destroyed - Flag to note if this a2dp_io is about to destroy.
  *    next_flush_time - The time when it is okay for next flush call.
  *    flush_period - The time period between two a2dp packet writes.
- *    drain_for_no_stream - Flag to note that some valid samples are in progress
- *        to be drained in no_stream state.
- *    free_running - Flag to note that all valid samples have been drained in
- *        no_stream state, hence audio thread doesn't need to wake up for this
- *        iodev.
  *    write_block - How many frames of audio samples are transferred in one
  *        a2dp packet write.
  */
@@ -57,8 +52,6 @@ struct a2dp_io {
 	int destroyed;
 	struct timespec next_flush_time;
 	struct timespec flush_period;
-	bool drain_for_no_stream;
-	bool free_running;
 	unsigned int write_block;
 };
 
@@ -104,7 +97,7 @@ static int update_supported_formats(struct cras_iodev *iodev)
 	return 0;
 }
 
-static int bt_local_queued_frames(const struct cras_iodev *iodev)
+static unsigned int bt_local_queued_frames(const struct cras_iodev *iodev)
 {
 	struct a2dp_io *a2dpio = (struct a2dp_io *)iodev;
 	return a2dp_queued_frames(&a2dpio->a2dp) +
@@ -121,6 +114,21 @@ static int frames_queued(const struct cras_iodev *iodev,
 }
 
 /*
+ * Utility function to fill zero frames until buffer level reaches
+ * min_buffer_level. This is useful to allocate just enough data to write
+ * to controller, while not introducing extra latency.
+ */
+static int fill_zeros_to_min_buffer_level(struct cras_iodev *iodev)
+{
+	unsigned int local_queued_frames = bt_local_queued_frames(iodev);
+
+	if (local_queued_frames < iodev->min_buffer_level)
+		return cras_iodev_fill_odev_zeros(
+			iodev, iodev->min_buffer_level - local_queued_frames);
+	return 0;
+}
+
+/*
  * dev_io_playback_write() has the logic to detect underrun scenario
  * and calls into this underrun ops, by comparing buffer level with
  * number of frames just written. Note that it's not correct 100% of
@@ -129,7 +137,7 @@ static int frames_queued(const struct cras_iodev *iodev,
  */
 static int output_underrun(struct cras_iodev *iodev)
 {
-	int local_queued_frames = bt_local_queued_frames(iodev);
+	unsigned int local_queued_frames = bt_local_queued_frames(iodev);
 
 	/*
 	 * Examples to help understand the check:
@@ -151,72 +159,39 @@ static int output_underrun(struct cras_iodev *iodev)
 	return cras_iodev_fill_odev_zeros(iodev, iodev->min_cb_level);
 }
 
-static int is_free_running(const struct cras_iodev *odev)
-{
-	struct a2dp_io *a2dpio = (struct a2dp_io *)odev;
-	return a2dpio->free_running;
-}
-
+/*
+ * This wil be called multiple times when a2dpio is in no_stream state.
+ * Simply fill zero frames to one write_block to ensure enough audio data
+ * can be written at next flush_period.
+ */
 static int enter_no_stream(struct a2dp_io *a2dpio)
 {
 	struct cras_iodev *odev = &a2dpio->base;
-	unsigned int local_queued_frames;
-
-	if (a2dpio->free_running)
-		return 0;
-
-	local_queued_frames = bt_local_queued_frames(odev);
-
-	if (!a2dpio->drain_for_no_stream) {
-		/*
-		 * Frames less than write_block cannot be written to controller.
-		 * Put one chunk of zero if total number of frames is not a
-		 * multiple of write_block.
-		 */
-		if (local_queued_frames % a2dpio->write_block)
-			cras_iodev_fill_odev_zeros(&a2dpio->base,
-						   a2dpio->write_block);
-		a2dpio->drain_for_no_stream = 1;
-	}
-	encode_and_flush(odev);
-
-	local_queued_frames = bt_local_queued_frames(odev);
-	if (local_queued_frames < a2dpio->write_block) {
-		/* All valid samples are drained. */
-		a2dpio->free_running = 1;
-		buf_reset(a2dpio->pcm_buf);
-		a2dp_reset(&a2dpio->a2dp);
-	}
-	return 0;
+	int rc;
+	rc = fill_zeros_to_min_buffer_level(odev);
+	if (rc)
+		syslog(LOG_ERR, "Error in A2DP enter_no_stream");
+	return encode_and_flush(odev);
 }
 
+/*
+ * This is called when stream data is available to write. Prepare audio
+ * data to one min_buffer_level. Don't flush it now because stream data is
+ * coming right up which will trigger next flush at appropriate time.
+ */
 static int leave_no_stream(struct a2dp_io *a2dpio)
 {
 	struct cras_iodev *odev = &a2dpio->base;
 
-	if (!a2dpio->free_running) {
-		encode_and_flush(odev);
-	} else {
-		/*
-		 * Fast forward next_flush_time to now. Then immediately fill
-		 * and flush one write_block of zeros as padding. This is to
-		 * restore the exact state at when start() is called.
-		 */
-		clock_gettime(CLOCK_MONOTONIC_RAW, &a2dpio->next_flush_time);
-		cras_iodev_fill_odev_zeros(odev, a2dpio->write_block);
-	}
-	a2dpio->drain_for_no_stream = 0;
-	a2dpio->free_running = 0;
-
-	return 0;
+	/*
+	 * Less than mib_buffer_level could easily get into underrun with small
+	 * size stream.
+	 * More than min_buffer_level means unecessary latency to subsequent
+	 * stream.
+	 */
+	return fill_zeros_to_min_buffer_level(odev);
 }
 
-/*
- * Enter no_stream -> draining -> free_running -|
- *                      |                       |
- *                      V                       |
- *                  leave no_stream <------------/
- */
 static int no_stream(struct cras_iodev *odev, int enable)
 {
 	struct a2dp_io *a2dpio = (struct a2dp_io *)odev;
@@ -242,9 +217,6 @@ static int encode_a2dp_packet(struct a2dp_io *a2dpio)
 			&a2dpio->a2dp, buf_read_pointer(a2dpio->pcm_buf),
 			buf_readable(a2dpio->pcm_buf), format_bytes,
 			cras_bt_transport_write_mtu(a2dpio->transport));
-		ATLOG(atlog, AUDIO_THREAD_A2DP_ENCODE, processed,
-		      buf_queued(a2dpio->pcm_buf),
-		      buf_readable(a2dpio->pcm_buf));
 		if (processed == -ENOSPC || processed == 0)
 			break;
 		if (processed < 0)
@@ -270,6 +242,7 @@ static int configure_dev(struct cras_iodev *iodev)
 	int sock_depth;
 	int err;
 	socklen_t optlen;
+	int a2dp_payload_length;
 
 	err = cras_bt_transport_acquire(a2dpio->transport);
 	if (err < 0) {
@@ -304,12 +277,15 @@ static int configure_dev(struct cras_iodev *iodev)
 	a2dpio->sock_depth_frames = a2dp_block_size(&a2dpio->a2dp, sock_depth) /
 				    cras_get_format_bytes(iodev->format);
 	/*
+	 * Per avdtp_write, subtract the room for packet header first.
 	 * Calculate how many frames are encapsulated in one a2dp packet, and
 	 * the corresponding time period between two packets.
 	 */
+	a2dp_payload_length = cras_bt_transport_write_mtu(a2dpio->transport) -
+			      sizeof(struct rtp_header) -
+			      sizeof(struct rtp_payload);
 	a2dpio->write_block =
-		a2dp_block_size(&a2dpio->a2dp, cras_bt_transport_write_mtu(
-						       a2dpio->transport)) /
+		a2dp_block_size(&a2dpio->a2dp, a2dp_payload_length) /
 		cras_get_format_bytes(iodev->format);
 	cras_frames_to_time(a2dpio->write_block, iodev->format->frame_rate,
 			    &a2dpio->flush_period);
@@ -323,9 +299,6 @@ static int configure_dev(struct cras_iodev *iodev)
 	 * underruns, audio thread can take action to fill some zeros.
 	 */
 	iodev->min_buffer_level = a2dpio->write_block;
-
-	a2dpio->drain_for_no_stream = 0;
-	a2dpio->free_running = 0;
 
 	audio_thread_add_write_callback(cras_bt_transport_fd(a2dpio->transport),
 					a2dp_socket_write_cb, iodev);
@@ -409,7 +382,7 @@ static int encode_and_flush(const struct cras_iodev *iodev)
 	int err;
 	size_t format_bytes;
 	int written = 0;
-	int queued_frames;
+	unsigned int queued_frames;
 	struct a2dp_io *a2dpio;
 	struct cras_bt_device *device;
 	struct timespec now;
@@ -642,7 +615,6 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport)
 	iodev->set_volume = set_volume;
 	iodev->start = start;
 	iodev->frames_to_play_in_sleep = frames_to_play_in_sleep;
-	iodev->is_free_running = is_free_running;
 
 	/* Create a dummy ionode */
 	node = (struct cras_ionode *)calloc(1, sizeof(*node));

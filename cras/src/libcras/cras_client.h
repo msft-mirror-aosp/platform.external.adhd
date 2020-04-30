@@ -808,6 +808,14 @@ long cras_client_get_system_min_volume(const struct cras_client *client);
  */
 long cras_client_get_system_max_volume(const struct cras_client *client);
 
+/* Gets the default output buffer size.
+ * Args:
+ *    client - The client from cras_client_create.
+ * Returns:
+ *    Default output buffer size in frames. A negative error on failure.
+ */
+int cras_client_get_default_output_buffer_size(struct cras_client *client);
+
 /* Gets audio debug info.
  *
  * Requires that the connection to the server has been established.
@@ -930,7 +938,8 @@ int cras_client_swap_node_left_right(struct cras_client *client,
  * Args:
  *    client - The client from cras_client_create.
  *    node_id - ID of the node.
- *    gain - New capture gain for the node.
+ *    gain - New capture gain for the node, in range (0, 100) which will
+ *        linearly maps to (-4000, 4000) 100*dBFS.
  */
 int cras_client_set_node_capture_gain(struct cras_client *client,
 				      cras_node_id_t node_id, long gain);
