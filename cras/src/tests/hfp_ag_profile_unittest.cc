@@ -167,6 +167,25 @@ int cras_bt_add_profile(DBusConnection* conn, struct cras_bt_profile* profile) {
   return 0;
 }
 
+int cras_bt_rm_profile(DBusConnection* conn, struct cras_bt_profile* profile) {
+  internal_bt_profile = NULL;
+  return 0;
+}
+
+int cras_bt_register_profile(DBusConnection* conn,
+                             struct cras_bt_profile* profile) {
+  return 0;
+}
+
+int cras_bt_register_profiles(DBusConnection* conn) {
+  return 0;
+}
+
+int cras_bt_unregister_profile(DBusConnection* conn,
+                               struct cras_bt_profile* profile) {
+  return 0;
+}
+
 struct hfp_info* hfp_info_create() {
   return NULL;
 }
@@ -223,6 +242,9 @@ struct hfp_slc_handle* hfp_slc_create(int fd,
 
 int hfp_slc_get_selected_codec(struct hfp_slc_handle* handle) {
   return HFP_CODEC_ID_CVSD;
+}
+int hfp_slc_get_ag_codec_negotiation_supported(struct hfp_slc_handle* handle) {
+  return 1;
 }
 
 int hfp_slc_get_hf_codec_negotiation_supported(struct hfp_slc_handle* handle) {
