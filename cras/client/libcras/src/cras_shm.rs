@@ -1,6 +1,7 @@
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+use std::convert::TryFrom;
 use std::io;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -10,13 +11,15 @@ use std::slice;
 use std::sync::atomic::{self, Ordering};
 use std::thread;
 
-use libc;
-
 use cras_sys::gen::{
-    cras_audio_shm_header, cras_server_state, CRAS_NUM_SHM_BUFFERS, CRAS_SERVER_STATE_VERSION,
-    CRAS_SHM_BUFFERS_MASK,
+    audio_dev_debug_info, audio_stream_debug_info, cras_audio_shm_header, cras_iodev_info,
+    cras_ionode_info, cras_server_state, CRAS_MAX_IODEVS, CRAS_MAX_IONODES, CRAS_NUM_SHM_BUFFERS,
+    CRAS_SERVER_STATE_VERSION, CRAS_SHM_BUFFERS_MASK, MAX_DEBUG_DEVS, MAX_DEBUG_STREAMS,
 };
-use data_model::VolatileRef;
+use cras_sys::{
+    AudioDebugInfo, AudioDevDebugInfo, AudioStreamDebugInfo, CrasIodevInfo, CrasIonodeInfo,
+};
+use data_model::{VolatileRef, VolatileSlice};
 
 /// A structure wrapping a fd which contains a shared `cras_audio_shm_header`.
 /// * `shm_fd` - A shared memory fd contains a `cras_audio_shm_header`
@@ -58,7 +61,7 @@ pub struct CrasAudioHeader<'a> {
     write_buf_idx: VolatileRef<'a, u32>,
     read_offset: [VolatileRef<'a, u32>; CRAS_NUM_SHM_BUFFERS as usize],
     write_offset: [VolatileRef<'a, u32>; CRAS_NUM_SHM_BUFFERS as usize],
-    buffer_offset: [VolatileRef<'a, u32>; CRAS_NUM_SHM_BUFFERS as usize],
+    buffer_offset: [VolatileRef<'a, u64>; CRAS_NUM_SHM_BUFFERS as usize],
 }
 
 // It is safe to send audio buffers between threads as this struct has exclusive ownership of the
@@ -228,8 +231,13 @@ impl<'a> CrasAudioHeader<'a> {
         self.frame_size.load() as usize
     }
 
-    /// Gets the size in bytes of the shared memory buffer.
-    fn get_used_size(&self) -> usize {
+    /// Gets the max size in bytes of each shared memory buffer within
+    /// the samples area.
+    ///
+    /// # Returns
+    ///
+    /// * `usize` - Value of `used_size` fetched from the shared memory header.
+    pub fn get_used_size(&self) -> usize {
         self.used_size.load() as usize
     }
 
@@ -301,7 +309,7 @@ impl<'a> CrasAudioHeader<'a> {
         Ok(())
     }
 
-    /// Sets `read_offset[idx]` of to count of written bytes.
+    /// Sets `read_offset[idx]` to count of written bytes.
     ///
     /// # Arguments
     /// `idx` - 0 <= `idx` < `CRAS_NUM_SHM_BUFFERS`
@@ -362,12 +370,11 @@ impl<'a> CrasAudioHeader<'a> {
     ///  * overlaps some other buffer `[other_offset, other_offset + used_size)`
     ///  * is close enough to the end of the samples area that the buffer would
     ///    be shorter than `frame_size`.
-    #[allow(dead_code)]
-    fn set_buffer_offset(&mut self, idx: usize, offset: usize) -> io::Result<()> {
+    pub fn set_buffer_offset(&mut self, idx: usize, offset: usize) -> io::Result<()> {
         self.check_buffer_offset(idx, offset)?;
 
         let buffer_offset = self.buffer_offset.get(idx).ok_or_else(index_out_of_range)?;
-        buffer_offset.store(offset as u32);
+        buffer_offset.store(offset as u64);
         Ok(())
     }
 
@@ -502,6 +509,23 @@ unsafe fn cras_mmap(
     cras_mmap_offset(len, prot, fd, 0)
 }
 
+/// An unsafe macro for getting a `VolatileSlice` representing an entire array
+/// field from a given NonNull pointer.
+///
+/// To use this macro safely, we need to
+/// - Make sure the pointer address is readable and writeable for its struct.
+/// - Make sure all `VolatileSlice`s generated from this macro have exclusive ownership for the same
+/// pointer.
+/// - Make sure the length of the array field is non-zero.
+#[macro_export]
+macro_rules! vslice_from_addr {
+    ($addr:ident, $($field:ident).*) => {{
+        let ptr = &mut $addr.as_mut().$($field).* as *mut _ as *mut u8;
+        let size = std::mem::size_of_val(&$addr.as_mut().$($field).*) as u64;
+        VolatileSlice::new(ptr, size)
+    }};
+}
+
 /// A structure that points to RO shared memory area - `cras_server_state`
 /// The structure is created from a shared memory fd which contains the structure.
 #[derive(Debug)]
@@ -509,7 +533,19 @@ pub struct CrasServerState<'a> {
     addr: *mut libc::c_void,
     volume: VolatileRef<'a, u32>,
     mute: VolatileRef<'a, i32>,
+    num_output_devs: VolatileRef<'a, u32>,
+    output_devs: VolatileSlice<'a>,
+    num_input_devs: VolatileRef<'a, u32>,
+    input_devs: VolatileSlice<'a>,
+    num_output_nodes: VolatileRef<'a, u32>,
+    num_input_nodes: VolatileRef<'a, u32>,
+    output_nodes: VolatileSlice<'a>,
+    input_nodes: VolatileSlice<'a>,
     update_count: VolatileRef<'a, u32>,
+    debug_info_num_devs: VolatileRef<'a, u32>,
+    debug_info_devs: VolatileSlice<'a>,
+    debug_info_num_streams: VolatileRef<'a, u32>,
+    debug_info_streams: VolatileSlice<'a>,
 }
 
 // It is safe to send server_state between threads as this struct has exclusive
@@ -549,7 +585,19 @@ impl<'a> CrasServerState<'a> {
                 addr: addr.as_ptr() as *mut libc::c_void,
                 volume: vref_from_addr!(addr, volume),
                 mute: vref_from_addr!(addr, mute),
+                num_output_devs: vref_from_addr!(addr, num_output_devs),
+                num_input_devs: vref_from_addr!(addr, num_input_devs),
+                output_devs: vslice_from_addr!(addr, output_devs),
+                input_devs: vslice_from_addr!(addr, input_devs),
+                num_output_nodes: vref_from_addr!(addr, num_output_nodes),
+                num_input_nodes: vref_from_addr!(addr, num_input_nodes),
+                output_nodes: vslice_from_addr!(addr, output_nodes),
+                input_nodes: vslice_from_addr!(addr, input_nodes),
                 update_count: vref_from_addr!(addr, update_count),
+                debug_info_num_devs: vref_from_addr!(addr, audio_debug_info.num_devs),
+                debug_info_devs: vslice_from_addr!(addr, audio_debug_info.devs),
+                debug_info_num_streams: vref_from_addr!(addr, audio_debug_info.num_streams),
+                debug_info_streams: vslice_from_addr!(addr, audio_debug_info.streams),
             })
         }
     }
@@ -572,10 +620,9 @@ impl<'a> CrasServerState<'a> {
     /// was not updated during the read.
     /// This can be used for an "atomic" read of non-atomic data from the
     /// state shared memory.
-    #[allow(dead_code)]
-    fn synchronized_state_read<F, T>(&self, func: F) -> T
+    fn synchronized_state_read<F, T>(&self, mut func: F) -> T
     where
-        F: Fn() -> T,
+        F: FnMut() -> T,
     {
         // Waits until the server has completed a state update before returning
         // the current update count.
@@ -609,6 +656,96 @@ impl<'a> CrasServerState<'a> {
                 return result;
             }
         }
+    }
+
+    /// Gets a list of output devices
+    ///
+    /// Read a list of the currently attached output devices from shared memory.
+    pub fn output_devices(&self) -> impl Iterator<Item = CrasIodevInfo> {
+        let mut devs: Vec<cras_iodev_info> = vec![Default::default(); CRAS_MAX_IODEVS as usize];
+        let num_devs = self.synchronized_state_read(|| {
+            self.output_devs.copy_to(&mut devs);
+            self.num_output_devs.load()
+        });
+        devs.into_iter()
+            .take(num_devs as usize)
+            .map(CrasIodevInfo::from)
+    }
+
+    /// Gets a list of input devices
+    ///
+    /// Read a list of the currently attached input devices from shared memory.
+    pub fn input_devices(&self) -> impl Iterator<Item = CrasIodevInfo> {
+        let mut devs: Vec<cras_iodev_info> = vec![Default::default(); CRAS_MAX_IODEVS as usize];
+        let num_devs = self.synchronized_state_read(|| {
+            self.input_devs.copy_to(&mut devs);
+            self.num_input_devs.load()
+        });
+        devs.into_iter()
+            .take(num_devs as usize)
+            .map(CrasIodevInfo::from)
+    }
+
+    /// Gets a list of output nodes
+    ///
+    /// Read a list of the currently attached output nodes from shared memory.
+    pub fn output_nodes(&self) -> impl Iterator<Item = CrasIonodeInfo> {
+        let mut nodes: Vec<cras_ionode_info> = vec![Default::default(); CRAS_MAX_IONODES as usize];
+        let num_nodes = self.synchronized_state_read(|| {
+            self.output_nodes.copy_to(&mut nodes);
+            self.num_output_nodes.load()
+        });
+        nodes
+            .into_iter()
+            .take(num_nodes as usize)
+            .map(CrasIonodeInfo::from)
+    }
+
+    /// Gets a list of input nodes
+    ///
+    /// Read a list of the currently attached input nodes from shared memory.
+    pub fn input_nodes(&self) -> impl Iterator<Item = CrasIonodeInfo> {
+        let mut nodes: Vec<cras_ionode_info> = vec![Default::default(); CRAS_MAX_IONODES as usize];
+        let num_nodes = self.synchronized_state_read(|| {
+            self.input_nodes.copy_to(&mut nodes);
+            self.num_input_nodes.load()
+        });
+        nodes
+            .into_iter()
+            .take(num_nodes as usize)
+            .map(CrasIonodeInfo::from)
+    }
+
+    /// Get audio debug info
+    ///
+    /// Loads the server's audio_debug_info struct and converts it into an
+    /// idiomatic rust representation.
+    ///
+    /// # Errors
+    /// * If any of the stream debug information structs are invalid.
+    pub fn get_audio_debug_info(&self) -> Result<AudioDebugInfo, cras_sys::Error> {
+        let mut devs: Vec<audio_dev_debug_info> = vec![Default::default(); MAX_DEBUG_DEVS as usize];
+        let mut streams: Vec<audio_stream_debug_info> =
+            vec![Default::default(); MAX_DEBUG_STREAMS as usize];
+        let (num_devs, num_streams) = self.synchronized_state_read(|| {
+            self.debug_info_devs.copy_to(&mut devs);
+            self.debug_info_streams.copy_to(&mut streams);
+            (
+                self.debug_info_num_devs.load(),
+                self.debug_info_num_streams.load(),
+            )
+        });
+        let dev_info = devs
+            .into_iter()
+            .take(num_devs as usize)
+            .map(AudioDevDebugInfo::from)
+            .collect();
+        let stream_info = streams
+            .into_iter()
+            .take(num_streams as usize)
+            .map(AudioStreamDebugInfo::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AudioDebugInfo::new(dev_info, stream_info))
     }
 }
 
@@ -680,6 +817,16 @@ pub fn create_header_and_buffers<'a>(
     let buffer = CrasAudioBuffer::new(samples_fd)?;
 
     Ok((header, buffer))
+}
+
+/// Creates header from header shared memory fds. Use this function
+/// when mapping the samples shm is not necessary, for instance with a
+/// client-provided shm stream.
+pub fn create_header<'a>(
+    header_fd: CrasAudioShmHeaderFd,
+    samples_len: usize,
+) -> io::Result<CrasAudioHeader<'a>> {
+    Ok(CrasAudioHeader::new(header_fd, samples_len)?)
 }
 
 /// A structure wrapping a fd which contains a shared memory area and its size.

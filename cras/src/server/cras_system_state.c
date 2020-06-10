@@ -48,6 +48,8 @@ struct card_list {
  *    add_task - Function to handle adding a task for main thread to execute.
  *    task_data - Data to be passed to add_task handler function.
  *    main_thread_tid - The thread id of the main thread.
+ *    bt_fix_a2dp_packet_size - The flag to override A2DP packet size set by
+ *      Blueetoh peer devices to a smaller default value.
  */
 static struct {
 	struct cras_server_state *exp_state;
@@ -71,6 +73,7 @@ static struct {
 	void *task_data;
 	struct cras_audio_thread_snapshot_buffer snapshot_buffer;
 	pthread_t main_thread_tid;
+	bool bt_fix_a2dp_packet_size;
 } state;
 
 /*
@@ -103,14 +106,10 @@ void cras_system_state_init(const char *device_config_dir, const char *shm_name,
 	exp_state->mute = 0;
 	exp_state->mute_locked = 0;
 	exp_state->suspended = 0;
-	exp_state->capture_gain = DEFAULT_CAPTURE_GAIN;
-	exp_state->capture_gain_target = DEFAULT_CAPTURE_GAIN;
 	exp_state->capture_mute = 0;
 	exp_state->capture_mute_locked = 0;
 	exp_state->min_volume_dBFS = DEFAULT_MIN_VOLUME_DBFS;
 	exp_state->max_volume_dBFS = DEFAULT_MAX_VOLUME_DBFS;
-	exp_state->min_capture_gain = DEFAULT_MIN_CAPTURE_GAIN;
-	exp_state->max_capture_gain = DEFAULT_MAX_CAPTURE_GAIN;
 	exp_state->num_streams_attached = 0;
 	exp_state->default_output_buffer_size =
 		board_config.default_output_buffer_size;
@@ -148,6 +147,8 @@ void cras_system_state_init(const char *device_config_dir, const char *shm_name,
 
 	/* Save thread id of the main thread. */
 	state.main_thread_tid = pthread_self();
+
+	state.bt_fix_a2dp_packet_size = false;
 }
 
 void cras_system_state_set_internal_ucm_suffix(const char *internal_ucm_suffix)
@@ -185,21 +186,6 @@ void cras_system_set_volume(size_t volume)
 size_t cras_system_get_volume()
 {
 	return state.exp_state->volume;
-}
-
-void cras_system_set_capture_gain(long gain)
-{
-	/* Adjust targeted gain to be in supported range. */
-	state.exp_state->capture_gain_target = gain;
-	gain = MAX(gain, state.exp_state->min_capture_gain);
-	gain = MIN(gain, state.exp_state->max_capture_gain);
-	state.exp_state->capture_gain = gain;
-	cras_observer_notify_capture_gain(state.exp_state->capture_gain);
-}
-
-long cras_system_get_capture_gain()
-{
-	return state.exp_state->capture_gain;
 }
 
 void cras_system_notify_mute(void)
@@ -328,24 +314,6 @@ long cras_system_get_max_volume()
 	return state.exp_state->max_volume_dBFS;
 }
 
-void cras_system_set_capture_gain_limits(long min, long max)
-{
-	state.exp_state->min_capture_gain = MAX(min, DEFAULT_MIN_CAPTURE_GAIN);
-	state.exp_state->max_capture_gain = max;
-	/* Re-apply target gain subjected to the new supported range. */
-	cras_system_set_capture_gain(state.exp_state->capture_gain_target);
-}
-
-long cras_system_get_min_capture_gain()
-{
-	return state.exp_state->min_capture_gain;
-}
-
-long cras_system_get_max_capture_gain()
-{
-	return state.exp_state->max_capture_gain;
-}
-
 int cras_system_get_default_output_buffer_size()
 {
 	return state.exp_state->default_output_buffer_size;
@@ -369,6 +337,16 @@ void cras_system_set_bt_wbs_enabled(bool enabled)
 bool cras_system_get_bt_wbs_enabled()
 {
 	return !!state.exp_state->bt_wbs_enabled;
+}
+
+void cras_system_set_bt_fix_a2dp_packet_size_enabled(bool enabled)
+{
+	state.bt_fix_a2dp_packet_size = enabled;
+}
+
+bool cras_system_get_bt_fix_a2dp_packet_size_enabled()
+{
+	return state.bt_fix_a2dp_packet_size;
 }
 
 int cras_system_add_alsa_card(struct cras_alsa_card_info *alsa_card_info)

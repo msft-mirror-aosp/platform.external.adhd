@@ -7,11 +7,10 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audio_streams::SampleFormat;
 use sync::{Condvar, Mutex};
 use sys_util::SharedMemory;
 
-use crate::cras_types::StreamDirection;
+use crate::{SampleFormat, StreamDirection, StreamEffect};
 
 type GenericResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
@@ -177,6 +176,7 @@ pub trait ShmStreamSource: Send {
     /// * `buffer_size` - The maximum size of an audio buffer. This will be the
     ///                   size used for transfers of audio data between client
     ///                   and server.
+    /// * `effects` - Audio effects to use for the stream, such as echo-cancellation.
     /// * `client_shm` - The shared memory area that will contain samples.
     /// * `buffer_offsets` - The two initial values to use as buffer offsets
     ///                      for streams. This way, the server will not write
@@ -193,8 +193,9 @@ pub trait ShmStreamSource: Send {
         format: SampleFormat,
         frame_rate: usize,
         buffer_size: usize,
+        effects: &[StreamEffect],
         client_shm: &SharedMemory,
-        buffer_offsets: [u32; 2],
+        buffer_offsets: [u64; 2],
     ) -> GenericResult<Box<dyn ShmStream>>;
 
     /// Get a list of file descriptors used by the implementation.
@@ -287,8 +288,9 @@ impl ShmStreamSource for NullShmStreamSource {
         format: SampleFormat,
         frame_rate: usize,
         buffer_size: usize,
+        _effects: &[StreamEffect],
         _client_shm: &SharedMemory,
-        _buffer_offsets: [u32; 2],
+        _buffer_offsets: [u64; 2],
     ) -> GenericResult<Box<dyn ShmStream>> {
         let new_stream = NullShmStream::new(buffer_size, num_channels, format, frame_rate);
         Ok(Box::new(new_stream))
@@ -414,8 +416,9 @@ impl ShmStreamSource for MockShmStreamSource {
         format: SampleFormat,
         _frame_rate: usize,
         buffer_size: usize,
+        _effects: &[StreamEffect],
         _client_shm: &SharedMemory,
-        _buffer_offsets: [u32; 2],
+        _buffer_offsets: [u64; 2],
     ) -> GenericResult<Box<dyn ShmStream>> {
         let &(ref last_stream, ref cvar) = &*self.last_stream;
         let mut stream = last_stream.lock();
@@ -449,6 +452,7 @@ pub mod tests {
                     format,
                     44100,
                     buffer_size,
+                    &[],
                     &shm,
                     [400, 8000],
                 )
@@ -492,6 +496,7 @@ pub mod tests {
                 SampleFormat::S24LE,
                 frame_rate,
                 buffer_size,
+                &[],
                 &shm,
                 [400, 8000],
             )

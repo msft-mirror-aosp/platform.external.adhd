@@ -23,7 +23,6 @@
 #include "cras_system_state.h"
 #include "cras_types.h"
 #include "cras_util.h"
-#include "stream_list.h"
 #include "utlist.h"
 
 /* Handles dumping audio thread debug info back to the client. */
@@ -335,14 +334,6 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 		cras_system_set_mute_locked(
 			((const struct cras_set_system_mute *)msg)->mute);
 		break;
-	case CRAS_SERVER_SET_SYSTEM_CAPTURE_GAIN: {
-		const struct cras_set_system_capture_gain *m =
-			(const struct cras_set_system_capture_gain *)msg;
-		if (!MSG_LEN_VALID(msg, struct cras_set_system_capture_gain))
-			return -EINVAL;
-		cras_system_set_capture_gain(m->gain);
-		break;
-	}
 	case CRAS_SERVER_SET_SYSTEM_CAPTURE_MUTE:
 		if (!MSG_LEN_VALID(msg, struct cras_set_system_mute))
 			return -EINVAL;
@@ -531,25 +522,11 @@ static const struct cras_rclient_ops cras_control_rclient_ops = {
  * the conneciton has succeeded. */
 struct cras_rclient *cras_control_rclient_create(int fd, size_t id)
 {
-	struct cras_rclient *client;
-	struct cras_client_connected msg;
-	int state_fd;
-
-	client = (struct cras_rclient *)calloc(1, sizeof(struct cras_rclient));
-	if (!client)
-		return NULL;
-
-	client->fd = fd;
-	client->id = id;
-	client->ops = &cras_control_rclient_ops;
-	client->supported_directions = CRAS_STREAM_ALL_DIRECTION;
-	/* Filters CRAS_STREAM_UNDEFINED stream out. */
-	client->supported_directions ^=
+	/* Supports all directions but not CRAS_STREAM_UNDEFINED. */
+	int supported_directions =
+		CRAS_STREAM_ALL_DIRECTION ^
 		cras_stream_direction_mask(CRAS_STREAM_UNDEFINED);
 
-	cras_fill_client_connected(&msg, client->id);
-	state_fd = cras_sys_state_shm_fd();
-	client->ops->send_message_to_client(client, &msg.header, &state_fd, 1);
-
-	return client;
+	return rclient_generic_create(fd, id, &cras_control_rclient_ops,
+				      supported_directions);
 }

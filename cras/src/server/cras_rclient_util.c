@@ -12,6 +12,7 @@
 #include "cras_rclient_util.h"
 #include "cras_rstream.h"
 #include "cras_server_metrics.h"
+#include "cras_system_state.h"
 #include "cras_tm.h"
 #include "cras_types.h"
 #include "cras_util.h"
@@ -132,10 +133,15 @@ int rclient_handle_client_stream_connect(struct cras_rclient *client,
 	struct cras_audio_format remote_fmt;
 	struct cras_rstream_config stream_config;
 	int rc, header_fd, samples_fd;
+	size_t samples_size;
 	int stream_fds[2];
 
 	rc = rclient_validate_stream_connect_params(client, msg, aud_fd,
 						    client_shm_fd);
+	remote_fmt = unpack_cras_audio_format(&msg->format);
+	if (rc == 0 && !cras_audio_format_valid(&remote_fmt)) {
+		rc = -EINVAL;
+	}
 	if (rc) {
 		if (client_shm_fd >= 0)
 			close(client_shm_fd);
@@ -144,14 +150,11 @@ int rclient_handle_client_stream_connect(struct cras_rclient *client,
 		goto reply_err;
 	}
 
-	unpack_cras_audio_format(&remote_fmt, &msg->format);
-
 	/* When full, getting an error is preferable to blocking. */
 	cras_make_fd_nonblocking(aud_fd);
 
-	cras_rstream_config_init_with_message(client, msg, &aud_fd,
-					      &client_shm_fd, &remote_fmt,
-					      &stream_config);
+	stream_config = cras_rstream_config_init_with_message(
+		client, msg, &aud_fd, &client_shm_fd, &remote_fmt);
 	rc = stream_list_add(cras_iodev_list_get_stream_list(), &stream_config,
 			     &stream);
 	if (rc)
@@ -159,11 +162,23 @@ int rclient_handle_client_stream_connect(struct cras_rclient *client,
 
 	/* Tell client about the stream setup. */
 	syslog(LOG_DEBUG, "Send connected for stream %x\n", msg->stream_id);
-	cras_fill_client_stream_connected(
-		&stream_connected, 0, /* No error. */
-		msg->stream_id, &remote_fmt,
-		cras_rstream_get_samples_shm_size(stream),
-		cras_rstream_get_effects(stream));
+
+	// Check that shm size is at most UINT32_MAX for non-shm streams.
+	samples_size = cras_rstream_get_samples_shm_size(stream);
+	if (samples_size > UINT32_MAX && stream_config.client_shm_fd < 0) {
+		syslog(LOG_ERR,
+		       "Non client-provided shm stream has samples shm larger "
+		       "than uint32_t: %zu",
+		       samples_size);
+		if (aud_fd >= 0)
+			close(aud_fd);
+		rc = -EINVAL;
+		goto cleanup_config;
+	}
+	cras_fill_client_stream_connected(&stream_connected, 0, /* No error. */
+					  msg->stream_id, &remote_fmt,
+					  samples_size,
+					  cras_rstream_get_effects(stream));
 	reply = &stream_connected.header;
 
 	rc = cras_rstream_get_shm_fds(stream, &header_fd, &samples_fd);
@@ -215,4 +230,30 @@ int rclient_handle_client_stream_disconnect(
 	}
 	return stream_list_rm(cras_iodev_list_get_stream_list(),
 			      msg->stream_id);
+}
+
+/* Creates a client structure and sends a message back informing the client that
+ * the connection has succeeded. */
+struct cras_rclient *rclient_generic_create(int fd, size_t id,
+					    const struct cras_rclient_ops *ops,
+					    int supported_directions)
+{
+	struct cras_rclient *client;
+	struct cras_client_connected msg;
+	int state_fd;
+
+	client = (struct cras_rclient *)calloc(1, sizeof(struct cras_rclient));
+	if (!client)
+		return NULL;
+
+	client->fd = fd;
+	client->id = id;
+	client->ops = ops;
+	client->supported_directions = supported_directions;
+
+	cras_fill_client_connected(&msg, client->id);
+	state_fd = cras_sys_state_shm_fd();
+	client->ops->send_message_to_client(client, &msg.header, &state_fd, 1);
+
+	return client;
 }

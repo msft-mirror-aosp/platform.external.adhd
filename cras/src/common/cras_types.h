@@ -48,6 +48,8 @@ enum CRAS_CONNECTION_TYPE {
 	CRAS_CONTROL, // For legacy client.
 	CRAS_PLAYBACK, // For playback client.
 	CRAS_CAPTURE, // For capture client.
+	CRAS_VMS_LEGACY, // For legacy client in vms.
+	CRAS_VMS_UNIFIED, // For unified client in vms.
 	CRAS_NUM_CONN_TYPE,
 };
 
@@ -270,7 +272,7 @@ enum AUDIO_THREAD_LOG_EVENTS {
 	AUDIO_THREAD_FETCH_STREAM,
 	AUDIO_THREAD_STREAM_ADDED,
 	AUDIO_THREAD_STREAM_REMOVED,
-	AUDIO_THREAD_A2DP_ENCODE,
+	AUDIO_THREAD_A2DP_FLUSH,
 	AUDIO_THREAD_A2DP_WRITE,
 	AUDIO_THREAD_DEV_STREAM_MIX,
 	AUDIO_THREAD_CAPTURE_POST,
@@ -451,16 +453,8 @@ struct __attribute__((__packed__)) cras_audio_thread_snapshot_buffer {
  *    mute_locked - 0 = unlocked, 1 = locked.
  *    suspended - 1 = suspended, 0 = resumed.
  *    capture_gain - Capture gain in dBFS * 100.
- *    capture_gain_target - Target capture gain in dBFS * 100. The actual
- *                          capture gain will be subjected to current
- *                          supported range. When active device/node changes,
- *                          supported range changes accordingly. System state
- *                          should try to re-apply target gain subjected to new
- *                          range.
  *    capture_mute - 0 = unmuted, 1 = muted.
  *    capture_mute_locked - 0 = unlocked, 1 = locked.
- *    min_capture_gain - Min allowed capture gain in dBFS * 100.
- *    max_capture_gain - Max allowed capture gain in dBFS * 100.
  *    num_streams_attached - Total number of streams since server started.
  *    num_output_devs - Number of available output devices.
  *    num_input_devs - Number of available input devices.
@@ -502,11 +496,8 @@ struct __attribute__((packed, aligned(4))) cras_server_state {
 	int32_t mute_locked;
 	int32_t suspended;
 	int32_t capture_gain;
-	int32_t capture_gain_target;
 	int32_t capture_mute;
 	int32_t capture_mute_locked;
-	int32_t min_capture_gain;
-	int32_t max_capture_gain;
 	uint32_t num_streams_attached;
 	uint32_t num_output_devs;
 	uint32_t num_input_devs;

@@ -37,11 +37,13 @@
 //! # }
 //! ```
 
+use std::cmp::min;
 use std::error;
 use std::fmt::{self, Display};
 use std::io::{self, Write};
 use std::os::unix::io::RawFd;
 use std::result::Result;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -64,7 +66,66 @@ impl SampleFormat {
     }
 }
 
+impl Display for SampleFormat {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use SampleFormat::*;
+        match self {
+            U8 => write!(f, "Unsigned 8 bit"),
+            S16LE => write!(f, "Signed 16 bit Little Endian"),
+            S24LE => write!(f, "Signed 24 bit Little Endian"),
+            S32LE => write!(f, "Signed 32 bit Little Endian"),
+        }
+    }
+}
+
+/// Valid directions of an audio stream.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum StreamDirection {
+    Playback,
+    Capture,
+}
+
+/// Valid effects for an audio stream.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum StreamEffect {
+    NoEffect,
+    EchoCancellation,
+}
+
 pub mod capture;
+pub mod shm_streams;
+
+impl Default for StreamEffect {
+    fn default() -> Self {
+        StreamEffect::NoEffect
+    }
+}
+
+/// Errors that are possible from a `StreamEffect`.
+#[derive(Debug)]
+pub enum StreamEffectError {
+    InvalidEffect,
+}
+
+impl error::Error for StreamEffectError {}
+
+impl Display for StreamEffectError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StreamEffectError::InvalidEffect => write!(f, "Must be in [EchoCancellation, aec]"),
+        }
+    }
+}
+
+impl FromStr for StreamEffect {
+    type Err = StreamEffectError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "EchoCancellation" | "aec" => Ok(StreamEffect::EchoCancellation),
+            _ => Err(StreamEffectError::InvalidEffect),
+        }
+    }
+}
 
 /// `StreamSource` creates streams for playback or capture of audio.
 pub trait StreamSource: Send {
@@ -197,7 +258,10 @@ impl<'a> PlaybackBuffer<'a> {
     /// Writes up to `size` bytes directly to this buffer inside of the given callback function.
     pub fn copy_cb<F: FnOnce(&mut [u8])>(&mut self, size: usize, cb: F) {
         // only write complete frames.
-        let len = size / self.buffer.frame_size * self.buffer.frame_size;
+        let len = min(
+            size / self.buffer.frame_size * self.buffer.frame_size,
+            self.buffer.buffer.len() - self.buffer.offset,
+        );
         cb(&mut self.buffer.buffer[self.buffer.offset..(self.buffer.offset + len)]);
         self.buffer.offset += len;
     }

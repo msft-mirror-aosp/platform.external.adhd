@@ -25,6 +25,7 @@
 #define HFP_AG_PROFILE_NAME "Hands-Free Voice gateway"
 #define HFP_AG_PROFILE_PATH "/org/chromium/Cras/Bluetooth/HFPAG"
 #define HFP_VERSION_1_5 0x0105
+#define HFP_VERSION_1_7 0x0107
 #define HSP_AG_PROFILE_NAME "Headset Voice gateway"
 #define HSP_AG_PROFILE_PATH "/org/chromium/Cras/Bluetooth/HSPAG"
 #define HSP_VERSION_1_2 0x0102
@@ -71,6 +72,13 @@
 	"  </attribute>"                                                       \
 	"</record>"
 
+/* The supported features value in +BSRF command response of HFP AG in CRAS */
+#define BSRF_SUPPORTED_FEATURES (AG_ENHANCED_CALL_STATUS | AG_HF_INDICATORS)
+
+/* The "SupportedFeatures" attribute value of HFP AG service record in CRAS. */
+#define SDP_SUPPORTED_FEATURES 0
+#define SDP_SUPPORTED_FEATURES_1_7 FEATURES_AG_WIDE_BAND_SPEECH
+
 /* Object representing the audio gateway role for HFP/HSP.
  * Members:
  *    idev - The input iodev for HFP/HSP.
@@ -106,6 +114,9 @@ static int need_go_sco_pcm(struct cras_bt_device *device)
 static void destroy_audio_gateway(struct audio_gateway *ag)
 {
 	DL_DELETE(connected_ags, ag);
+
+	cras_server_metrics_hfp_battery_indicator(
+		hfp_slc_get_hf_supports_battery_indicator(ag->slc_handle));
 
 	if (need_go_sco_pcm(ag->device)) {
 		if (ag->idev)
@@ -167,7 +178,8 @@ static int cras_hfp_ag_slc_initialized(struct hfp_slc_handle *handle)
 	/* Log the final selected codec given that codec negotiation is
 	 * supported.
 	 */
-	if (hfp_slc_get_hf_codec_negotiation_supported(handle))
+	if (hfp_slc_get_hf_codec_negotiation_supported(handle) &&
+	    hfp_slc_get_ag_codec_negotiation_supported(handle))
 		cras_server_metrics_hfp_wideband_selected_codec(
 			hfp_slc_get_selected_codec(handle));
 
@@ -256,7 +268,7 @@ static int cras_hfp_ag_new_connection(DBusConnection *conn,
 	 * TODO(hychao): AND the two conditions to let bluetooth daemon
 	 * control whether to turn on WBS feature.
 	 */
-	ag_features = CRAS_AG_SUPPORTED_FEATURES;
+	ag_features = BSRF_SUPPORTED_FEATURES;
 	if (cras_system_get_bt_wbs_enabled() &&
 	    cras_bt_adapter_wbs_supported(adapter))
 		ag_features |= AG_CODEC_NEGOTIATION;
@@ -295,13 +307,37 @@ static struct cras_bt_profile cras_hfp_ag_profile = {
 	.uuid = HFP_AG_UUID,
 	.version = HFP_VERSION_1_5,
 	.role = NULL,
-	.features = CRAS_AG_SUPPORTED_FEATURES & 0x1F,
+	.features = SDP_SUPPORTED_FEATURES,
 	.record = NULL,
 	.release = cras_hfp_ag_release,
 	.new_connection = cras_hfp_ag_new_connection,
 	.request_disconnection = cras_hfp_ag_request_disconnection,
 	.cancel = cras_hfp_ag_cancel
 };
+
+int cras_hfp_ag_profile_next_handsfree(DBusConnection *conn, bool enabled)
+{
+	unsigned int target_version = HFP_VERSION_1_5;
+	unsigned int target_feature = SDP_SUPPORTED_FEATURES;
+
+	if (enabled) {
+		target_version = HFP_VERSION_1_7;
+		target_feature = SDP_SUPPORTED_FEATURES_1_7;
+	}
+
+	if (cras_hfp_ag_profile.version == target_version)
+		return 0;
+
+	cras_bt_unregister_profile(conn, &cras_hfp_ag_profile);
+	cras_bt_rm_profile(conn, &cras_hfp_ag_profile);
+
+	cras_hfp_ag_profile.features = target_feature;
+	cras_hfp_ag_profile.version = target_version;
+
+	cras_bt_add_profile(conn, &cras_hfp_ag_profile);
+	cras_bt_register_profile(conn, &cras_hfp_ag_profile);
+	return 0;
+}
 
 int cras_hfp_ag_profile_create(DBusConnection *conn)
 {
@@ -333,7 +369,7 @@ static int cras_hsp_ag_new_connection(DBusConnection *conn,
 	ag->conn = conn;
 	ag->profile = cras_bt_device_profile_from_uuid(profile->uuid);
 	ag->slc_handle =
-		hfp_slc_create(rfcomm_fd, 1, CRAS_AG_SUPPORTED_FEATURES, device,
+		hfp_slc_create(rfcomm_fd, 1, BSRF_SUPPORTED_FEATURES, device,
 			       NULL, cras_hfp_ag_slc_disconnected);
 	DL_APPEND(connected_ags, ag);
 	cras_hfp_ag_slc_initialized(ag->slc_handle);

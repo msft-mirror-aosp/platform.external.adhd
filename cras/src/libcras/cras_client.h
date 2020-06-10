@@ -538,7 +538,7 @@ int cras_client_update_audio_thread_snapshots(struct cras_client *client,
  *        be called when buffer_frames have been captured).
  *    unused - No longer used.
  *    stream_type - media or talk (currently only support "default").
- *    flags - None currently used.
+ *    flags - Currently only used for CRAS_INPUT_STREAM_FLAG.
  *    user_data - Pointer that will be passed to the callback.
  *    aud_cb - Called when audio is needed(playback) or ready(capture). Allowed
  *        return EOF to indicate that the stream should terminate.
@@ -682,20 +682,6 @@ int cras_client_set_stream_volume(struct cras_client *client,
  */
 int cras_client_set_system_volume(struct cras_client *client, size_t volume);
 
-/* Sets the capture gain of the system.
- *
- * Gain is specified in dBFS * 100.  For example 5dB of gain would be specified
- * with an argument of 500, while -10 would be specified with -1000.
- *
- * Args:
- *    client - The client from cras_client_create.
- *    gain - The gain in dBFS * 100.
- * Returns:
- *    0 for success, -EPIPE if there is an I/O error talking to the server, or
- *    -EINVAL if 'client' is invalid.
- */
-int cras_client_set_system_capture_gain(struct cras_client *client, long gain);
-
 /* Sets the mute state of the system.
  *
  * Args:
@@ -771,17 +757,6 @@ int cras_client_set_system_capture_mute_locked(struct cras_client *client,
  */
 size_t cras_client_get_system_volume(const struct cras_client *client);
 
-/* Gets the current system capture gain.
- *
- * Requires that the connection to the server has been established.
- *
- * Args:
- *    client - The client from cras_client_create.
- * Returns:
- *    The current system capture volume in dB * 100.
- */
-long cras_client_get_system_capture_gain(const struct cras_client *client);
-
 /* Gets the current system mute state.
  *
  * Requires that the connection to the server has been established.
@@ -833,27 +808,13 @@ long cras_client_get_system_min_volume(const struct cras_client *client);
  */
 long cras_client_get_system_max_volume(const struct cras_client *client);
 
-/* Gets the current minimum system capture gain.
- *
- * Requires that the connection to the server has been established.
- *
+/* Gets the default output buffer size.
  * Args:
  *    client - The client from cras_client_create.
  * Returns:
- *    The minimum capture gain for the current input device in dBFS * 100.
+ *    Default output buffer size in frames. A negative error on failure.
  */
-long cras_client_get_system_min_capture_gain(const struct cras_client *client);
-
-/* Gets the current maximum system capture gain.
- *
- * Requires that the connection to the server has been established.
- *
- * Args:
- *    client - The client from cras_client_create.
- * Returns:
- *    The maximum capture gain for the current input device in dBFS * 100.
- */
-long cras_client_get_system_max_capture_gain(const struct cras_client *client);
+int cras_client_get_default_output_buffer_size(struct cras_client *client);
 
 /* Gets audio debug info.
  *
@@ -977,7 +938,8 @@ int cras_client_swap_node_left_right(struct cras_client *client,
  * Args:
  *    client - The client from cras_client_create.
  *    node_id - ID of the node.
- *    gain - New capture gain for the node.
+ *    gain - New capture gain for the node, in range (0, 100) which will
+ *        linearly maps to (-4000, 4000) 100*dBFS.
  */
 int cras_client_set_node_capture_gain(struct cras_client *client,
 				      cras_node_id_t node_id, long gain);

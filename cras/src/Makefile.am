@@ -144,7 +144,9 @@ cras_server_SOURCES = \
 	server/cras_control_rclient.c \
 	server/cras_playback_rclient.c \
 	server/cras_capture_rclient.c \
+	server/cras_unified_rclient.c \
 	server/cras_rstream.c \
+	server/cras_rstream_config.c \
 	server/cras_server_metrics.c \
 	server/cras_system_state.c \
 	server/cras_tm.c \
@@ -329,21 +331,18 @@ $(hide_install)-asound_module_ctl_crasLTLIBRARIES: install-libLTLIBRARIES
 # ==== Fuzzer section
 if HAVE_FUZZER
 FUZZERS = \
-	cras_rclient_message_fuzzer
+	cras_rclient_message_fuzzer \
+	cras_hfp_slc_fuzzer
+
 noinst_PROGRAMS += $(FUZZERS)
 
-cras_rclient_message_fuzzer_SOURCES = \
-	fuzz/rclient_message.cc
-
-cras_rclient_message_fuzzer_CPPFLAGS = $(COMMON_CPPFLAGS) \
+FUZZER_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/dsp -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config -I$(top_srcdir)/src/plc \
 	$(DBUS_CFLAGS) $(SBC_CFLAGS)
 
-cras_rclient_message_fuzzer_LDFLAGS = $(FUZZER_LDFLAGS)
-
-cras_rclient_message_fuzzer_LDADD = \
+FUZZER_LDADD = \
 	libcrasmix.la \
 	libcrasserver.la \
 	$(CRAS_SSE4_2) \
@@ -356,6 +355,20 @@ cras_rclient_message_fuzzer_LDADD = \
 	$(SBC_LIBS) \
 	$(DBUS_LIBS) \
 	$(WEBRTC_APM_LIBS)
+
+cras_rclient_message_fuzzer_SOURCES = \
+	fuzz/rclient_message.cc
+
+cras_rclient_message_fuzzer_CPPFLAGS = $(FUZZER_CPPFLAGS)
+cras_rclient_message_fuzzer_LDFLAGS = $(FUZZER_LDFLAGS)
+cras_rclient_message_fuzzer_LDADD = $(FUZZER_LDADD)
+
+cras_hfp_slc_fuzzer_SOURCES = \
+	fuzz/cras_hfp_slc.cc
+
+cras_hfp_slc_fuzzer_CPPFLAGS = $(FUZZER_CPPFLAGS)
+cras_hfp_slc_fuzzer_LDFLAGS = $(FUZZER_LDFLAGS)
+cras_hfp_slc_fuzzer_LDADD = $(FUZZER_LDADD)
 endif
 
 # ==== Tests section
@@ -585,8 +598,7 @@ a2dp_info_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common
 a2dp_info_unittest_LDADD = -lgtest -lpthread
 
-a2dp_iodev_unittest_SOURCES = tests/a2dp_iodev_unittest.cc \
-	server/cras_a2dp_iodev.c common/sfh.c
+a2dp_iodev_unittest_SOURCES = tests/a2dp_iodev_unittest.cc common/sfh.c
 a2dp_iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common $(DBUS_CFLAGS)
 a2dp_iodev_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
@@ -844,7 +856,7 @@ hfp_ag_profile_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 hfp_ag_profile_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
 
 hfp_slc_unittest_SOURCES = tests/hfp_slc_unittest.cc \
-	server/cras_hfp_slc.c
+	server/cras_hfp_slc.c tests/metrics_stub.cc
 hfp_slc_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server $(DBUS_CFLAGS)
 hfp_slc_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
@@ -921,26 +933,30 @@ rate_estimator_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common
 	 -I$(top_srcdir)/src/server/rust/src/headers
 rate_estimator_unittest_LDADD = $(CRAS_RUST) -lgtest -ldl -lpthread
 
-control_rclient_unittest_SOURCES = tests/control_rclient_unittest.cc
+control_rclient_unittest_SOURCES = tests/control_rclient_unittest.cc \
+				   server/cras_rstream_config.c
 control_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server $(CRAS_UT_TMPDIR_CFLAGS)
 control_rclient_unittest_LDADD = -lgtest -lpthread
 
-playback_rclient_unittest_SOURCES = tests/playback_rclient_unittest.cc
+playback_rclient_unittest_SOURCES = tests/playback_rclient_unittest.cc \
+				    server/cras_rstream_config.c
 playback_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server $(CRAS_UT_TMPDIR_CFLAGS)
 playback_rclient_unittest_LDADD = -lgtest -lpthread
 
-capture_rclient_unittest_SOURCES = tests/capture_rclient_unittest.cc
+capture_rclient_unittest_SOURCES = tests/capture_rclient_unittest.cc \
+				   server/cras_rstream_config.c
 capture_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server $(CRAS_UT_TMPDIR_CFLAGS)
 capture_rclient_unittest_LDADD = -lgtest -lpthread
 
 rstream_unittest_SOURCES = tests/rstream_unittest.cc server/cras_rstream.c \
-	common/cras_shm.c tests/metrics_stub.cc $(CRAS_SELINUX_UNITTEST_SOURCES)
+	common/cras_shm.c tests/metrics_stub.cc \
+	server/cras_rstream_config.c $(CRAS_SELINUX_UNITTEST_SOURCES)
 rstream_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	 -I$(top_srcdir)/src/server $(SELINUX_CFLAGS)
 rstream_unittest_LDADD = $(SELINUX_LIBS) \

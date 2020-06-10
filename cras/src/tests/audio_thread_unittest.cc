@@ -1311,7 +1311,9 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev* odev, unsigned int frames) {
   return 0;
 }
 
-int cras_iodev_output_underrun(struct cras_iodev* odev) {
+int cras_iodev_output_underrun(struct cras_iodev* odev,
+                               unsigned int hw_level,
+                               unsigned int frames_written) {
   cras_iodev_output_underrun_called++;
   return 0;
 }
@@ -1442,6 +1444,11 @@ int cras_audio_thread_event_drop_samples() {
   return 0;
 }
 
+float input_data_get_software_gain_scaler(struct input_data* data,
+                                          float idev_sw_gain_scaler,
+                                          struct cras_rstream* stream) {
+  return 1.0;
+}
 }  // extern "C"
 
 int main(int argc, char** argv) {

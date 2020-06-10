@@ -18,6 +18,7 @@
 #include "cras_types.h"
 #include "cras_system_state.h"
 #include "server_stream.h"
+#include "softvol_curve.h"
 #include "stream_list.h"
 #include "test_iodev.h"
 #include "utlist.h"
@@ -254,6 +255,7 @@ static int fill_node_list(struct iodev_list *list,
 				dev->is_enabled && (dev->active_node == node);
 			node_info->volume = node->volume;
 			node_info->capture_gain = node->capture_gain;
+			node_info->ui_gain_scaler = node->ui_gain_scaler;
 			node_info->left_right_swapped =
 				node->left_right_swapped;
 			node_info->stable_id = node->stable_id;
@@ -555,18 +557,6 @@ void sys_suspend_change(void *arg, int suspended)
 		resume_devs();
 }
 
-/* Called when the system capture gain changes.  Pass the current capture_gain
- * setting to the default input if it is active. */
-void sys_cap_gain_change(void *context, int32_t gain)
-{
-	struct cras_iodev *dev;
-
-	DL_FOREACH (devs[CRAS_STREAM_INPUT].iodevs, dev) {
-		if (dev->set_capture_gain && cras_iodev_is_open(dev))
-			dev->set_capture_gain(dev);
-	}
-}
-
 /* Called when the system capture mute state changes.  Pass the current capture
  * mute setting to the default input if it is active. */
 static void sys_cap_mute_change(void *context, int muted, int mute_locked)
@@ -634,7 +624,9 @@ static int add_stream_to_open_devs(struct cras_rstream *stream,
 	if (stream->apm_list) {
 		for (i = 0; i < num_iodevs; i++)
 			cras_apm_list_add_apm(stream->apm_list, iodevs[i],
-					      iodevs[i]->format);
+					      iodevs[i]->format,
+					      cras_iodev_is_aec_use_case(
+						      iodevs[i]->active_node));
 	}
 	return audio_thread_add_stream(audio_thread, stream, iodevs,
 				       num_iodevs);
@@ -1033,7 +1025,6 @@ void cras_iodev_list_init()
 	memset(&observer_ops, 0, sizeof(observer_ops));
 	observer_ops.output_volume_changed = sys_vol_change;
 	observer_ops.output_mute_changed = sys_mute_change;
-	observer_ops.capture_gain_changed = sys_cap_gain_change;
 	observer_ops.capture_mute_changed = sys_cap_mute_change;
 	observer_ops.suspend_changed = sys_suspend_change;
 	list_observer = cras_observer_add(&observer_ops, NULL);
@@ -1609,7 +1600,7 @@ static int set_node_volume(struct cras_iodev *iodev, unsigned int node_idx,
 }
 
 static int set_node_capture_gain(struct cras_iodev *iodev,
-				 unsigned int node_idx, int capture_gain)
+				 unsigned int node_idx, int value)
 {
 	struct cras_ionode *node;
 
@@ -1617,7 +1608,17 @@ static int set_node_capture_gain(struct cras_iodev *iodev,
 	if (!node)
 		return -EINVAL;
 
-	node->capture_gain = capture_gain;
+	/* Assert value in range 0 - 100. */
+	if (value < 0)
+		value = 0;
+	if (value > 100)
+		value = 100;
+
+	/* Linear maps (0, 100) to (-4000, 4000) dBFS. Calculate and store
+	 * corresponding scaler in ui_gain_scaler. */
+	node->ui_gain_scaler =
+		convert_softvol_scaler_from_dB((value - 50) * 80);
+
 	if (iodev->set_capture_gain)
 		iodev->set_capture_gain(iodev);
 	cras_iodev_list_notify_node_capture_gain(node);

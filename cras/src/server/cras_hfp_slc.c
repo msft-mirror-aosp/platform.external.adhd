@@ -10,8 +10,10 @@
 
 #include "cras_bt_device.h"
 #include "cras_bt_log.h"
+#include "cras_observer.h"
 #include "cras_telephony.h"
 #include "cras_hfp_slc.h"
+#include "cras_server_metrics.h"
 #include "cras_system_state.h"
 #include "cras_tm.h"
 
@@ -20,7 +22,7 @@
 
 /* The timeout between service level initialized and codec negotiation
  * completed. */
-#define CODEC_NEGOTIATION_TIMEOUT_MS 500
+#define CODEC_NEGOTIATION_TIMEOUT_MS 10000
 #define SLC_BUF_SIZE_BYTES 256
 
 /* Indicator update command response and indicator indices.
@@ -64,6 +66,10 @@
  *    hf_codec_supported - Flags to indicate if codec is supported in HF.
  *    hf_supports_codec_negotiation - If the connected HF supports codec
  *        negotiation.
+ *    hf_supports_battery_indicator - Bit map of battery indicator support of
+ *    	connected HF.
+ *    hf_battery - Current battery level of HF reported by the HF. The data
+ *    range should be 0 ~ 100. Use -1 for no battery level reported.
  *    preferred_codec - CVSD or mSBC based on the situation and strategy. This
  *        need not to be equal to selected_codec because codec negotiation
  *        process may fail.
@@ -92,6 +98,8 @@ struct hfp_slc_handle {
 	int ag_supported_features;
 	bool hf_codec_supported[HFP_MAX_CODECS];
 	int hf_supports_codec_negotiation;
+	int hf_supports_battery_indicator;
+	int hf_battery;
 	int preferred_codec;
 	int selected_codec;
 	int pending_codec_negotiation;
@@ -181,6 +189,10 @@ static int call_waiting_notify(struct hfp_slc_handle *handle, const char *buf)
  */
 static int cli_notification(struct hfp_slc_handle *handle, const char *cmd)
 {
+	if (strlen(cmd) < 9) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
 	handle->cli_active = (cmd[8] == '1');
 	return hfp_send(handle, AT_CMD("OK"));
 }
@@ -194,6 +206,8 @@ static int dial_number(struct hfp_slc_handle *handle, const char *cmd)
 	int rc, cmd_len;
 
 	cmd_len = strlen(cmd);
+	if (cmd_len < 4)
+		goto error_out;
 
 	if (cmd[3] == '>') {
 		/* Handle memory dial. Extract memory location from command
@@ -214,6 +228,10 @@ static int dial_number(struct hfp_slc_handle *handle, const char *cmd)
 
 	handle->telephony->callsetup = 2;
 	return hfp_send_ind_event_report(handle, CALLSETUP_IND_INDEX, 2);
+
+error_out:
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	return hfp_send(handle, AT_CMD("ERROR"));
 }
 
 /* AT+VTS command to generate a DTMF code. Mandatory per spec 4.27. */
@@ -247,6 +265,7 @@ static void initialize_slc_handle(struct cras_timer *timer, void *arg)
 	 */
 	if ((handle->selected_codec == HFP_CODEC_UNUSED) &&
 	    handle->hf_codec_supported[HFP_CODEC_ID_MSBC]) {
+		syslog(LOG_ERR, "Failed to enable mSBC, fallback to CVSD");
 		handle->preferred_codec = HFP_CODEC_ID_CVSD;
 		select_preferred_codec(handle);
 	}
@@ -301,7 +320,8 @@ static int bluetooth_codec_selection(struct hfp_slc_handle *handle,
  */
 static void choose_codec_and_init_slc(struct hfp_slc_handle *handle)
 {
-	if (handle->hf_supports_codec_negotiation &&
+	if (hfp_slc_get_ag_codec_negotiation_supported(handle) &&
+	    handle->hf_supports_codec_negotiation &&
 	    handle->hf_codec_supported[HFP_CODEC_ID_MSBC]) {
 		/* Sets preferred codec to mSBC, and schedule callback to
 		 * select preferred codec until reply received or timeout.
@@ -318,6 +338,112 @@ static void choose_codec_and_init_slc(struct hfp_slc_handle *handle)
 	} else {
 		initialize_slc_handle(NULL, (void *)handle);
 	}
+}
+
+/*
+ * AT+IPHONEACCEV command from HF to report state change.You can find details
+ * of this command in the Accessory Design Guidelines for Apple Devices R11
+ * section 16.1.
+ */
+static int apple_accessory_state_change(struct hfp_slc_handle *handle,
+					const char *cmd)
+{
+	char *tokens, *num, *key, *val;
+	int i, level;
+
+	/* AT+IPHONEACCEV=Number of key/value pairs,key1,val1,key2,val2,...
+	 * Number of key/value pairs: The number of parameters coming next.
+	 * key: the type of change being reported:
+         *      1 = Battery Level
+         *      2 = Dock State
+         * val: the value of the change:
+         * Battery Level: string value between '0' and '9'
+         * Dock State: 0 = undocked, 1 = docked
+	 */
+	tokens = strdup(cmd);
+	strtok(tokens, "=");
+	num = strtok(NULL, ",");
+	if (!num) {
+		free(tokens);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
+
+	for (i = 0; i < atoi(num); i++) {
+		key = strtok(NULL, ",");
+		val = strtok(NULL, ",");
+		if (!key || !val) {
+			syslog(LOG_WARNING,
+			       "IPHONEACCEV: Expected %d kv pairs but got %d",
+			       atoi(num), i);
+			break;
+		}
+
+		if (atoi(key) == 1) {
+			level = atoi(val);
+			if (level >= 0 && level < 10) {
+				cras_server_metrics_hfp_battery_report(
+					CRAS_HFP_BATTERY_INDICATOR_APPLE);
+				level = (level + 1) * 10;
+				if (handle->hf_battery != level) {
+					handle->hf_battery = level;
+					cras_observer_notify_bt_battery_changed(
+						cras_bt_device_address(
+							handle->device),
+						(uint32_t)(level));
+				}
+			} else {
+				syslog(LOG_ERR,
+				       "Get invalid battery status from cmd:%s",
+				       cmd);
+			}
+		}
+	}
+	free(tokens);
+	return hfp_send(handle, AT_CMD("OK"));
+}
+
+/*
+ * AT+XAPL command from HF to enable Apple custom features. You can find details
+ * of it in the Accessory Design Guidelines for Apple Devices R11 section 15.1.
+ */
+static int apple_supported_features(struct hfp_slc_handle *handle,
+				    const char *cmd)
+{
+	char *tokens, *features;
+	int apple_features, err;
+	char buf[64];
+
+	/* AT+XAPL=<vendorID>-<productID>-<version>,<features>
+	 * Parse <features>, the only token we care about.
+	 */
+	tokens = strdup(cmd);
+	strtok(tokens, "=");
+
+	strtok(NULL, ",");
+	features = strtok(NULL, ",");
+	if (!features)
+		goto error_out;
+
+	apple_features = atoi(features);
+
+	if (apple_features & APL_BATTERY)
+		handle->hf_supports_battery_indicator |=
+			CRAS_HFP_BATTERY_INDICATOR_APPLE;
+
+	snprintf(buf, 64, AT_CMD("+XAPL=iPhone,%d"),
+		 CRAS_APL_SUPPORTED_FEATURES);
+	err = hfp_send(handle, buf);
+	if (err)
+		goto error_out;
+
+	err = hfp_send(handle, AT_CMD("OK"));
+	free(tokens);
+	return err;
+
+error_out:
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	free(tokens);
+	return hfp_send(handle, AT_CMD("ERROR"));
 }
 
 /* Handles the event when headset reports its available codecs list. */
@@ -502,6 +628,11 @@ static int report_indicators(struct hfp_slc_handle *handle, const char *cmd)
 	int err;
 	char buf[64];
 
+	if (strlen(cmd) < 8) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
+
 	if (cmd[7] == '=') {
 		/* Indicator update test command "AT+CIND=?" */
 		err = hfp_send(handle, AT_CMD(INDICATOR_UPDATE_RSP));
@@ -533,8 +664,132 @@ static int report_indicators(struct hfp_slc_handle *handle, const char *cmd)
 static int indicator_activation(struct hfp_slc_handle *handle, const char *cmd)
 {
 	/* AT+BIA=[[<indrep 1>][,[<indrep 2>][,...[,[<indrep n>]]]]] */
-	syslog(LOG_ERR, "Bluetooth indicator activation command %s", cmd);
+	syslog(LOG_INFO, "Bluetooth indicator activation command %s", cmd);
 	return hfp_send(handle, AT_CMD("OK"));
+}
+
+/* AT+BIND command to report, query and activate Generic Status Indicators.
+ * It is sent by the HF if both AG and HF support the HF indicator feature.
+ */
+static int indicator_support(struct hfp_slc_handle *handle, const char *cmd)
+{
+	char *tokens, *key;
+	int err, cmd_len;
+
+	cmd_len = strlen(cmd);
+	if (cmd_len < 8)
+		goto error_out;
+
+	if (cmd[7] == '=') {
+		/* AT+BIND=? (Read AG supported indicators) */
+		if (cmd_len > 8 && cmd[8] == '?') {
+			/* +BIND: (<a>,<b>,<c>,...,<n>) (Response to AT+BIND=?)
+			 * <a> ... <n>: 0-65535, entered as decimal unsigned
+			 * integer values without leading zeros, referencing an
+			 * HF indicator assigned number.
+			 * 1 is for Enhanced Driver Status.
+			 * 2 is for Battery Level.
+			 * For the list of HF indicator assigned number, you can
+			 * check the  Bluetooth SIG Assigned Numbers web page.
+			 */
+			err = hfp_send(handle, AT_CMD("+BIND: (1,2)"));
+			if (err < 0)
+				return err;
+		}
+		/* AT+BIND=<a>,<b>,...,<n>(List HF supported indicators) */
+		else {
+			tokens = strdup(cmd);
+			strtok(tokens, "=");
+			key = strtok(NULL, ",");
+			while (key != NULL) {
+				if (atoi(key) == 2)
+					handle->hf_supports_battery_indicator |=
+						CRAS_HFP_BATTERY_INDICATOR_HFP;
+				key = strtok(NULL, ",");
+			}
+			free(tokens);
+		}
+	}
+	/* AT+BIND? (Read AG enabled/disabled status of indicators) */
+	else if (cmd[7] == '?') {
+		/* +BIND: <a>,<state> (Unsolicited or Response to AT+BIND?)
+		 * This response enables the AG to notify the HF which HF
+		 * indicators are supported and their state, enabled or
+		 * disabled.
+		 * <a>: 1 or 2, referencing an HF indicator assigned number.
+		 * <state>: 0-1, entered as integer values, where
+		 * 0 = disabled, no value changes shall be sent for this
+		 * indicator
+		 * 1 = enabled, value changes may be sent for this indicator
+		 */
+
+		/* We support 1:enhanced driver status but disable it just for
+		 * passing PTS test case HFP/AG/SLC/BV-09-I
+		 */
+		err = hfp_send(handle, AT_CMD("+BIND: 1,0"));
+		if (err < 0)
+			return err;
+
+		err = hfp_send(handle, AT_CMD("+BIND: 2,1"));
+		if (err < 0)
+			return err;
+	} else {
+		goto error_out;
+	}
+	/* This OK reply is required after both +BIND AT commands. It also
+	 * covers the AT+BIND= <a>,<b>,...,<n> case.
+	 */
+	return hfp_send(handle, AT_CMD("OK"));
+
+error_out:
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	return hfp_send(handle, AT_CMD("ERROR"));
+}
+
+/* AT+BIEV command reports updated values of enabled HF indicators to the AG.
+ */
+static int indicator_state_change(struct hfp_slc_handle *handle,
+				  const char *cmd)
+{
+	char *tokens, *key, *val;
+	int level;
+	/* AT+BIEV= <assigned number>,<value> (Update value of indicator)
+	 * We only care about battery level, which is with assigned number 2.
+	 * The valid value for battery level should be 0 ~ 100 defined by the
+	 * spec.
+	 */
+	tokens = strdup(cmd);
+	strtok(tokens, "=");
+	key = strtok(NULL, ",");
+	if (!key)
+		goto error_out;
+
+	if (atoi(key) == 2) {
+		val = strtok(NULL, ",");
+		if (!val)
+			goto error_out;
+		level = atoi(val);
+		if (level >= 0 && level <= 100) {
+			cras_server_metrics_hfp_battery_report(
+				CRAS_HFP_BATTERY_INDICATOR_HFP);
+			if (handle->hf_battery != level) {
+				handle->hf_battery = level;
+				cras_observer_notify_bt_battery_changed(
+					cras_bt_device_address(handle->device),
+					(uint32_t)(level));
+			}
+		} else {
+			syslog(LOG_ERR,
+			       "Get invalid battery status from cmd:%s", cmd);
+		}
+	}
+	free(tokens);
+	return hfp_send(handle, AT_CMD("OK"));
+
+error_out:
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	free(tokens);
+	return hfp_send(handle, AT_CMD("ERROR"));
 }
 
 /* AT+VGM and AT+VGS command reports the current mic and speaker gain
@@ -545,14 +800,20 @@ static int signal_gain_setting(struct hfp_slc_handle *handle, const char *cmd)
 	int gain;
 
 	if (strlen(cmd) < 8) {
-		syslog(LOG_ERR, "Invalid gain setting command %s", cmd);
-		return -EINVAL;
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
 	}
 
 	/* Map 0 to the smallest non-zero scale 6/100, and 15 to
 	 * 100/100 full. */
 	if (cmd[5] == 'S') {
 		gain = atoi(&cmd[7]);
+		if (gain < 0 || gain > 15) {
+			syslog(LOG_ERR,
+			       "signal_gain_setting: gain %d is not between 0 and 15",
+			       gain);
+			return hfp_send(handle, AT_CMD("ERROR"));
+		}
 		cras_bt_device_update_hardware_volume(handle->device,
 						      (gain + 1) * 100 / 16);
 	}
@@ -578,14 +839,18 @@ static int supported_features(struct hfp_slc_handle *handle, const char *cmd)
 	char response[128];
 	char *tokens, *features;
 
-	if (strlen(cmd) < 9)
-		return -EINVAL;
+	if (strlen(cmd) < 9) {
+		syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+		return hfp_send(handle, AT_CMD("ERROR"));
+	}
 
 	handle->hf_supports_codec_negotiation = 0;
 
 	tokens = strdup(cmd);
 	strtok(tokens, "=");
 	features = strtok(NULL, ",");
+	if (!features)
+		goto error_out;
 
 	hf_features = atoi(features);
 	BTLOG(btlog, BT_HFP_SUPPORTED_FEATURES, 0, hf_features);
@@ -606,6 +871,11 @@ static int supported_features(struct hfp_slc_handle *handle, const char *cmd)
 		return err;
 
 	return hfp_send(handle, AT_CMD("OK"));
+
+error_out:
+	free(tokens);
+	syslog(LOG_ERR, "%s: malformed command: '%s'", __func__, cmd);
+	return hfp_send(handle, AT_CMD("ERROR"));
 }
 
 int hfp_event_speaker_gain(struct hfp_slc_handle *handle, int gain)
@@ -668,27 +938,32 @@ static int terminate_call(struct hfp_slc_handle *handle, const char *cmd)
  *                     AT+CMER= -->
  *                 <-- OK
  */
-static struct at_command at_commands[] = { { "ATA", answer_call },
-					   { "ATD", dial_number },
-					   { "AT+BAC", available_codecs },
-					   { "AT+BCS",
-					     bluetooth_codec_selection },
-					   { "AT+BIA", indicator_activation },
-					   { "AT+BLDN", last_dialed_number },
-					   { "AT+BRSF", supported_features },
-					   { "AT+CCWA", call_waiting_notify },
-					   { "AT+CHUP", terminate_call },
-					   { "AT+CIND", report_indicators },
-					   { "AT+CKPD", key_press },
-					   { "AT+CLCC", list_current_calls },
-					   { "AT+CLIP", cli_notification },
-					   { "AT+CMEE", extended_errors },
-					   { "AT+CMER", event_reporting },
-					   { "AT+CNUM", subscriber_number },
-					   { "AT+COPS", operator_selection },
-					   { "AT+VG", signal_gain_setting },
-					   { "AT+VTS", dtmf_tone },
-					   { 0 } };
+static struct at_command at_commands[] = {
+	{ "ATA", answer_call },
+	{ "ATD", dial_number },
+	{ "AT+BAC", available_codecs },
+	{ "AT+BCS", bluetooth_codec_selection },
+	{ "AT+BIA", indicator_activation },
+	{ "AT+BIEV", indicator_state_change },
+	{ "AT+BIND", indicator_support },
+	{ "AT+BLDN", last_dialed_number },
+	{ "AT+BRSF", supported_features },
+	{ "AT+CCWA", call_waiting_notify },
+	{ "AT+CHUP", terminate_call },
+	{ "AT+CIND", report_indicators },
+	{ "AT+CKPD", key_press },
+	{ "AT+CLCC", list_current_calls },
+	{ "AT+CLIP", cli_notification },
+	{ "AT+CMEE", extended_errors },
+	{ "AT+CMER", event_reporting },
+	{ "AT+CNUM", subscriber_number },
+	{ "AT+COPS", operator_selection },
+	{ "AT+IPHONEACCEV", apple_accessory_state_change },
+	{ "AT+VG", signal_gain_setting },
+	{ "AT+VTS", dtmf_tone },
+	{ "AT+XAPL", apple_supported_features },
+	{ 0 }
+};
 
 static int handle_at_command(struct hfp_slc_handle *slc_handle, const char *cmd)
 {
@@ -700,6 +975,12 @@ static int handle_at_command(struct hfp_slc_handle *slc_handle, const char *cmd)
 
 	syslog(LOG_DEBUG, "AT command %s not supported", cmd);
 	return hfp_send(slc_handle, AT_CMD("ERROR"));
+}
+
+int handle_at_command_for_test(struct hfp_slc_handle *slc_handle,
+			       const char *cmd)
+{
+	return handle_at_command(slc_handle, cmd);
 }
 
 static void slc_watch_callback(void *arg)
@@ -769,6 +1050,9 @@ struct hfp_slc_handle *hfp_slc_create(int fd, int is_hsp,
 {
 	struct hfp_slc_handle *handle;
 
+	if (!disconnect_cb)
+		return NULL;
+
 	handle = (struct hfp_slc_handle *)calloc(1, sizeof(*handle));
 	if (!handle)
 		return NULL;
@@ -787,7 +1071,8 @@ struct hfp_slc_handle *hfp_slc_create(int fd, int is_hsp,
 	handle->telephony = cras_telephony_get();
 	handle->preferred_codec = HFP_CODEC_ID_CVSD;
 	handle->selected_codec = HFP_CODEC_UNUSED;
-
+	handle->hf_supports_battery_indicator = CRAS_HFP_BATTERY_INDICATOR_NONE;
+	handle->hf_battery = -1;
 	cras_system_add_select_fd(handle->rfcomm_fd, slc_watch_callback,
 				  handle);
 
@@ -895,7 +1180,17 @@ int hfp_event_set_service(struct hfp_slc_handle *handle, int avail)
 	return hfp_send_ind_event_report(handle, SERVICE_IND_INDEX, avail);
 }
 
+int hfp_slc_get_ag_codec_negotiation_supported(struct hfp_slc_handle *handle)
+{
+	return handle->ag_supported_features & AG_CODEC_NEGOTIATION;
+}
+
 int hfp_slc_get_hf_codec_negotiation_supported(struct hfp_slc_handle *handle)
 {
 	return handle->hf_supports_codec_negotiation;
+}
+
+int hfp_slc_get_hf_supports_battery_indicator(struct hfp_slc_handle *handle)
+{
+	return handle->hf_supports_battery_indicator;
 }

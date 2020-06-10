@@ -23,7 +23,7 @@
 /* Default to -6 dBFS as 90% of CrOS boards use microphone with -26dBFS
  * sensitivity under 94dB SPL @ 1kHz and we generally added 20dB gain to it.
  * This is a temporary value that should be refined when the standard process
- * measuring intrinsic volume is built. */
+ * measuring intrinsic sensitivity is built. */
 #define DEFAULT_CAPTURE_VOLUME_DBFS -600
 /* Default to 1--dB of range for playback and capture. */
 #define DEFAULT_MIN_VOLUME_DBFS -10000
@@ -57,9 +57,8 @@ void cras_system_set_volume(size_t volume);
 /* Gets the current system volume. */
 size_t cras_system_get_volume();
 
-/* Sets the system capture volume.  Will be applied by the active device. */
-void cras_system_set_capture_gain(long gain);
-/* Gets the current system capture volume. */
+/* Gets the current system capture volume. As we remove the support of setting
+ * system capture gain, it should always be DEFAULT_CAPTURE_GAIN now. */
 long cras_system_get_capture_gain();
 
 /* Sets if the system is muted by the user. */
@@ -108,19 +107,6 @@ long cras_system_get_min_volume();
 /* Returns the dB value when volume = CRAS_MAX_SYSTEM_VOLUME, in dB * 100. */
 long cras_system_get_max_volume();
 
-/* Sets the limits in dB * 100 of the MAX and MIN capture gain.  This will allow
- * clients to query what range of control is available.  Both arguments are
- * specified as dB * 100.
- * Args:
- *     min - minimum allowed capture gain.
- *     max - maximum allowed capture gaax.
- */
-void cras_system_set_capture_gain_limits(long min, long max);
-/* Returns the max value allowed for capture gain in dB * 100. */
-long cras_system_get_min_capture_gain();
-/* Returns the min value allowed for capture gain in dB * 100. */
-long cras_system_get_max_capture_gain();
-
 /* Returns the default value of output buffer size in frames. */
 int cras_system_get_default_output_buffer_size();
 
@@ -135,6 +121,12 @@ void cras_system_set_bt_wbs_enabled(bool enabled);
 
 /* Gets the elable flag of bluetooth wideband speech feature. */
 bool cras_system_get_bt_wbs_enabled();
+
+/* Sets the flag to enable or disable Bluetooth fixed A2DP packet size. */
+void cras_system_set_bt_fix_a2dp_packet_size_enabled(bool enabled);
+
+/* Gets the flag of Bluetooth fixed A2DP packet size. */
+bool cras_system_get_bt_fix_a2dp_packet_size_enabled();
 
 /* Adds a card at the given index to the system.  When a new card is found
  * (through a udev event notification) this will add the card to the system,

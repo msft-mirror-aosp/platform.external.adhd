@@ -364,16 +364,16 @@ static void print_node_info(const struct cras_ionode_info *nodes, int num_nodes,
 {
 	unsigned i;
 
-	printf("\tStable Id\t ID\t%4s   Plugged\tL/R swapped\t      "
+	printf("\tStable Id\t ID\t%4s  UI       Plugged\tL/R swapped\t      "
 	       "Time Hotword\tType\t\t Name\n",
 	       is_input ? "Gain" : " Vol");
 	for (i = 0; i < num_nodes; i++)
-		printf("\t(%08x)\t%u:%u\t%5g  %7s\t%14s\t%10ld %-7s\t%-16s%c%s\n",
+		printf("\t(%08x)\t%u:%u\t%5g %f %7s\t%14s\t%10ld %-7s\t%-16s%c%s\n",
 		       nodes[i].stable_id, nodes[i].iodev_idx,
 		       nodes[i].ionode_idx,
 		       is_input ? nodes[i].capture_gain / 100.0 :
 				  (double)nodes[i].volume,
-		       nodes[i].plugged ? "yes" : "no",
+		       nodes[i].ui_gain_scaler, nodes[i].plugged ? "yes" : "no",
 		       nodes[i].left_right_swapped ? "yes" : "no",
 		       (long)nodes[i].plugged_time.tv_sec,
 		       nodes[i].active_hotword_model, nodes[i].type,
@@ -440,13 +440,11 @@ static void print_active_stream_info(struct cras_client *client)
 static void print_system_volumes(struct cras_client *client)
 {
 	printf("System Volume (0-100): %zu %s\n"
-	       "Capture Gain (%.2f - %.2f): %.2fdB %s\n",
+	       "Capture Muted : %s\n",
 	       cras_client_get_system_volume(client),
 	       cras_client_get_system_muted(client) ? "(Muted)" : "",
-	       cras_client_get_system_min_capture_gain(client) / 100.0,
-	       cras_client_get_system_max_capture_gain(client) / 100.0,
-	       cras_client_get_system_capture_gain(client) / 100.0,
-	       cras_client_get_system_capture_muted(client) ? "(Muted)" : "");
+	       cras_client_get_system_capture_muted(client) ? "Muted" :
+							      "Not muted");
 }
 
 static void print_user_muted(struct cras_client *client)
@@ -502,6 +500,7 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 
 	/* Prepare realtime string for arguments. */
 	switch (tag) {
+	case AUDIO_THREAD_A2DP_FLUSH:
 	case AUDIO_THREAD_READ_AUDIO_TSTAMP:
 	case AUDIO_THREAD_FILL_AUDIO_TSTAMP:
 	case AUDIO_THREAD_STREAM_RESCHEDULE:
@@ -579,9 +578,10 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 	case AUDIO_THREAD_STREAM_REMOVED:
 		printf("%-30s id:%x\n", "STREAM_REMOVED", data1);
 		break;
-	case AUDIO_THREAD_A2DP_ENCODE:
-		printf("%-30s proc:%d queued:%u readable:%u\n", "A2DP_ENCODE",
-		       data1, data2, data3);
+		break;
+	case AUDIO_THREAD_A2DP_FLUSH:
+		printf("%-30s state %u next flush time:%s.%09u\n", "A2DP_FLUSH",
+		       data1, time_str, nsec);
 		break;
 	case AUDIO_THREAD_A2DP_WRITE:
 		printf("%-30s written:%d queued:%u\n", "A2DP_WRITE", data1,
@@ -1069,7 +1069,6 @@ static int run_file_io_stream(struct cras_client *client, int fd,
 	struct timespec sleep_ts;
 	float volume_scaler = 1.0;
 	size_t sys_volume = 100;
-	long cap_gain = 0;
 	int mute = 0;
 	int8_t layout[CRAS_CH_MAX];
 
@@ -1218,14 +1217,6 @@ static int run_file_io_stream(struct cras_client *client, int fd,
 			sys_volume = sys_volume == 0 ? 0 : sys_volume - 1;
 			cras_client_set_system_volume(client, sys_volume);
 			break;
-		case 'K':
-			cap_gain = MIN(cap_gain + 100, 5000);
-			cras_client_set_system_capture_gain(client, cap_gain);
-			break;
-		case 'J':
-			cap_gain = cap_gain == -5000 ? -5000 : cap_gain - 100;
-			cras_client_set_system_capture_gain(client, cap_gain);
-			break;
 		case 'm':
 			mute = !mute;
 			cras_client_set_system_mute(client, mute);
@@ -1238,19 +1229,16 @@ static int run_file_io_stream(struct cras_client *client, int fd,
 			break;
 		case 'v':
 			printf("Volume: %zu%s Min dB: %ld Max dB: %ld\n"
-			       "Capture: %ld%s Min dB: %ld Max dB: %ld\n",
+			       "Capture: %s\n",
 			       cras_client_get_system_volume(client),
 			       cras_client_get_system_muted(client) ?
 				       "(Muted)" :
 				       "",
 			       cras_client_get_system_min_volume(client),
 			       cras_client_get_system_max_volume(client),
-			       cras_client_get_system_capture_gain(client),
 			       cras_client_get_system_capture_muted(client) ?
-				       "(Muted)" :
-				       "",
-			       cras_client_get_system_min_capture_gain(client),
-			       cras_client_get_system_max_capture_gain(client));
+				       "Muted" :
+				       "Not muted");
 			break;
 		case '\'':
 			play_short_sound_periods_left =
@@ -1474,6 +1462,9 @@ static void cras_show_continuous_atlog(struct cras_client *client)
 
 	fill_time_offset(&sec_offset, &nsec_offset);
 
+	/* Set stdout buffer to line buffered mode. */
+	setlinebuf(stdout);
+
 	while (1) {
 		len = cras_client_read_atlog(client, &atlog_read_idx, &missing,
 					     &log);
@@ -1584,7 +1575,11 @@ static void show_usage()
 	       "                                      "
 	       "          1 - For playback client.\n"
 	       "                                      "
-	       "          2 - For capture client.\n");
+	       "          2 - For capture client.\n"
+	       "                                      "
+	       "          3 - For legacy client in vms.\n"
+	       "                                      "
+	       "          4 - For unified client in vms.\n");
 	printf("--dump_audio_thread - "
 	       "Dumps audio thread info.\n");
 	printf("--dump_bt - "
@@ -1787,15 +1782,6 @@ int main(int argc, char **argv)
 			if (!supported_formats[i].name) {
 				printf("Unsupported format: %s\n", optarg);
 				return -EINVAL;
-			}
-			break;
-		}
-		case 'g': {
-			long gain = atol(optarg);
-			rc = cras_client_set_system_capture_gain(client, gain);
-			if (rc < 0) {
-				fprintf(stderr, "problem setting capture\n");
-				goto destroy_exit;
 			}
 			break;
 		}

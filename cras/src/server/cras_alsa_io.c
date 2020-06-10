@@ -115,7 +115,6 @@ struct alsa_input_node {
  * jack_always_plugged - true if this node is always plugged even without jack.
  * enable_htimestamp - True when the device's htimestamp is used.
  * handle - Handle to the opened ALSA device.
- * num_underruns - Number of times we have run out of data (playback only).
  * num_severe_underruns - Number of times we have run out of data badly.
                           Unlike num_underruns which records for the duration
                           where device is opened, num_severe_underruns records
@@ -151,7 +150,6 @@ struct alsa_io {
 	int jack_always_plugged;
 	int enable_htimestamp;
 	snd_pcm_t *handle;
-	unsigned int num_underruns;
 	unsigned int num_severe_underruns;
 	snd_pcm_stream_t alsa_stream;
 	struct cras_alsa_mixer *mixer;
@@ -415,7 +413,6 @@ static int configure_dev(struct cras_iodev *iodev)
 	 */
 	if (iodev->format == NULL)
 		return -EINVAL;
-	aio->num_underruns = 0;
 	aio->free_running = 0;
 	aio->filled_zeros_for_draining = 0;
 	aio->severe_underrun_frames =
@@ -768,8 +765,7 @@ static void set_alsa_capture_gain(struct cras_iodev *iodev)
 {
 	const struct alsa_io *aio = (const struct alsa_io *)iodev;
 	struct alsa_input_node *ain;
-	long gain;
-
+	long min_capture_gain, max_capture_gain, gain;
 	assert(aio);
 	if (aio->mixer == NULL)
 		return;
@@ -778,19 +774,29 @@ static void set_alsa_capture_gain(struct cras_iodev *iodev)
 	if (!has_handle(aio))
 		return;
 
+	ain = get_active_input(aio);
+
+	cras_alsa_mixer_set_capture_mute(aio->mixer,
+					 cras_system_get_capture_mute(),
+					 ain ? ain->mixer_input : NULL);
+
+	/* For USB device without UCM config, not change a gain control. */
+	if (ain->base.type == CRAS_NODE_TYPE_USB && !aio->ucm)
+		return;
+
 	/* Set hardware gain to 0dB if software gain is needed. */
 	if (cras_iodev_software_volume_needed(iodev))
 		gain = 0;
-	else
-		gain = cras_iodev_adjust_active_node_gain(
-			iodev, cras_system_get_capture_gain());
-
-	ain = get_active_input(aio);
+	else {
+		min_capture_gain = cras_alsa_mixer_get_minimum_capture_gain(
+			aio->mixer, ain ? ain->mixer_input : NULL);
+		max_capture_gain = cras_alsa_mixer_get_maximum_capture_gain(
+			aio->mixer, ain ? ain->mixer_input : NULL);
+		gain = MAX(iodev->active_node->capture_gain, min_capture_gain);
+		gain = MIN(gain, max_capture_gain);
+	}
 
 	cras_alsa_mixer_set_capture_dBFS(aio->mixer, gain,
-					 ain ? ain->mixer_input : NULL);
-	cras_alsa_mixer_set_capture_mute(aio->mixer,
-					 cras_system_get_capture_mute(),
 					 ain ? ain->mixer_input : NULL);
 }
 
@@ -819,28 +825,6 @@ static void init_device_settings(struct alsa_io *aio)
 		set_alsa_volume(&aio->base);
 		set_alsa_mute(&aio->base);
 	} else {
-		struct mixer_control *mixer_input = NULL;
-		struct alsa_input_node *ain = get_active_input(aio);
-		long min_capture_gain, max_capture_gain;
-
-		if (ain)
-			mixer_input = ain->mixer_input;
-
-		if (cras_iodev_software_volume_needed(&aio->base)) {
-			min_capture_gain =
-				cras_iodev_minimum_software_gain(&aio->base);
-			max_capture_gain =
-				cras_iodev_maximum_software_gain(&aio->base);
-		} else {
-			min_capture_gain =
-				cras_alsa_mixer_get_minimum_capture_gain(
-					aio->mixer, mixer_input);
-			max_capture_gain =
-				cras_alsa_mixer_get_maximum_capture_gain(
-					aio->mixer, mixer_input);
-		}
-		cras_system_set_capture_gain_limits(min_capture_gain,
-						    max_capture_gain);
 		set_alsa_capture_gain(&aio->base);
 	}
 }
@@ -1092,97 +1076,50 @@ set_output_node_software_volume_needed(struct alsa_output_node *output,
 		       output->base.name);
 }
 
-static void set_input_node_software_volume_needed(struct alsa_input_node *input,
-						  struct alsa_io *aio)
-{
-	long min_software_gain;
-	long max_software_gain;
-	int rc;
-
-	input->base.software_volume_needed = 0;
-	input->base.min_software_gain = DEFAULT_MIN_CAPTURE_GAIN;
-	input->base.max_software_gain = 0;
-
-	/* TODO(enshuo): Deprecate the max and min software gain when intrinsic
-	 * volume is done. */
-
-	/* Enable software gain if max software gain is specified in UCM. */
-	if (!aio->ucm)
-		return;
-
-	rc = ucm_get_max_software_gain(aio->ucm, input->base.name,
-				       &max_software_gain);
-
-	/* If max software gain doesn't exist, skip min software gain setting. */
-	if (rc)
-		return;
-
-	input->base.software_volume_needed = 1;
-	input->base.max_software_gain = max_software_gain;
-	syslog(LOG_INFO,
-	       "Use software gain for %s with max %ld because it is specified"
-	       " in UCM",
-	       input->base.name, max_software_gain);
-
-	/* Enable min software gain if it is specified in UCM. */
-	rc = ucm_get_min_software_gain(aio->ucm, input->base.name,
-				       &min_software_gain);
-	if (rc)
-		return;
-
-	if (min_software_gain > max_software_gain) {
-		syslog(LOG_ERR,
-		       "Ignore MinSoftwareGain %ld because it is larger than "
-		       "MaxSoftwareGain %ld",
-		       min_software_gain, max_software_gain);
-		return;
-	}
-
-	syslog(LOG_INFO,
-	       "Use software gain for %s with min %ld because it is specified"
-	       " in UCM",
-	       input->base.name, min_software_gain);
-	input->base.min_software_gain = min_software_gain;
-}
-
 static void set_input_default_node_gain(struct alsa_input_node *input,
 					struct alsa_io *aio)
 {
-	long default_node_gain;
-	int rc;
+	long gain;
+
+	input->base.capture_gain = DEFAULT_CAPTURE_GAIN;
+	input->base.ui_gain_scaler = 1.0f;
 
 	if (!aio->ucm)
 		return;
 
-	rc = ucm_get_default_node_gain(aio->ucm, input->base.name,
-				       &default_node_gain);
-	if (rc)
-		return;
-
-	input->base.capture_gain = default_node_gain;
+	if (ucm_get_default_node_gain(aio->ucm, input->base.name, &gain) == 0)
+		input->base.capture_gain = gain;
 }
 
-static void set_input_node_intrinsic_volume(struct alsa_input_node *input,
-					    struct alsa_io *aio)
+static void set_input_node_intrinsic_sensitivity(struct alsa_input_node *input,
+						 struct alsa_io *aio)
 {
-	long volume;
+	long sensitivity;
 	int rc;
 
-	input->base.intrinsic_volume = 0;
+	input->base.intrinsic_sensitivity = 0;
 
-	if (!aio->ucm)
+	if (aio->ucm) {
+		rc = ucm_get_intrinsic_sensitivity(aio->ucm, input->base.name,
+						   &sensitivity);
+		if (rc)
+			return;
+	} else if (input->base.type == CRAS_NODE_TYPE_USB) {
+		/*
+		 * For USB devices without UCM config, trust the default capture gain.
+		 * Set sensitivity to the default dbfs so the capture gain is 0.
+		 */
+		sensitivity = DEFAULT_CAPTURE_VOLUME_DBFS;
+	} else {
 		return;
+	}
 
-	rc = ucm_get_intrinsic_volume(aio->ucm, input->base.name, &volume);
-	if (rc)
-		return;
-
-	input->base.intrinsic_volume = volume;
-	input->base.capture_gain = DEFAULT_CAPTURE_VOLUME_DBFS - volume;
+	input->base.intrinsic_sensitivity = sensitivity;
+	input->base.capture_gain = DEFAULT_CAPTURE_VOLUME_DBFS - sensitivity;
 	syslog(LOG_INFO,
-	       "Use software gain %ld for %s because IntrinsicVolume %ld is"
+	       "Use software gain %ld for %s because IntrinsicSensitivity %ld is"
 	       " specified in UCM",
-	       input->base.capture_gain, input->base.name, volume);
+	       input->base.capture_gain, input->base.name, sensitivity);
 }
 
 static void check_auto_unplug_output_node(struct alsa_io *aio,
@@ -1317,9 +1254,8 @@ static struct alsa_input_node *new_input(struct alsa_io *aio,
 	input->mixer_input = cras_input;
 	strncpy(input->base.name, name, sizeof(input->base.name) - 1);
 	set_node_initial_state(&input->base, aio->card_type);
-	set_input_node_software_volume_needed(input, aio);
 	set_input_default_node_gain(input, aio);
-	set_input_node_intrinsic_volume(input, aio);
+	set_input_node_intrinsic_sensitivity(input, aio);
 
 	if (aio->ucm) {
 		/* Check mic positions only for internal mic. */
@@ -1804,8 +1740,8 @@ static int adjust_appl_ptr_samples_remaining(struct cras_iodev *odev)
 	 * If underrun happened, handle it. Because alsa_output_underrun function
 	 * has already called adjust_appl_ptr, we don't need to call it again.
 	 */
-	if (real_hw_level < odev->min_buffer_level)
-		return odev->output_underrun(odev);
+	if (real_hw_level <= odev->min_buffer_level)
+		return cras_iodev_output_underrun(odev, real_hw_level, 0);
 
 	if (real_hw_level > aio->filled_zeros_for_draining)
 		valid_sample = real_hw_level - aio->filled_zeros_for_draining;
@@ -1823,11 +1759,7 @@ static int adjust_appl_ptr_samples_remaining(struct cras_iodev *odev)
 
 static int alsa_output_underrun(struct cras_iodev *odev)
 {
-	struct alsa_io *aio = (struct alsa_io *)odev;
 	int rc;
-
-	/* Update number of underruns we got. */
-	aio->num_underruns++;
 
 	/* Fill whole buffer with zeros. This avoids samples left in buffer causing
 	 * noise when device plays them. */
@@ -1857,8 +1789,8 @@ static int possibly_enter_free_run(struct cras_iodev *odev)
 	real_hw_level = rc;
 
 	/* If underrun happened, handle it and enter free run state. */
-	if (real_hw_level < odev->min_buffer_level) {
-		rc = odev->output_underrun(odev);
+	if (real_hw_level <= odev->min_buffer_level) {
+		rc = cras_iodev_output_underrun(odev, real_hw_level, 0);
 		if (rc < 0)
 			return rc;
 		aio->free_running = 1;
@@ -1925,12 +1857,6 @@ static int is_free_running(const struct cras_iodev *odev)
 	struct alsa_io *aio = (struct alsa_io *)odev;
 
 	return aio->free_running;
-}
-
-static unsigned int get_num_underruns(const struct cras_iodev *iodev)
-{
-	const struct alsa_io *aio = (const struct alsa_io *)iodev;
-	return aio->num_underruns;
 }
 
 static unsigned int get_num_severe_underruns(const struct cras_iodev *iodev)
@@ -2061,7 +1987,6 @@ alsa_iodev_create(size_t card_index, const char *card_name, size_t device_index,
 	iodev->get_hotword_models = get_hotword_models;
 	iodev->no_stream = no_stream;
 	iodev->is_free_running = is_free_running;
-	iodev->get_num_underruns = get_num_underruns;
 	iodev->get_num_severe_underruns = get_num_severe_underruns;
 	iodev->get_valid_frames = get_valid_frames;
 	iodev->set_swap_mode_for_node = cras_iodev_dsp_set_swap_mode_for_node;
@@ -2258,9 +2183,6 @@ int alsa_iodev_ucm_add_nodes_and_jacks(struct cras_iodev *iodev,
 		input_node->pcm_name = strdup(section->pcm_name);
 	}
 
-	if (section->jack_type && !strcmp(section->jack_type, "always"))
-		aio->jack_always_plugged = 1;
-
 	/* Find any jack controls for this device. */
 	rc = cras_alsa_jack_list_add_jack_for_section(aio->jack_list, section,
 						      &jack);
@@ -2278,6 +2200,9 @@ int alsa_iodev_ucm_add_nodes_and_jacks(struct cras_iodev *iodev,
 		} else if (input_node) {
 			input_node->jack = jack;
 		}
+	} else if (aio->card_type == ALSA_CARD_TYPE_USB) {
+		/* No jack is found, assume device is always plugged */
+		aio->jack_always_plugged = 1;
 	}
 	return 0;
 }
