@@ -18,7 +18,7 @@ struct cras_bt_device;
 #define HF_THREE_WAY_CALLING 0x0002
 #define HF_CLI_PRESENTATION_CAP 0x0004
 #define HF_VOICE_RECOGNITION 0x0008
-#define HF_REMOVE_VOLUME_CTONTROL 0x0010
+#define HF_REMOTE_VOLUME_CONTROL 0x0010
 #define HF_ENHANCED_CALL_STATUS 0x0020
 #define HF_ENHANCED_CALL_CONTROL 0x0040
 #define HF_CODEC_NEGOTIATION 0x0080
@@ -132,12 +132,21 @@ int hfp_slc_get_selected_codec(struct hfp_slc_handle *handle);
 /* Gets if the remote HF supports codec negotiation. */
 int hfp_slc_get_hf_codec_negotiation_supported(struct hfp_slc_handle *handle);
 
+/* Gets if the remote HF supports HF indicator. */
+int hfp_slc_get_hf_hf_indicators_supported(struct hfp_slc_handle *handle);
+
+/* Gets if the HF side supports wideband speech. */
+bool hfp_slc_get_wideband_speech_supported(struct hfp_slc_handle *handle);
+
 /* Gets if the AG side supports codec negotiation. */
 int hfp_slc_get_ag_codec_negotiation_supported(struct hfp_slc_handle *handle);
 
 /* Gets an enum representing which spec the HF supports battery indicator.
  * Apple, HFP, none, or both. */
 int hfp_slc_get_hf_supports_battery_indicator(struct hfp_slc_handle *handle);
+
+/* Init the codec negotiation process if needed. */
+int hfp_slc_codec_connection_setup(struct hfp_slc_handle *handle);
 
 // Expose internal AT command handling for fuzzing.
 int handle_at_command_for_test(struct hfp_slc_handle *slc_handle,
