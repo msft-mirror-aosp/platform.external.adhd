@@ -33,6 +33,15 @@ struct hfp_alsa_io {
 	struct cras_iodev *aio;
 };
 
+static int hfp_alsa_get_valid_frames(struct cras_iodev *iodev,
+				     struct timespec *hw_tstamp)
+{
+	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
+	struct cras_iodev *aio = hfp_alsa_io->aio;
+
+	return aio->get_valid_frames(aio, hw_tstamp);
+}
+
 static int hfp_alsa_open_dev(struct cras_iodev *iodev)
 {
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
@@ -45,31 +54,8 @@ static int hfp_alsa_update_supported_formats(struct cras_iodev *iodev)
 {
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
-	int rc, i;
 
 	/* 16 bit, mono, 8kHz (narrow band speech); */
-	rc = aio->update_supported_formats(aio);
-	if (rc)
-		return rc;
-
-	for (i = 0; aio->supported_rates[i]; ++i)
-		if (aio->supported_rates[i] == 8000)
-			break;
-	if (aio->supported_rates[i] != 8000)
-		return -EINVAL;
-
-	for (i = 0; aio->supported_channel_counts[i]; ++i)
-		if (aio->supported_channel_counts[i] == 1)
-			break;
-	if (aio->supported_channel_counts[i] != 1)
-		return -EINVAL;
-
-	for (i = 0; aio->supported_formats[i]; ++i)
-		if (aio->supported_formats[i] == SND_PCM_FORMAT_S16_LE)
-			break;
-	if (aio->supported_formats[i] != SND_PCM_FORMAT_S16_LE)
-		return -EINVAL;
-
 	free(aio->format);
 	aio->format = malloc(sizeof(struct cras_audio_format));
 	if (!aio->format)
@@ -124,7 +110,6 @@ static int hfp_alsa_configure_dev(struct cras_iodev *iodev)
 		return rc;
 	}
 
-	hfp_set_call_status(hfp_alsa_io->slc, 1);
 	iodev->buffer_size = aio->buffer_size;
 
 	return 0;
@@ -135,7 +120,6 @@ static int hfp_alsa_close_dev(struct cras_iodev *iodev)
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
 
-	hfp_set_call_status(hfp_alsa_io->slc, 0);
 	cras_bt_device_put_sco(hfp_alsa_io->device);
 	cras_iodev_free_format(iodev);
 	return aio->close_dev(aio);
@@ -235,6 +219,21 @@ static int hfp_alsa_is_free_running(const struct cras_iodev *iodev)
 	return aio->is_free_running(aio);
 }
 
+static int hfp_alsa_output_underrun(struct cras_iodev *iodev)
+{
+	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
+	struct cras_iodev *aio = hfp_alsa_io->aio;
+
+	/*
+	 * Copy iodev->min_cb_level and iodev->max_cb_level from the parent
+	 * (i.e. hfp_alsa_iodev).  output_underrun() of alsa_io will use them.
+	 */
+	aio->min_cb_level = iodev->min_cb_level;
+	aio->max_cb_level = iodev->max_cb_level;
+
+	return aio->output_underrun(aio);
+}
+
 struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
 					 struct cras_bt_device *device,
 					 struct hfp_slc_handle *slc,
@@ -281,8 +280,10 @@ struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
 	iodev->update_active_node = hfp_alsa_update_active_node;
 	iodev->start = hfp_alsa_start;
 	iodev->set_volume = hfp_alsa_set_volume;
+	iodev->get_valid_frames = hfp_alsa_get_valid_frames;
 	iodev->no_stream = hfp_alsa_no_stream;
 	iodev->is_free_running = hfp_alsa_is_free_running;
+	iodev->output_underrun = hfp_alsa_output_underrun;
 
 	iodev->min_buffer_level = aio->min_buffer_level;
 
@@ -306,6 +307,9 @@ struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
 	cras_bt_device_append_iodev(device, iodev, profile);
+
+	/* Record max supported channels into cras_iodev_info. */
+	iodev->info.max_supported_channels = 1;
 
 	return iodev;
 }

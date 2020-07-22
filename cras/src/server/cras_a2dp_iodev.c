@@ -20,6 +20,7 @@
 #include "cras_a2dp_info.h"
 #include "cras_a2dp_iodev.h"
 #include "cras_audio_area.h"
+#include "cras_audio_thread_monitor.h"
 #include "cras_bt_device.h"
 #include "cras_iodev.h"
 #include "cras_util.h"
@@ -29,6 +30,16 @@
 
 #define PCM_BUF_MAX_SIZE_FRAMES (4096 * 4)
 #define PCM_BUF_MAX_SIZE_BYTES (PCM_BUF_MAX_SIZE_FRAMES * 4)
+
+/* Threshold for reasonable a2dp throttle log in audio dump. */
+static const struct timespec throttle_log_threshold = {
+	0, 20000000 /* 20ms */
+};
+
+/* Threshold for severe a2dp throttle event. */
+static const struct timespec throttle_event_threshold = {
+	2, 0 /* 2s */
+};
 
 /* Child of cras_iodev to handle bluetooth A2DP streaming.
  * Members:
@@ -66,7 +77,6 @@ static int update_supported_formats(struct cras_iodev *iodev)
 
 	cras_bt_transport_configuration(a2dpio->transport, &a2dp, sizeof(a2dp));
 
-	iodev->format->format = SND_PCM_FORMAT_S16_LE;
 	channel = (a2dp.channel_mode == SBC_CHANNEL_MODE_MONO) ? 1 : 2;
 
 	if (a2dp.frequency & SBC_SAMPLING_FREQ_48000)
@@ -115,16 +125,17 @@ static int frames_queued(const struct cras_iodev *iodev,
 
 /*
  * Utility function to fill zero frames until buffer level reaches
- * min_buffer_level. This is useful to allocate just enough data to write
+ * target_level. This is useful to allocate just enough data to write
  * to controller, while not introducing extra latency.
  */
-static int fill_zeros_to_min_buffer_level(struct cras_iodev *iodev)
+static int fill_zeros_to_target_level(struct cras_iodev *iodev,
+				      unsigned int target_level)
 {
 	unsigned int local_queued_frames = bt_local_queued_frames(iodev);
 
-	if (local_queued_frames < iodev->min_buffer_level)
+	if (local_queued_frames < target_level)
 		return cras_iodev_fill_odev_zeros(
-			iodev, iodev->min_buffer_level - local_queued_frames);
+			iodev, target_level - local_queued_frames);
 	return 0;
 }
 
@@ -160,15 +171,19 @@ static int output_underrun(struct cras_iodev *iodev)
 }
 
 /*
- * This wil be called multiple times when a2dpio is in no_stream state.
- * Simply fill zero frames to one write_block to ensure enough audio data
- * can be written at next flush_period.
+ * This will be called multiple times when a2dpio is in no_stream state
+ * frames_to_play_in_sleep ops determins how regular this will be called.
  */
 static int enter_no_stream(struct a2dp_io *a2dpio)
 {
 	struct cras_iodev *odev = &a2dpio->base;
 	int rc;
-	rc = fill_zeros_to_min_buffer_level(odev);
+	/*
+         * Setting target level to 3 times of min_buffer_level.
+         * We want hw_level to stay bewteen 1-2 times of min_buffer_level on
+	 * top of the underrun threshold(i.e one min_cb_level).
+         */
+	rc = fill_zeros_to_target_level(odev, 3 * odev->min_buffer_level);
 	if (rc)
 		syslog(LOG_ERR, "Error in A2DP enter_no_stream");
 	return encode_and_flush(odev);
@@ -184,14 +199,19 @@ static int leave_no_stream(struct a2dp_io *a2dpio)
 	struct cras_iodev *odev = &a2dpio->base;
 
 	/*
-	 * Less than mib_buffer_level could easily get into underrun with small
-	 * size stream.
-	 * More than min_buffer_level means unecessary latency to subsequent
-	 * stream.
-	 */
-	return fill_zeros_to_min_buffer_level(odev);
+	 * Since stream data is ready, just make sure hw_level doesn't underrun
+	 * after one flush. Hence setting the target level to 2 times of
+	 * min_buffer_level.
+         */
+	return fill_zeros_to_target_level(odev, 2 * odev->min_buffer_level);
 }
 
+/*
+ * Makes sure there's enough data(zero frames) to flush when no stream presents.
+ * Note that the underrun condition is when real buffer level goes below
+ * min_buffer_level, so we want to keep data at a reasonable higher level on top
+ * of that.
+ */
 static int no_stream(struct cras_iodev *odev, int enable)
 {
 	struct a2dp_io *a2dpio = (struct a2dp_io *)odev;
@@ -230,7 +250,7 @@ static int encode_a2dp_packet(struct a2dp_io *a2dpio)
 /*
  * To be called when a2dp socket becomes writable.
  */
-static int a2dp_socket_write_cb(void *arg)
+static int a2dp_socket_write_cb(void *arg, int revent)
 {
 	struct cras_iodev *iodev = (struct cras_iodev *)arg;
 	return encode_and_flush(iodev);
@@ -300,10 +320,11 @@ static int configure_dev(struct cras_iodev *iodev)
 	 */
 	iodev->min_buffer_level = a2dpio->write_block;
 
-	audio_thread_add_write_callback(cras_bt_transport_fd(a2dpio->transport),
-					a2dp_socket_write_cb, iodev);
-	audio_thread_enable_callback(cras_bt_transport_fd(a2dpio->transport),
-				     0);
+	audio_thread_add_events_callback(
+		cras_bt_transport_fd(a2dpio->transport), a2dp_socket_write_cb,
+		iodev, POLLOUT | POLLERR | POLLHUP);
+	audio_thread_config_events_callback(
+		cras_bt_transport_fd(a2dpio->transport), TRIGGER_NONE);
 	return 0;
 }
 
@@ -385,7 +406,7 @@ static int encode_and_flush(const struct cras_iodev *iodev)
 	unsigned int queued_frames;
 	struct a2dp_io *a2dpio;
 	struct cras_bt_device *device;
-	struct timespec now;
+	struct timespec now, ts;
 	static const struct timespec flush_wake_fuzz_ts = {
 		0, 1000000 /* 1ms */
 	};
@@ -415,8 +436,34 @@ do_flush:
 	/* If flush gets called before targeted next flush time, do nothing. */
 	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
 	add_timespecs(&now, &flush_wake_fuzz_ts);
-	if (!timespec_after(&now, &a2dpio->next_flush_time))
+	if (!timespec_after(&now, &a2dpio->next_flush_time)) {
+		if (iodev->buffer_size == bt_local_queued_frames(iodev)) {
+			/*
+			 * If buffer is full, audio thread will no longer call
+			 * into get/put buffer in subsequent wake-ups. In that
+			 * case set the registered callback to be triggered at
+			 * next audio thread wake up.
+			 */
+			audio_thread_config_events_callback(
+				cras_bt_transport_fd(a2dpio->transport),
+				TRIGGER_WAKEUP);
+			cras_audio_thread_event_a2dp_overrun();
+			syslog(LOG_WARNING, "Buffer overrun in A2DP iodev");
+		}
 		return 0;
+	}
+
+	/* If the A2DP write schedule miss exceeds a small threshold, log it for
+	 * debug purpose. */
+	subtract_timespecs(&now, &a2dpio->next_flush_time, &ts);
+	if (timespec_after(&ts, &throttle_log_threshold))
+		ATLOG(atlog, AUDIO_THREAD_A2DP_THROTTLE_TIME, ts.tv_sec,
+		      ts.tv_nsec, bt_local_queued_frames(iodev));
+
+	/* Log an event if the A2DP write schedule miss exceeds a large threshold
+	 * that we consider it as something severe. */
+	if (timespec_after(&ts, &throttle_event_threshold))
+		cras_audio_thread_event_a2dp_throttle();
 
 	written = a2dp_write(&a2dpio->a2dp,
 			     cras_bt_transport_fd(a2dpio->transport),
@@ -426,19 +473,20 @@ do_flush:
 	if (written == -EAGAIN) {
 		/* If EAGAIN error lasts longer than 5 seconds, suspend the
 		 * a2dp connection. */
-		cras_bt_device_schedule_suspend(device, 5000);
-		audio_thread_enable_callback(
-			cras_bt_transport_fd(a2dpio->transport), 1);
+		cras_bt_device_schedule_suspend(device, 5000,
+						A2DP_LONG_TX_FAILURE);
+		audio_thread_config_events_callback(
+			cras_bt_transport_fd(a2dpio->transport), TRIGGER_POLL);
 		return 0;
 	} else if (written < 0) {
 		/* Suspend a2dp immediately when receives error other than
 		 * EAGAIN. */
 		cras_bt_device_cancel_suspend(device);
-		cras_bt_device_schedule_suspend(device, 0);
+		cras_bt_device_schedule_suspend(device, 0, A2DP_TX_FATAL_ERROR);
 		/* Stop polling the socket in audio thread. Main thread will
 		 * close this iodev soon. */
-		audio_thread_enable_callback(
-			cras_bt_transport_fd(a2dpio->transport), 0);
+		audio_thread_config_events_callback(
+			cras_bt_transport_fd(a2dpio->transport), TRIGGER_NONE);
 		return written;
 	}
 
@@ -448,8 +496,8 @@ do_flush:
 
 	/* a2dp_write no longer return -EAGAIN when reaches here, disable
 	 * the polling write callback. */
-	audio_thread_enable_callback(cras_bt_transport_fd(a2dpio->transport),
-				     0);
+	audio_thread_config_events_callback(
+		cras_bt_transport_fd(a2dpio->transport), TRIGGER_NONE);
 
 	/* Data succcessfully written to a2dp socket, cancel any scheduled
 	 * suspend timer. */
@@ -631,6 +679,10 @@ struct cras_iodev *a2dp_iodev_create(struct cras_bt_transport *transport)
 	cras_iodev_set_active_node(iodev, node);
 	cras_bt_device_append_iodev(
 		device, iodev, cras_bt_transport_profile(a2dpio->transport));
+
+	/* Record max supported channels into cras_iodev_info. */
+	iodev->info.max_supported_channels =
+		(a2dp.channel_mode == SBC_CHANNEL_MODE_MONO) ? 1 : 2;
 
 	return iodev;
 error:

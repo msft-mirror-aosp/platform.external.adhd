@@ -128,6 +128,9 @@ void cras_system_set_bt_fix_a2dp_packet_size_enabled(bool enabled);
 /* Gets the flag of Bluetooth fixed A2DP packet size. */
 bool cras_system_get_bt_fix_a2dp_packet_size_enabled();
 
+/* Checks if the card ignores the ucm suffix. */
+bool cras_system_check_ignore_ucm_suffix(const char *card_name);
+
 /* Adds a card at the given index to the system.  When a new card is found
  * (through a udev event notification) this will add the card to the system,
  * causing its devices to become available for playback/capture.
@@ -171,8 +174,8 @@ int cras_system_alsa_card_exists(unsigned alsa_card_index);
  *    0 on success, or -EBUSY if there is already a registered handler.
  */
 int cras_system_set_select_handler(
-	int (*add)(int fd, void (*callback)(void *data), void *callback_data,
-		   void *select_data),
+	int (*add)(int fd, void (*callback)(void *data, int revents),
+		   void *callback_data, int events, void *select_data),
 	void (*rm)(int fd, void *select_data), void *select_data);
 
 /* Adds the fd and callback pair.  When select indicates that fd is readable,
@@ -181,11 +184,12 @@ int cras_system_set_select_handler(
  *    fd - The file descriptor to pass to select(2).
  *    callback - The callback to call when fd is ready.
  *    callback_data - Value passed back to the callback.
+ *    events - The events to poll for.
  * Returns:
  *    0 on success or a negative error code on failure.
  */
-int cras_system_add_select_fd(int fd, void (*callback)(void *data),
-			      void *callback_data);
+int cras_system_add_select_fd(int fd, void (*callback)(void *data, int revents),
+			      void *callback_data, int events);
 
 /* Removes the fd from the list of fds that are passed to select.
  * Args:
