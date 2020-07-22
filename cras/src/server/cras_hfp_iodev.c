@@ -44,12 +44,10 @@ static int update_supported_formats(struct cras_iodev *iodev)
 {
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
-	/* 16 bit, mono, 8kHz for narrowband and 16KHz for wideband */
-	iodev->format->format = SND_PCM_FORMAT_S16_LE;
-
 	free(iodev->supported_rates);
 	iodev->supported_rates = (size_t *)malloc(2 * sizeof(size_t));
 
+	/* 16 bit, mono, 8kHz for narrowband and 16KHz for wideband */
 	iodev->supported_rates[0] =
 		(hfp_slc_get_selected_codec(hfpio->slc) == HFP_CODEC_ID_MSBC) ?
 			16000 :
@@ -139,11 +137,17 @@ static int configure_dev(struct cras_iodev *iodev)
 	/* Assert format is set before opening device. */
 	if (iodev->format == NULL)
 		return -EINVAL;
+
 	iodev->format->format = SND_PCM_FORMAT_S16_LE;
 	cras_iodev_init_audio_area(iodev, iodev->format->num_channels);
 
 	if (hfp_info_running(hfpio->info))
 		goto add_dev;
+
+	/*
+	 * Might require a codec negotiation before building the sco connection.
+	 */
+	hfp_slc_codec_connection_setup(hfpio->slc);
 
 	sk = cras_bt_device_sco_connect(hfpio->device,
 					hfp_slc_get_selected_codec(hfpio->slc));
@@ -154,7 +158,8 @@ static int configure_dev(struct cras_iodev *iodev)
 		hfpio->device, sk, hfp_slc_get_selected_codec(hfpio->slc));
 
 	/* Start hfp_info */
-	err = hfp_info_start(sk, mtu, hfpio->info);
+	err = hfp_info_start(sk, mtu, hfp_slc_get_selected_codec(hfpio->slc),
+			     hfpio->info);
 	if (err)
 		goto error;
 
@@ -162,7 +167,6 @@ static int configure_dev(struct cras_iodev *iodev)
 	hfpio->filled_zeros = 0;
 add_dev:
 	hfp_info_add_iodev(hfpio->info, iodev->direction, iodev->format);
-	hfp_set_call_status(hfpio->slc, 1);
 
 	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev->direction);
 
@@ -177,10 +181,8 @@ static int close_dev(struct cras_iodev *iodev)
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
 	hfp_info_rm_iodev(hfpio->info, iodev->direction);
-	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info)) {
+	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info))
 		hfp_info_stop(hfpio->info);
-		hfp_set_call_status(hfpio->slc, 0);
-	}
 
 	cras_iodev_free_format(iodev);
 	cras_iodev_free_audio_area(iodev);
@@ -327,10 +329,10 @@ struct cras_iodev *hfp_iodev_create(enum CRAS_STREAM_DIRECTION dir,
 	strcpy(node->name, iodev->info.name);
 
 	node->plugged = 1;
-	/* If headset mic uses legacy narrow band, i.e CVSD codec, report a
+	/* If headset mic doesn't support the wideband speech, report a
 	 * different node type so UI can set different plug priority. */
 	node->type = CRAS_NODE_TYPE_BLUETOOTH;
-	if ((hfp_slc_get_selected_codec(hfpio->slc) == HFP_CODEC_ID_CVSD) &&
+	if (!hfp_slc_get_wideband_speech_supported(hfpio->slc) &&
 	    (dir == CRAS_STREAM_INPUT))
 		node->type = CRAS_NODE_TYPE_BLUETOOTH_NB_MIC;
 
@@ -344,6 +346,9 @@ struct cras_iodev *hfp_iodev_create(enum CRAS_STREAM_DIRECTION dir,
 	cras_bt_device_append_iodev(device, iodev, profile);
 
 	hfpio->info = info;
+
+	/* Record max supported channels into cras_iodev_info. */
+	iodev->info.max_supported_channels = 1;
 
 	return iodev;
 

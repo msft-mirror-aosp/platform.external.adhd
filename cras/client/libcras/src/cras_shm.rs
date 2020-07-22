@@ -20,6 +20,7 @@ use cras_sys::{
     AudioDebugInfo, AudioDevDebugInfo, AudioStreamDebugInfo, CrasIodevInfo, CrasIonodeInfo,
 };
 use data_model::{VolatileRef, VolatileSlice};
+use sys_util::warn;
 
 /// A structure wrapping a fd which contains a shared `cras_audio_shm_header`.
 /// * `shm_fd` - A shared memory fd contains a `cras_audio_shm_header`
@@ -344,13 +345,23 @@ impl<'a> CrasAudioHeader<'a> {
             .load() as usize;
         let other_end = other_start + self.buffer_len_from_offset(other_start)?;
         if start < other_end && other_start < end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Setting buffer {} to [{}, {}) overlaps buffer {} at [{}, {})",
-                    idx, start, end, other_idx, other_start, other_end,
-                ),
-            ));
+            // Special case: occasionally we get the same buffer offset twice
+            // from the intel8x0 kernel driver in crosvm's AC97 device, and we
+            // don't want to crash in that case.
+            if start == other_start && end == other_end {
+                warn!(
+                    "Setting buffer {} to same index/offset as buffer {}, [{}, {})",
+                    idx, other_idx, other_start, other_end
+                );
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Setting buffer {} to [{}, {}) overlaps buffer {} at [{}, {})",
+                        idx, start, end, other_idx, other_start, other_end,
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -521,8 +532,8 @@ unsafe fn cras_mmap(
 macro_rules! vslice_from_addr {
     ($addr:ident, $($field:ident).*) => {{
         let ptr = &mut $addr.as_mut().$($field).* as *mut _ as *mut u8;
-        let size = std::mem::size_of_val(&$addr.as_mut().$($field).*) as u64;
-        VolatileSlice::new(ptr, size)
+        let size = std::mem::size_of_val(&$addr.as_mut().$($field).*);
+        VolatileSlice::from_raw_parts(ptr, size)
     }};
 }
 
@@ -1113,13 +1124,16 @@ mod tests {
         header.write_offset[1].store(0);
         header.buffer_offset[1].store(10);
 
-        // Setting buffer_offset to overlap with other buffer is not okay
-        assert!(header.set_buffer_offset(0, 10).is_err());
+        // Setting buffer_offset to exactly overlap with other buffer is okay
+        assert!(header.set_buffer_offset(0, 10).is_ok());
+
+        // Setting buffer_offset to partially overlap other buffer is not okay
+        assert!(header.set_buffer_offset(0, 9).is_err());
 
         header.buffer_offset[0].store(0);
         header.write_offset[1].store(8);
         // With samples, it's still an error.
-        assert!(header.set_buffer_offset(0, 10).is_err());
+        assert!(header.set_buffer_offset(0, 9).is_err());
 
         // Setting the offset past the end of the other buffer is okay
         assert!(header.set_buffer_offset(0, 20).is_ok());
@@ -1134,9 +1148,9 @@ mod tests {
         assert!(header.set_buffer_offset(0, 30).is_err());
 
         // If we try to overlap another buffer with that other buffer at the end,
-        // it's not okay.
+        // it's not okay, unless it's the exact same index.
         assert!(header.set_buffer_offset(1, 25).is_err());
-        assert!(header.set_buffer_offset(1, 27).is_err());
+        assert!(header.set_buffer_offset(1, 27).is_ok());
         assert!(header.set_buffer_offset(1, 28).is_err());
 
         // Setting buffer offset past the end of samples is an error.
