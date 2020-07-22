@@ -98,15 +98,6 @@ char *ucm_get_flag(struct cras_use_case_mgr *mgr, const char *flag_name);
  */
 char *ucm_get_cap_control(struct cras_use_case_mgr *mgr, const char *ucm_dev);
 
-/* Gets the mic positions string for internal mic.
- * Args:
- *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
- * Returns:
- *    A pointer to the allocated string containing the mic positions
- *    information, or NULL if not specified.
- */
-char *ucm_get_mic_positions(struct cras_use_case_mgr *mgr);
-
 /* Gets the new node type name which user wants to override the old one for
  * given ucm device.
  * Args:
@@ -256,6 +247,20 @@ ucm_get_echo_reference_dev_name_for_dev(struct cras_use_case_mgr *mgr,
 int ucm_get_sample_rate_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
 				enum CRAS_STREAM_DIRECTION direction);
 
+/* Gets the channel count at which to run this device.
+ *
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for channel count.
+ *    direction - playback(CRAS_STREAM_OUTPUT) or capture(CRAS_STREAM_INPUT).
+ *    channels - The pointer to the returned channel count.
+ * Returns:
+ *    0 on success, other error codes on failure.
+ */
+int ucm_get_channels_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
+			     enum CRAS_STREAM_DIRECTION direction,
+			     size_t *channels);
+
 /* Gets the capture channel map for this device.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
@@ -315,7 +320,7 @@ int ucm_set_hotword_model(struct cras_use_case_mgr *mgr, const char *model);
  */
 int ucm_has_fully_specified_ucm_flag(struct cras_use_case_mgr *mgr);
 
-/* Gets the mixer name of this device on the card.
+/* Gets the playback mixer name of this device on the card.
  *
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
@@ -324,8 +329,20 @@ int ucm_has_fully_specified_ucm_flag(struct cras_use_case_mgr *mgr);
  *    A pointer to the allocated string containing the mixer name, or NULL
  *    if no device name is found.
  */
-const char *ucm_get_mixer_name_for_dev(struct cras_use_case_mgr *mgr,
-				       const char *dev);
+const char *ucm_get_playback_mixer_elem_for_dev(struct cras_use_case_mgr *mgr,
+						const char *dev);
+
+/* Gets the capture mixer name of this device on the card.
+ *
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    dev - The device to check for device name
+ * Returns:
+ *    A pointer to the allocated string containing the mixer name, or NULL
+ *    if no device name is found.
+ */
+const char *ucm_get_capture_mixer_elem_for_dev(struct cras_use_case_mgr *mgr,
+					       const char *dev);
 
 /* Gets the mixer names for the main volume controls on the card.
  *
