@@ -16,13 +16,16 @@
 #include "cras_metrics.h"
 #include "cras_main_message.h"
 #include "cras_rstream.h"
+#include "cras_server_metrics.h"
 #include "cras_system_state.h"
 
 #define METRICS_NAME_BUFFER_SIZE 100
 
 const char kBusyloop[] = "Cras.Busyloop";
+const char kBusyloopLength[] = "Cras.BusyloopLength";
 const char kDeviceTypeInput[] = "Cras.DeviceTypeInput";
 const char kDeviceTypeOutput[] = "Cras.DeviceTypeOutput";
+const char kDeviceVolume[] = "Cras.DeviceVolume";
 const char kHighestDeviceDelayInput[] = "Cras.HighestDeviceDelayInput";
 const char kHighestDeviceDelayOutput[] = "Cras.HighestDeviceDelayOutput";
 const char kHighestInputHardwareLevel[] = "Cras.HighestInputHardwareLevel";
@@ -53,6 +56,7 @@ const char kStreamEffects[] = "Cras.StreamEffects";
 const char kStreamSamplingFormat[] = "Cras.StreamSamplingFormat";
 const char kStreamSamplingRate[] = "Cras.StreamSamplingRate";
 const char kUnderrunsPerDevice[] = "Cras.UnderrunsPerDevice";
+const char kHfpScoConnectionError[] = "Cras.HfpScoConnectionError";
 const char kHfpBatteryIndicatorSupported[] =
 	"Cras.HfpBatteryIndicatorSupported";
 const char kHfpBatteryReport[] = "Cras.HfpBatteryReport";
@@ -83,11 +87,14 @@ static const char *get_timespec_period_str(struct timespec ts)
 enum CRAS_SERVER_METRICS_TYPE {
 	BT_BATTERY_INDICATOR_SUPPORTED,
 	BT_BATTERY_REPORT,
+	BT_SCO_CONNECTION_ERROR,
 	BT_WIDEBAND_PACKET_LOSS,
 	BT_WIDEBAND_SUPPORTED,
 	BT_WIDEBAND_SELECTED_CODEC,
 	BUSYLOOP,
+	BUSYLOOP_LENGTH,
 	DEVICE_RUNTIME,
+	DEVICE_VOLUME,
 	HIGHEST_DEVICE_DELAY_INPUT,
 	HIGHEST_DEVICE_DELAY_OUTPUT,
 	HIGHEST_INPUT_HW_LEVEL,
@@ -135,6 +142,7 @@ enum CRAS_METRICS_DEVICE_TYPE {
 	CRAS_METRICS_DEVICE_SILENT_HOTWORD,
 	CRAS_METRICS_DEVICE_UNKNOWN,
 	CRAS_METRICS_DEVICE_BLUETOOTH_WB_MIC,
+	CRAS_METRICS_DEVICE_ALSA_LOOPBACK,
 };
 
 struct cras_server_metrics_stream_config {
@@ -151,6 +159,7 @@ struct cras_server_metrics_device_data {
 	enum CRAS_METRICS_DEVICE_TYPE type;
 	enum CRAS_STREAM_DIRECTION direction;
 	struct timespec runtime;
+	unsigned value;
 };
 
 struct cras_server_metrics_stream_data {
@@ -257,6 +266,8 @@ metrics_device_type_str(enum CRAS_METRICS_DEVICE_TYPE device_type)
 		return "BluetoothWideBandMic";
 	case CRAS_METRICS_DEVICE_NO_DEVICE:
 		return "NoDevice";
+	case CRAS_METRICS_DEVICE_ALSA_LOOPBACK:
+		return "AlsaLoopback";
 	/* Other dummy devices. */
 	case CRAS_METRICS_DEVICE_NORMAL_FALLBACK:
 		return "NormalFallback";
@@ -373,10 +384,32 @@ get_metrics_device_type(struct cras_iodev *iodev)
 	}
 	case CRAS_NODE_TYPE_BLUETOOTH_NB_MIC:
 		return CRAS_METRICS_DEVICE_BLUETOOTH_NB_MIC;
+	case CRAS_NODE_TYPE_ALSA_LOOPBACK:
+		return CRAS_METRICS_DEVICE_ALSA_LOOPBACK;
 	case CRAS_NODE_TYPE_UNKNOWN:
 	default:
 		return CRAS_METRICS_DEVICE_UNKNOWN;
 	}
+}
+
+int cras_server_metrics_hfp_sco_connection_error(
+	enum CRAS_METRICS_BT_SCO_ERROR_TYPE type)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	data.value = type;
+	init_server_metrics_msg(&msg, BT_SCO_CONNECTION_ERROR, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR, "Failed to send metrics message: "
+				"BT_SCO_CONNECTION_ERROR");
+		return err;
+	}
+	return 0;
 }
 
 int cras_server_metrics_hfp_battery_indicator(int battery_indicator_support)
@@ -495,6 +528,31 @@ int cras_server_metrics_device_runtime(struct cras_iodev *iodev)
 	if (err < 0) {
 		syslog(LOG_ERR,
 		       "Failed to send metrics message: DEVICE_RUNTIME");
+		return err;
+	}
+
+	return 0;
+}
+
+int cras_server_metrics_device_volume(struct cras_iodev *iodev)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	if (iodev->direction == CRAS_STREAM_INPUT)
+		return 0;
+
+	data.device_data.type = get_metrics_device_type(iodev);
+	data.device_data.value = iodev->active_node->volume;
+
+	init_server_metrics_msg(&msg, DEVICE_VOLUME, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR,
+		       "Failed to send metrics message: DEVICE_VOLUME");
 		return err;
 	}
 
@@ -862,6 +920,26 @@ int cras_server_metrics_busyloop(struct timespec *ts, unsigned count)
 	return 0;
 }
 
+int cras_server_metrics_busyloop_length(unsigned length)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	data.value = length;
+
+	init_server_metrics_msg(&msg, BUSYLOOP_LENGTH, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR,
+		       "Failed to send metrics message: BUSYLOOP_LENGTH");
+		return err;
+	}
+	return 0;
+}
+
 static void metrics_device_runtime(struct cras_server_metrics_device_data data)
 {
 	char metrics_name[METRICS_NAME_BUFFER_SIZE];
@@ -878,6 +956,15 @@ static void metrics_device_runtime(struct cras_server_metrics_device_data data)
 		cras_metrics_log_sparse_histogram(kDeviceTypeInput, data.type);
 	else
 		cras_metrics_log_sparse_histogram(kDeviceTypeOutput, data.type);
+}
+
+static void metrics_device_volume(struct cras_server_metrics_device_data data)
+{
+	char metrics_name[METRICS_NAME_BUFFER_SIZE];
+
+	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE, "%s.%s", kDeviceVolume,
+		 metrics_device_type_str(data.type));
+	cras_metrics_log_histogram(metrics_name, data.value, 0, 100, 20);
 }
 
 static void metrics_stream_runtime(struct cras_server_metrics_stream_data data)
@@ -980,6 +1067,10 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 	struct cras_server_metrics_message *metrics_msg =
 		(struct cras_server_metrics_message *)msg;
 	switch (metrics_msg->metrics_type) {
+	case BT_SCO_CONNECTION_ERROR:
+		cras_metrics_log_sparse_histogram(kHfpScoConnectionError,
+						  metrics_msg->data.value);
+		break;
 	case BT_BATTERY_INDICATOR_SUPPORTED:
 		cras_metrics_log_sparse_histogram(kHfpBatteryIndicatorSupported,
 						  metrics_msg->data.value);
@@ -1004,6 +1095,9 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 		break;
 	case DEVICE_RUNTIME:
 		metrics_device_runtime(metrics_msg->data.device_data);
+		break;
+	case DEVICE_VOLUME:
+		metrics_device_volume(metrics_msg->data.device_data);
 		break;
 	case HIGHEST_DEVICE_DELAY_INPUT:
 		cras_metrics_log_histogram(kHighestDeviceDelayInput,
@@ -1083,6 +1177,10 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 		break;
 	case BUSYLOOP:
 		metrics_busyloop(metrics_msg->data.timespec_data);
+		break;
+	case BUSYLOOP_LENGTH:
+		cras_metrics_log_histogram(
+			kBusyloopLength, metrics_msg->data.value, 0, 1000, 50);
 		break;
 	default:
 		syslog(LOG_ERR, "Unknown metrics type %u",

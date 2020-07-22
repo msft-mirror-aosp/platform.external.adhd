@@ -112,6 +112,7 @@ static int buffer_share_get_new_write_point_ret;
 static int ext_mod_configure_called;
 static struct input_data* input_data_create_ret;
 static double rate_estimator_get_rate_ret;
+static int cras_audio_thread_event_dev_overrun_called;
 
 static char* atlog_name;
 
@@ -207,6 +208,7 @@ void ResetStubData() {
   buffer_share_add_id_called = 0;
   ext_mod_configure_called = 0;
   rate_estimator_get_rate_ret = 0;
+  cras_audio_thread_event_dev_overrun_called = 0;
 }
 
 namespace {
@@ -1722,7 +1724,7 @@ TEST(IoDev, PrepareOutputBeforeWriteSamples) {
 
   // Assume device has ramp member.
   iodev.ramp = reinterpret_cast<struct cras_ramp*>(0x1);
-
+  iodev.initial_ramp_request = CRAS_IODEV_RAMP_REQUEST_UP_START_PLAYBACK;
   // Case 4.1: Assume device with ramp is started and is in no stream state.
   iodev.state = CRAS_IODEV_STATE_NO_STREAM_RUN;
   // Assume sample is ready.
@@ -2373,6 +2375,26 @@ TEST(IoDev, AecUseCaseCheck) {
   EXPECT_EQ(0, cras_iodev_is_aec_use_case(&node));
 }
 
+TEST(IoDev, DeviceOverrun) {
+  struct cras_iodev iodev;
+
+  iodev.buffer_size = 4096;
+  iodev.largest_cb_level = 2048;
+  cras_iodev_update_highest_hw_level(&iodev, 4096);
+  EXPECT_EQ(0, cras_audio_thread_event_dev_overrun_called);
+
+  iodev.largest_cb_level = 1024;
+  iodev.highest_hw_level = 1024;
+  cras_iodev_update_highest_hw_level(&iodev, 2048);
+  EXPECT_EQ(0, cras_audio_thread_event_dev_overrun_called);
+
+  cras_iodev_update_highest_hw_level(&iodev, 4096);
+  EXPECT_EQ(1, cras_audio_thread_event_dev_overrun_called);
+
+  cras_iodev_update_highest_hw_level(&iodev, 4096);
+  EXPECT_EQ(1, cras_audio_thread_event_dev_overrun_called);
+}
+
 extern "C" {
 
 //  From libpthread.
@@ -2718,7 +2740,16 @@ int cras_audio_thread_event_underrun() {
   return 0;
 }
 
+int cras_audio_thread_event_dev_overrun() {
+  cras_audio_thread_event_dev_overrun_called++;
+  return 0;
+}
+
 int cras_server_metrics_device_runtime(struct cras_iodev* iodev) {
+  return 0;
+}
+
+int cras_server_metrics_device_volume(struct cras_iodev* iodev) {
   return 0;
 }
 
