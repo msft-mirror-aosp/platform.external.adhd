@@ -18,19 +18,21 @@ static const char jack_dev_var[] = "JackDev";
 static const char jack_switch_var[] = "JackSwitch";
 static const char edid_var[] = "EDIDFile";
 static const char cap_var[] = "CaptureControl";
-static const char mic_positions[] = "MicPositions";
 static const char override_type_name_var[] = "OverrideNodeType";
 static const char dsp_name_var[] = "DspName";
-static const char mixer_var[] = "MixerName";
+static const char playback_mixer_elem_var[] = "PlaybackMixerElem";
+static const char capture_mixer_elem_var[] = "CaptureMixerElem";
 static const char swap_mode_suffix[] = "Swap Mode";
 static const char min_buffer_level_var[] = "MinBufferLevel";
 static const char dma_period_var[] = "DmaPeriodMicrosecs";
 static const char disable_software_volume[] = "DisableSoftwareVolume";
 static const char playback_device_name_var[] = "PlaybackPCM";
 static const char playback_device_rate_var[] = "PlaybackRate";
+static const char playback_channels_var[] = "PlaybackChannels";
 static const char capture_device_name_var[] = "CapturePCM";
 static const char capture_device_rate_var[] = "CaptureRate";
 static const char capture_channel_map_var[] = "CaptureChannelMap";
+static const char capture_channels_var[] = "CaptureChannels";
 static const char coupled_mixers[] = "CoupledMixers";
 static const char dependent_device_name_var[] = "DependentPCM";
 static const char preempt_hotword_var[] = "PreemptHotword";
@@ -493,8 +495,8 @@ int ucm_set_enabled(struct cras_use_case_mgr *mgr, const char *dev, int enable)
 		return 0;
 	syslog(LOG_DEBUG, "UCM %s %s", enable ? "enable" : "disable", dev);
 	rc = snd_use_case_set(mgr->mgr, enable ? "_enadev" : "_disdev", dev);
-	if (rc) {
-		syslog(LOG_ERR, "Can not %s UCM for card %s, rc = %d",
+	if (rc && (rc != -ENOENT || ucm_has_fully_specified_ucm_flag(mgr))) {
+		syslog(LOG_ERR, "Can not %s UCM for device %s, rc = %d",
 		       enable ? "enable" : "disable", dev, rc);
 	}
 	return rc;
@@ -523,21 +525,6 @@ char *ucm_get_cap_control(struct cras_use_case_mgr *mgr, const char *ucm_dev)
 	int rc;
 
 	rc = get_var(mgr, cap_var, ucm_dev, uc_verb(mgr), &value);
-	if (!rc) {
-		control_name = strdup(value);
-		free((void *)value);
-	}
-
-	return control_name;
-}
-
-char *ucm_get_mic_positions(struct cras_use_case_mgr *mgr)
-{
-	char *control_name = NULL;
-	const char *value;
-	int rc;
-
-	rc = get_var(mgr, mic_positions, "", uc_verb(mgr), &value);
 	if (!rc) {
 		control_name = strdup(value);
 		free((void *)value);
@@ -587,10 +574,16 @@ char *ucm_get_dev_for_jack(struct cras_use_case_mgr *mgr, const char *jack,
 char *ucm_get_dev_for_mixer(struct cras_use_case_mgr *mgr, const char *mixer,
 			    enum CRAS_STREAM_DIRECTION dir)
 {
-	struct section_name *section_names, *c;
+	struct section_name *section_names = NULL, *c;
 	char *ret = NULL;
 
-	section_names = ucm_get_devices_for_var(mgr, mixer_var, mixer, dir);
+	if (dir == CRAS_STREAM_OUTPUT) {
+		section_names = ucm_get_devices_for_var(
+			mgr, playback_mixer_elem_var, mixer, dir);
+	} else if (dir == CRAS_STREAM_INPUT) {
+		section_names = ucm_get_devices_for_var(
+			mgr, capture_mixer_elem_var, mixer, dir);
+	}
 
 	if (section_names)
 		ret = strdup(section_names->name);
@@ -726,6 +719,31 @@ int ucm_get_sample_rate_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
 	return value;
 }
 
+int ucm_get_channels_for_dev(struct cras_use_case_mgr *mgr, const char *dev,
+			     enum CRAS_STREAM_DIRECTION direction,
+			     size_t *channels)
+{
+	int value;
+	int rc;
+	const char *var_name;
+
+	if (direction == CRAS_STREAM_OUTPUT)
+		var_name = playback_channels_var;
+	else if (direction == CRAS_STREAM_INPUT)
+		var_name = capture_channels_var;
+	else
+		return -EINVAL;
+
+	rc = get_int(mgr, var_name, dev, uc_verb(mgr), &value);
+	if (rc)
+		return rc;
+	if (value < 0)
+		return -1;
+
+	*channels = (size_t)value;
+	return 0;
+}
+
 int ucm_get_capture_chmap_for_dev(struct cras_use_case_mgr *mgr,
 				  const char *dev, int8_t *channel_layout)
 {
@@ -828,15 +846,6 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 			goto error_cleanup;
 		}
 
-		if (dev_idx == -1) {
-			syslog(LOG_ERR,
-			       "PlaybackPCM or CapturePCM for '%s' must be in"
-			       " the form 'hw:<card>,<number>'",
-			       dev_name);
-			free((void *)pcm_name);
-			goto error_cleanup;
-		}
-
 		dependent_dev_name =
 			ucm_get_dependent_device_name_for_dev(mgr, dev_name);
 		if (dependent_dev_name) {
@@ -847,7 +856,12 @@ struct ucm_section *ucm_get_sections(struct cras_use_case_mgr *mgr)
 
 		jack_dev = ucm_get_jack_dev_for_dev(mgr, dev_name);
 		jack_control = ucm_get_jack_control_for_dev(mgr, dev_name);
-		mixer_name = ucm_get_mixer_name_for_dev(mgr, dev_name);
+		if (dir == CRAS_STREAM_OUTPUT)
+			mixer_name = ucm_get_playback_mixer_elem_for_dev(
+				mgr, dev_name);
+		else if (dir == CRAS_STREAM_INPUT)
+			mixer_name = ucm_get_capture_mixer_elem_for_dev(
+				mgr, dev_name);
 
 		if (jack_dev) {
 			jack_name = jack_dev;
@@ -1003,10 +1017,18 @@ int ucm_has_fully_specified_ucm_flag(struct cras_use_case_mgr *mgr)
 	return ret;
 }
 
-inline const char *ucm_get_mixer_name_for_dev(struct cras_use_case_mgr *mgr,
-					      const char *dev)
+inline const char *
+ucm_get_playback_mixer_elem_for_dev(struct cras_use_case_mgr *mgr,
+				    const char *dev)
 {
-	return ucm_get_value_for_dev(mgr, mixer_var, dev);
+	return ucm_get_value_for_dev(mgr, playback_mixer_elem_var, dev);
+}
+
+inline const char *
+ucm_get_capture_mixer_elem_for_dev(struct cras_use_case_mgr *mgr,
+				   const char *dev)
+{
+	return ucm_get_value_for_dev(mgr, capture_mixer_elem_var, dev);
 }
 
 struct mixer_name *ucm_get_main_volume_names(struct cras_use_case_mgr *mgr)

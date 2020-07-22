@@ -10,6 +10,7 @@
 #include <syslog.h>
 
 #include "audio_thread.h"
+#include "bluetooth.h"
 #include "byte_buffer.h"
 #include "cras_hfp_info.h"
 #include "cras_hfp_slc.h"
@@ -40,8 +41,7 @@
  * be 3 octets of HCI header + 60 octets of data. */
 #define MSBC_PKT_SIZE 60
 #define WRITE_BUF_SIZE_BYTES MSBC_PKT_SIZE
-#define HCI_SCO_HDR_SIZE_BYTES 3
-#define HCI_SCO_PKT_SIZE (MSBC_PKT_SIZE + HCI_SCO_HDR_SIZE_BYTES)
+#define HCI_SCO_PKT_SIZE (MSBC_PKT_SIZE)
 
 #define H2_HEADER_0 0x01
 
@@ -407,8 +407,22 @@ int hfp_read_msbc(struct hfp_info *info)
 	const uint8_t *frame_head = NULL;
 	unsigned int seq;
 
+	struct msghdr msg = { 0 };
+	struct iovec iov;
+	struct cmsghdr *cmsg;
+	const unsigned int control_size = CMSG_SPACE(sizeof(int));
+	char control[control_size] = { 0 };
+	uint8_t pkt_status;
+
 recv_msbc_bytes:
-	err = recv(info->fd, info->hci_sco_buf, HCI_SCO_PKT_SIZE, 0);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	iov.iov_base = info->hci_sco_buf;
+	iov.iov_len = HCI_SCO_PKT_SIZE;
+	msg.msg_control = control;
+	msg.msg_controllen = control_size;
+
+	err = recvmsg(info->fd, &msg, 0);
 	if (err < 0) {
 		syslog(LOG_ERR, "HCI SCO packet read err %s", strerror(errno));
 		if (errno == EINTR)
@@ -424,6 +438,16 @@ recv_msbc_bytes:
 		return -1;
 	}
 
+	pkt_status = 0;
+	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+	     cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level == SOL_BLUETOOTH &&
+		    cmsg->cmsg_type == BT_SCM_PKT_STATUS) {
+			size_t len = cmsg->cmsg_len - sizeof(*cmsg);
+			memcpy(&pkt_status, CMSG_DATA(cmsg), len);
+		}
+	}
+
 	/*
 	 * HCI SCO packet status flag:
 	 * 0x00 - correctly received data.
@@ -431,18 +455,15 @@ recv_msbc_bytes:
 	 * 0x10 - No data received.
 	 * 0x11 - Data partially lost.
 	 */
-	err = (info->hci_sco_buf[1] >> 4);
-	if (err) {
-		syslog(LOG_ERR, "HCI SCO status flag %u", err);
+	if (pkt_status) {
+		syslog(LOG_ERR, "HCI SCO status flag %u", pkt_status);
 		return handle_packet_loss(info);
 	}
 
 	/* There is chance that erroneous data reporting gives us false positive.
 	 * If mSBC frame extraction fails, we shall handle it as packet loss.
 	 */
-	frame_head =
-		extract_msbc_frame(info->hci_sco_buf + HCI_SCO_HDR_SIZE_BYTES,
-				   MSBC_PKT_SIZE, &seq);
+	frame_head = extract_msbc_frame(info->hci_sco_buf, MSBC_PKT_SIZE, &seq);
 	if (!frame_head) {
 		syslog(LOG_ERR, "Failed to extract msbc frame");
 		return handle_packet_loss(info);
@@ -541,23 +562,30 @@ recv_sample:
  * 2. When input device not attached, ignore the data just read.
  * 3. When output device attached, write one chunk of MTU bytes of data.
  */
-static int hfp_info_callback(void *arg)
+static int hfp_info_callback(void *arg, int revents)
 {
 	struct hfp_info *info = (struct hfp_info *)arg;
-	int err;
+	int err = 0;
 
 	if (!info->started)
 		return 0;
 
-	err = info->read_cb(info);
-	if (err < 0) {
-		syslog(LOG_ERR, "Read error");
-		goto read_write_error;
+	/* Allow last read before handling error or hang-up events. */
+	if (revents & POLLIN) {
+		err = info->read_cb(info);
+		if (err < 0) {
+			syslog(LOG_ERR, "Read error");
+			goto read_write_error;
+		}
 	}
-
 	/* Ignore the bytes just read if input dev not in present */
 	if (!info->input_format_bytes)
 		buf_increment_read(info->capture_buf, err);
+
+	if (revents & (POLLERR | POLLHUP)) {
+		syslog(LOG_ERR, "Error polling SCO socket, revent %d", revents);
+		goto read_write_error;
+	}
 
 	/* Without output stream's presence, we shall still send zero packets
 	 * to HF. This is required for some HF devices to start sending non-zero
@@ -588,7 +616,7 @@ read_write_error:
 	return 0;
 }
 
-struct hfp_info *hfp_info_create(int codec)
+struct hfp_info *hfp_info_create()
 {
 	struct hfp_info *info;
 	info = (struct hfp_info *)calloc(1, sizeof(*info));
@@ -602,17 +630,6 @@ struct hfp_info *hfp_info_create(int codec)
 	info->playback_buf = byte_buffer_create(MAX_HFP_BUF_SIZE_BYTES);
 	if (!info->playback_buf)
 		goto error;
-
-	if (codec == HFP_CODEC_ID_MSBC) {
-		info->write_cb = hfp_write_msbc;
-		info->read_cb = hfp_read_msbc;
-		info->msbc_read = cras_msbc_codec_create();
-		info->msbc_write = cras_msbc_codec_create();
-		info->msbc_plc = cras_msbc_plc_create();
-	} else {
-		info->write_cb = hfp_write;
-		info->read_cb = hfp_read;
-	}
 
 	return info;
 
@@ -632,7 +649,7 @@ int hfp_info_running(struct hfp_info *info)
 	return info->started;
 }
 
-int hfp_info_start(int fd, unsigned int mtu, struct hfp_info *info)
+int hfp_info_start(int fd, unsigned int mtu, int codec, struct hfp_info *info)
 {
 	info->fd = fd;
 	info->mtu = mtu;
@@ -642,7 +659,19 @@ int hfp_info_start(int fd, unsigned int mtu, struct hfp_info *info)
 	buf_reset(info->playback_buf);
 	buf_reset(info->capture_buf);
 
-	audio_thread_add_callback(info->fd, hfp_info_callback, info);
+	if (codec == HFP_CODEC_ID_MSBC) {
+		info->write_cb = hfp_write_msbc;
+		info->read_cb = hfp_read_msbc;
+		info->msbc_read = cras_msbc_codec_create();
+		info->msbc_write = cras_msbc_codec_create();
+		info->msbc_plc = cras_msbc_plc_create();
+	} else {
+		info->write_cb = hfp_write;
+		info->read_cb = hfp_read;
+	}
+
+	audio_thread_add_events_callback(info->fd, hfp_info_callback, info,
+					 POLLIN | POLLERR | POLLHUP);
 
 	info->started = 1;
 	info->msbc_num_out_frames = 0;
@@ -664,6 +693,23 @@ int hfp_info_stop(struct hfp_info *info)
 	info->fd = 0;
 	info->started = 0;
 
+	/* Unset the write/read callbacks. */
+	info->write_cb = NULL;
+	info->read_cb = NULL;
+
+	if (info->msbc_read) {
+		cras_sbc_codec_destroy(info->msbc_read);
+		info->msbc_read = NULL;
+	}
+	if (info->msbc_write) {
+		cras_sbc_codec_destroy(info->msbc_write);
+		info->msbc_write = NULL;
+	}
+	if (info->msbc_plc) {
+		cras_msbc_plc_destroy(info->msbc_plc);
+		info->msbc_plc = NULL;
+	}
+
 	if (info->msbc_num_in_frames) {
 		cras_server_metrics_hfp_packet_loss(
 			(float)info->msbc_num_lost_frames /
@@ -680,13 +726,6 @@ void hfp_info_destroy(struct hfp_info *info)
 
 	if (info->playback_buf)
 		byte_buffer_destroy(&info->playback_buf);
-
-	if (info->msbc_read)
-		cras_sbc_codec_destroy(info->msbc_read);
-	if (info->msbc_write)
-		cras_sbc_codec_destroy(info->msbc_write);
-	if (info->msbc_plc)
-		cras_msbc_plc_destroy(info->msbc_plc);
 
 	free(info);
 }
