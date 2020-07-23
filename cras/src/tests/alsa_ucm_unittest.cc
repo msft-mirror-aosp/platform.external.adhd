@@ -347,8 +347,8 @@ TEST(AlsaUcm, GetDevForMixer) {
 
   fake_list["_devices/HiFi"] = devices;
   fake_list_size["_devices/HiFi"] = 4;
-  std::string id_1 = "=MixerName/Dev1/HiFi";
-  std::string id_2 = "=MixerName/Dev2/HiFi";
+  std::string id_1 = "=PlaybackMixerElem/Dev1/HiFi";
+  std::string id_2 = "=CaptureMixerElem/Dev2/HiFi";
   std::string value_1 = "Value1";
   std::string value_2 = "Value2";
 
@@ -413,6 +413,38 @@ TEST(AlsaUcm, GetDeviceRateForDevice) {
       ucm_get_sample_rate_for_dev(mgr, "Dev2", CRAS_STREAM_OUTPUT);
   EXPECT_EQ(44100, input_dev_rate);
   EXPECT_EQ(48000, output_dev_rate);
+
+  ASSERT_EQ(2, snd_use_case_get_called);
+  EXPECT_EQ(snd_use_case_get_id[0], id_1);
+  EXPECT_EQ(snd_use_case_get_id[1], id_2);
+}
+
+TEST(AlsaUcm, GetDeviceChannelsForDevice) {
+  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
+  int rc;
+  size_t input_dev_channels, output_dev_channels;
+  const char* devices[] = {"Dev1", "Comment for Dev1", "Dev2",
+                           "Comment for Dev2"};
+
+  ResetStubData();
+
+  fake_list["_devices/HiFi"] = devices;
+  fake_list_size["_devices/HiFi"] = 4;
+  std::string id_1 = "=CaptureChannels/Dev1/HiFi";
+  std::string id_2 = "=PlaybackChannels/Dev2/HiFi";
+  std::string value_1 = "4";
+  std::string value_2 = "8";
+
+  snd_use_case_get_value[id_1] = value_1;
+  snd_use_case_get_value[id_2] = value_2;
+  rc = ucm_get_channels_for_dev(mgr, "Dev1", CRAS_STREAM_INPUT,
+                                &input_dev_channels);
+  EXPECT_EQ(0, rc);
+  EXPECT_EQ(4, input_dev_channels);
+  rc = ucm_get_channels_for_dev(mgr, "Dev2", CRAS_STREAM_OUTPUT,
+                                &output_dev_channels);
+  EXPECT_EQ(0, rc);
+  EXPECT_EQ(8, output_dev_channels);
 
   ASSERT_EQ(2, snd_use_case_get_called);
   EXPECT_EQ(snd_use_case_get_id[0], id_1);
@@ -862,15 +894,15 @@ TEST(AlsaUcm, GetMixerNameForDevice) {
 
   fake_list["_devices/HiFi"] = devices;
   fake_list_size["_devices/HiFi"] = 4;
-  std::string id_1 = "=MixerName/Dev1/HiFi";
-  std::string id_2 = "=MixerName/Dev2/HiFi";
+  std::string id_1 = "=PlaybackMixerElem/Dev1/HiFi";
+  std::string id_2 = "=CaptureMixerElem/Dev2/HiFi";
   std::string value_1 = "MixerName1";
   std::string value_2 = "MixerName2";
 
   snd_use_case_get_value[id_1] = value_1;
   snd_use_case_get_value[id_2] = value_2;
-  mixer_name_1 = ucm_get_mixer_name_for_dev(mgr, "Dev1");
-  mixer_name_2 = ucm_get_mixer_name_for_dev(mgr, "Dev2");
+  mixer_name_1 = ucm_get_playback_mixer_elem_for_dev(mgr, "Dev1");
+  mixer_name_2 = ucm_get_capture_mixer_elem_for_dev(mgr, "Dev2");
 
   EXPECT_EQ(0, strcmp(mixer_name_1, value_1.c_str()));
   EXPECT_EQ(0, strcmp(mixer_name_2, value_2.c_str()));
@@ -1125,14 +1157,14 @@ TEST(AlsaUcm, GetSections) {
                        "=CapturePCM/Mic/HiFi",
                        "=JackDev/Mic/HiFi",
                        "=JackSwitch/Mic/HiFi",
-                       "=MixerName/Mic/HiFi",
+                       "=CaptureMixerElem/Mic/HiFi",
 
                        "=CapturePCM/Internal Mic/HiFi",
                        "=CoupledMixers/Internal Mic/HiFi",
                        "=JackSwitch/Internal Mic/HiFi",
 
                        "=PlaybackPCM/HDMI/HiFi",
-                       "=MixerName/HDMI/HiFi",
+                       "=PlaybackMixerElem/HDMI/HiFi",
 
                        NULL};
   const char* values[] = {
@@ -1254,33 +1286,6 @@ TEST(AlsaUcm, GetSectionsMissingPCM) {
   const char* ids[] = {"=JackDev/Headphone/HiFi",
                        "=CoupledMixers/Headphone/HiFi", NULL};
   const char* values[] = {
-      "my-sound-card Headset Jack",
-      "HP-L,HP-R",
-  };
-
-  ResetStubData();
-
-  fake_list["_devices/HiFi"] = devices;
-  fake_list_size["_devices/HiFi"] = ARRAY_SIZE(devices);
-
-  while (ids[i]) {
-    snd_use_case_get_value[ids[i]] = values[i];
-    i++;
-  }
-
-  sections = ucm_get_sections(mgr);
-  EXPECT_EQ(NULL, sections);
-}
-
-TEST(AlsaUcm, GetSectionsBadPCM) {
-  struct cras_use_case_mgr* mgr = &cras_ucm_mgr;
-  struct ucm_section* sections;
-  int i = 0;
-  const char* devices[] = {"Headphone", "The headphones jack."};
-  const char* ids[] = {"=PlaybackPCM/Headphone/HiFi", "=JackDev/Headphone/HiFi",
-                       "=CoupledMixers/Headphone/HiFi", NULL};
-  const char* values[] = {
-      "hw:my-sound-card:0",
       "my-sound-card Headset Jack",
       "HP-L,HP-R",
   };
