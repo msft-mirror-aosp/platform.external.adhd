@@ -3,6 +3,7 @@
  * found in the LICENSE file.
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <string.h>
@@ -15,7 +16,7 @@
 #include "cras_alsa_card.h"
 #include "cras_board_config.h"
 #include "cras_config.h"
-#include "cras_device_blacklist.h"
+#include "cras_device_blocklist.h"
 #include "cras_observer.h"
 #include "cras_shm.h"
 #include "cras_system_state.h"
@@ -29,6 +30,11 @@ struct card_list {
 	struct card_list *prev, *next;
 };
 
+struct name_list {
+	char name[NAME_MAX];
+	struct name_list *prev, *next;
+};
+
 /* The system state.
  * Members:
  *    exp_state - The exported system state shared with clients.
@@ -40,7 +46,7 @@ struct card_list {
  *    device_config_dir - Directory of device configs where volume curves live.
  *    internal_ucm_suffix - The suffix to append to internal card name to
  *        control which ucm config file to load.
- *    device_blacklist - Blacklist of device the server will ignore.
+ *    device_blocklist - Blocklist of device the server will ignore.
  *    cards - A list of active sound cards in the system.
  *    update_lock - Protects the update_count, as audio threads can update the
  *      stream count.
@@ -59,13 +65,14 @@ static struct {
 	size_t shm_size;
 	const char *device_config_dir;
 	const char *internal_ucm_suffix;
-	struct cras_device_blacklist *device_blacklist;
+	struct name_list *ignore_suffix_cards;
+	struct cras_device_blocklist *device_blocklist;
 	struct card_list *cards;
 	pthread_mutex_t update_lock;
 	struct cras_tm *tm;
 	/* Select loop callback registration. */
-	int (*fd_add)(int fd, void (*cb)(void *data), void *cb_data,
-		      void *select_data);
+	int (*fd_add)(int fd, void (*cb)(void *data, int events), void *cb_data,
+		      int events, void *select_data);
 	void (*fd_rm)(int fd, void *select_data);
 	void *select_data;
 	int (*add_task)(void (*callback)(void *data), void *callback_data,
@@ -75,6 +82,39 @@ static struct {
 	pthread_t main_thread_tid;
 	bool bt_fix_a2dp_packet_size;
 } state;
+
+/* The string format is CARD1,CARD2,CARD3. Divide it into a list. */
+void init_ignore_suffix_cards(char *str)
+{
+	struct name_list *card;
+	char *ptr;
+
+	state.ignore_suffix_cards = NULL;
+
+	if (str == NULL)
+		return;
+
+	ptr = strtok(str, ",");
+	while (ptr != NULL) {
+		card = (struct name_list *)calloc(1, sizeof(*card));
+		if (!card) {
+			syslog(LOG_ERR, "Failed to call calloc: %d", errno);
+			return;
+		}
+		strncpy(card->name, ptr, NAME_MAX - 1);
+		DL_APPEND(state.ignore_suffix_cards, card);
+		ptr = strtok(NULL, ",");
+	}
+}
+
+void deinit_ignore_suffix_cards()
+{
+	struct name_list *card;
+	DL_FOREACH (state.ignore_suffix_cards, card) {
+		DL_DELETE(state.ignore_suffix_cards, card);
+		free(card);
+	}
+}
 
 /*
  * Exported Interface.
@@ -125,11 +165,13 @@ void cras_system_state_init(const char *device_config_dir, const char *shm_name,
 	state.exp_state = exp_state;
 
 	/* Directory for volume curve configs.
-	 * Note that device_config_dir does not affect device blacklist.
-	 * Device blacklist is common to all boards so we do not need
-	 * to change device blacklist at run time. */
+	 * Note that device_config_dir does not affect device blocklist.
+	 * Device blocklist is common to all boards so we do not need
+	 * to change device blocklist at run time. */
 	state.device_config_dir = device_config_dir;
 	state.internal_ucm_suffix = NULL;
+	init_ignore_suffix_cards(board_config.ucm_ignore_suffix);
+	free(board_config.ucm_ignore_suffix);
 
 	state.tm = cras_tm_init();
 	if (!state.tm) {
@@ -137,9 +179,9 @@ void cras_system_state_init(const char *device_config_dir, const char *shm_name,
 		exit(-ENOMEM);
 	}
 
-	/* Read config file for blacklisted devices. */
-	state.device_blacklist =
-		cras_device_blacklist_create(CRAS_CONFIG_FILE_DIR);
+	/* Read config file for blocklisted devices. */
+	state.device_blocklist =
+		cras_device_blocklist_create(CRAS_CONFIG_FILE_DIR);
 
 	/* Initialize snapshot buffer memory */
 	memset(&state.snapshot_buffer, 0,
@@ -160,7 +202,7 @@ void cras_system_state_deinit()
 {
 	/* Free any resources used.  This prevents unit tests from leaking. */
 
-	cras_device_blacklist_destroy(state.device_blacklist);
+	cras_device_blocklist_destroy(state.device_blocklist);
 
 	cras_tm_deinit(state.tm);
 
@@ -171,6 +213,7 @@ void cras_system_state_deinit()
 			close(state.shm_fd_ro);
 	}
 
+	deinit_ignore_suffix_cards();
 	pthread_mutex_destroy(&state.update_lock);
 }
 
@@ -349,6 +392,16 @@ bool cras_system_get_bt_fix_a2dp_packet_size_enabled()
 	return state.bt_fix_a2dp_packet_size;
 }
 
+bool cras_system_check_ignore_ucm_suffix(const char *card_name)
+{
+	struct name_list *card;
+	DL_FOREACH (state.ignore_suffix_cards, card) {
+		if (!strcmp(card->name, card_name))
+			return true;
+	}
+	return false;
+}
+
 int cras_system_add_alsa_card(struct cras_alsa_card_info *alsa_card_info)
 {
 	struct card_list *card;
@@ -364,11 +417,10 @@ int cras_system_add_alsa_card(struct cras_alsa_card_info *alsa_card_info)
 		if (card_index == cras_alsa_card_get_index(card->card))
 			return -EEXIST;
 	}
-	alsa_card = cras_alsa_card_create(
-		alsa_card_info, state.device_config_dir, state.device_blacklist,
-		(alsa_card_info->card_type == ALSA_CARD_TYPE_INTERNAL) ?
-			state.internal_ucm_suffix :
-			NULL);
+	alsa_card =
+		cras_alsa_card_create(alsa_card_info, state.device_config_dir,
+				      state.device_blocklist,
+				      state.internal_ucm_suffix);
 	if (alsa_card == NULL)
 		return -ENOMEM;
 	card = calloc(1, sizeof(*card));
@@ -406,8 +458,8 @@ int cras_system_alsa_card_exists(unsigned alsa_card_index)
 }
 
 int cras_system_set_select_handler(
-	int (*add)(int fd, void (*callback)(void *data), void *callback_data,
-		   void *select_data),
+	int (*add)(int fd, void (*callback)(void *data, int events),
+		   void *callback_data, int events, void *select_data),
 	void (*rm)(int fd, void *select_data), void *select_data)
 {
 	if (state.fd_add != NULL || state.fd_rm != NULL)
@@ -418,12 +470,13 @@ int cras_system_set_select_handler(
 	return 0;
 }
 
-int cras_system_add_select_fd(int fd, void (*callback)(void *data),
-			      void *callback_data)
+int cras_system_add_select_fd(int fd, void (*callback)(void *data, int revents),
+			      void *callback_data, int events)
 {
 	if (state.fd_add == NULL)
 		return -EINVAL;
-	return state.fd_add(fd, callback, callback_data, state.select_data);
+	return state.fd_add(fd, callback, callback_data, events,
+			    state.select_data);
 }
 
 int cras_system_set_add_task_handler(int (*add_task)(void (*cb)(void *data),
