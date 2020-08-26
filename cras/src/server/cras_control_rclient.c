@@ -270,7 +270,14 @@ static int direction_valid(enum CRAS_STREAM_DIRECTION direction)
 }
 
 /* Entry point for handling a message from the client.  Called from the main
- * server context. */
+ * server context.
+ *
+ * If the message from clients has incorrect length (truncated message), return
+ * an error up to CRAS server.
+ * If the message from clients has invalid content, should return the errors to
+ * clients by send_message_to_client and return 0 here.
+ *
+ */
 static int ccr_handle_message_from_client(struct cras_rclient *client,
 					  const struct cras_server_message *msg,
 					  int *fds, unsigned int num_fds)
@@ -292,16 +299,17 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 		int client_shm_fd = num_fds > 1 ? fds[1] : -1;
 		struct cras_connect_message cmsg;
 		if (MSG_LEN_VALID(msg, struct cras_connect_message)) {
-			return rclient_handle_client_stream_connect(
+			rclient_handle_client_stream_connect(
 				client,
 				(const struct cras_connect_message *)msg, fd,
 				client_shm_fd);
 		} else if (!convert_connect_message_old(msg, &cmsg)) {
-			return rclient_handle_client_stream_connect(
-				client, &cmsg, fd, client_shm_fd);
+			rclient_handle_client_stream_connect(client, &cmsg, fd,
+							     client_shm_fd);
 		} else {
 			return -EINVAL;
 		}
+		break;
 	}
 	case CRAS_SERVER_DISCONNECT_STREAM:
 		if (!MSG_LEN_VALID(msg, struct cras_disconnect_stream_message))
@@ -449,17 +457,33 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 	case CRAS_CONFIG_GLOBAL_REMIX: {
 		const struct cras_config_global_remix *m =
 			(const struct cras_config_global_remix *)msg;
+		float *coefficient;
+
 		if (!MSG_LEN_VALID(msg, struct cras_config_global_remix) ||
 		    m->num_channels > CRAS_MAX_REMIX_CHANNELS)
 			return -EINVAL;
-		size_t size_with_coefficients =
-			sizeof(*m) + m->num_channels * m->num_channels *
-					     sizeof(m->coefficient[0]);
+		const size_t coefficient_len =
+			m->num_channels * m->num_channels;
+		const size_t size_with_coefficients =
+			sizeof(*m) +
+			coefficient_len * sizeof(m->coefficient[0]);
 		if (size_with_coefficients != msg->length)
 			return -EINVAL;
+
+		coefficient =
+			(float *)calloc(coefficient_len, sizeof(coefficient));
+		if (!coefficient) {
+			syslog(LOG_ERR,
+			       "Failed to create local coefficient array.");
+			break;
+		}
+		memcpy(coefficient, m->coefficient,
+		       coefficient_len * sizeof(coefficient));
+
 		audio_thread_config_global_remix(
 			cras_iodev_list_get_audio_thread(), m->num_channels,
-			m->coefficient);
+			coefficient);
+		free(coefficient);
 		break;
 	}
 	case CRAS_SERVER_GET_HOTWORD_MODELS: {
