@@ -107,7 +107,7 @@ cras_server_SOURCES = \
 	server/buffer_share.c \
 	server/config/cras_board_config.c \
 	server/config/cras_card_config.c \
-	server/config/cras_device_blacklist.c \
+	server/config/cras_device_blocklist.c \
 	server/cras_alert.c \
 	server/cras_alsa_card.c \
 	server/cras_alsa_helpers.c \
@@ -115,6 +115,7 @@ cras_server_SOURCES = \
 	server/cras_alsa_jack.c \
 	server/cras_alsa_mixer.c \
 	server/cras_alsa_mixer_name.c \
+	server/cras_alsa_plugin_io.c \
 	server/cras_alsa_ucm.c \
 	server/cras_alsa_ucm_section.c \
 	server/cras_audio_area.c \
@@ -417,7 +418,7 @@ TESTS = \
 	device_monitor_unittest \
 	dev_io_unittest \
 	dev_stream_unittest \
-	device_blacklist_unittest \
+	device_blocklist_unittest \
 	dsp_core_unittest \
 	dsp_ini_unittest \
 	dsp_pipeline_unittest \
@@ -670,7 +671,8 @@ audio_thread_monitor_unittest_LDADD = -lgtest -lpthread -lrt
 
 if HAVE_DBUS
 bt_device_unittest_SOURCES = tests/bt_device_unittest.cc \
-	server/cras_bt_device.c
+	server/cras_bt_device.c \
+	tests/metrics_stub.cc
 bt_device_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common $(DBUS_CFLAGS)
 bt_device_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
@@ -748,12 +750,12 @@ dev_stream_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server
 dev_stream_unittest_LDADD = -lgtest -liniparser -lpthread -lrt
 
-device_blacklist_unittest_SOURCES = tests/device_blacklist_unittest.cc \
-	server/config/cras_device_blacklist.c
-device_blacklist_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
+device_blocklist_unittest_SOURCES = tests/device_blocklist_unittest.cc \
+	server/config/cras_device_blocklist.c
+device_blocklist_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config $(CRAS_UT_TMPDIR_CFLAGS)
-device_blacklist_unittest_LDADD = -lgtest -liniparser -lpthread
+device_blocklist_unittest_LDADD = -lgtest -liniparser -lpthread
 
 device_monitor_unittest_SOURCES = tests/device_monitor_unittest.cc
 device_monitor_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
@@ -875,11 +877,11 @@ iodev_list_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 iodev_list_unittest_LDADD = -lgtest -lpthread
 
 loopback_iodev_unittest_SOURCES = tests/loopback_iodev_unittest.cc \
-	server/cras_loopback_iodev.c common/sfh.c
+	server/cras_loopback_iodev.c common/cras_shm.c common/sfh.c
 loopback_iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server
-loopback_iodev_unittest_LDADD = -lgtest -lpthread
+loopback_iodev_unittest_LDADD = -lgtest -lpthread -lrt
 
 input_data_unittest_SOURCES = tests/input_data_unittest.cc \
 	server/input_data.c
@@ -984,7 +986,7 @@ stream_list_unittest_LDADD = -lgtest -lpthread
 
 system_state_unittest_SOURCES = tests/system_state_unittest.cc \
 	server/cras_system_state.c common/cras_shm.c \
-	server/config/cras_board_config.c $(CRAS_SELINUX_UNITTEST_SOURCES)
+       	$(CRAS_SELINUX_UNITTEST_SOURCES)
 system_state_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/server/config $(SELINUX_CFLAGS)
