@@ -146,6 +146,7 @@ static thread_callback audio_thread_cb;
 static void* audio_thread_cb_data;
 static int hotword_send_triggered_msg_called;
 static struct timespec clock_gettime_retspec;
+static unsigned cras_iodev_reset_rate_estimator_called;
 
 void ResetStubData() {
   cras_alsa_open_called = 0;
@@ -224,6 +225,7 @@ void ResetStubData() {
   cras_iodev_dsp_set_swap_mode_for_node_called = 0;
   ucm_get_default_node_gain_values.clear();
   ucm_get_intrinsic_sensitivity_values.clear();
+  cras_iodev_reset_rate_estimator_called = 0;
 }
 
 static long fake_get_dBFS(const struct cras_volume_curve* curve,
@@ -1073,7 +1075,6 @@ TEST(AlsaOutputNode, TwoJacksHeadphoneLineout) {
 }
 
 TEST(AlsaOutputNode, MaxSupportedChannels) {
-  struct alsa_io* aio;
   struct cras_use_case_mgr* const fake_ucm = (struct cras_use_case_mgr*)3;
   struct cras_iodev* iodev;
   struct ucm_section* section;
@@ -1090,7 +1091,6 @@ TEST(AlsaOutputNode, MaxSupportedChannels) {
         1, NULL, ALSA_CARD_TYPE_INTERNAL, 1, fake_mixer, fake_config, fake_ucm,
         CRAS_STREAM_OUTPUT);
     ASSERT_NE(iodev, (void*)NULL);
-    aio = reinterpret_cast<struct alsa_io*>(iodev);
 
     // Node without controls or jacks.
     section = ucm_section_create(INTERNAL_SPEAKER, "hw:0,1", 1, -1,
@@ -2209,6 +2209,7 @@ TEST_F(AlsaFreeRunTestSuite, LeaveFreeRunNotInFreeRunMoreRemain) {
   EXPECT_EQ(0, cras_iodev_fill_odev_zeros_frames);
   EXPECT_EQ(0, aio.free_running);
   EXPECT_EQ(0, aio.filled_zeros_for_draining);
+  EXPECT_EQ(1, cras_iodev_reset_rate_estimator_called);
 }
 
 TEST_F(AlsaFreeRunTestSuite, LeaveFreeRunNotInFreeRunLessRemain) {
@@ -2233,6 +2234,7 @@ TEST_F(AlsaFreeRunTestSuite, LeaveFreeRunNotInFreeRunLessRemain) {
   EXPECT_EQ(96, cras_iodev_fill_odev_zeros_frames);
   EXPECT_EQ(0, aio.free_running);
   EXPECT_EQ(0, aio.filled_zeros_for_draining);
+  EXPECT_EQ(1, cras_iodev_reset_rate_estimator_called);
 }
 
 TEST_F(AlsaFreeRunTestSuite, LeaveFreeRunInFreeRun) {
@@ -2250,6 +2252,7 @@ TEST_F(AlsaFreeRunTestSuite, LeaveFreeRunInFreeRun) {
             cras_alsa_resume_appl_ptr_ahead);
   EXPECT_EQ(0, aio.free_running);
   EXPECT_EQ(0, aio.filled_zeros_for_draining);
+  EXPECT_EQ(1, cras_iodev_reset_rate_estimator_called);
 }
 
 // Reuse AlsaFreeRunTestSuite for output underrun handling because they are
@@ -2918,6 +2921,7 @@ void cras_iodev_init_audio_area(struct cras_iodev* iodev, int num_channels) {}
 void cras_iodev_free_audio_area(struct cras_iodev* iodev) {}
 
 int cras_iodev_reset_rate_estimator(const struct cras_iodev* iodev) {
+  cras_iodev_reset_rate_estimator_called++;
   return 0;
 }
 
