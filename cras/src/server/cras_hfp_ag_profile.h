@@ -26,12 +26,6 @@
 
 struct hfp_slc_handle;
 
-/* Re-registers HFP to the next version. Currently on HFP 1.5 and next is 1.7.
- * Args:
- *    enabled - True to register HFP 1.7 otherwise to HFP 1.5
- */
-int cras_hfp_ag_profile_next_handsfree(DBusConnection *conn, bool enabled);
-
 /* Adds a profile instance for HFP AG (Hands-Free Profile Audio Gateway). */
 int cras_hfp_ag_profile_create(DBusConnection *conn);
 
@@ -58,5 +52,9 @@ struct hfp_slc_handle *cras_hfp_ag_get_active_handle();
 
 /* Gets the SLC handle for given cras_bt_device. */
 struct hfp_slc_handle *cras_hfp_ag_get_slc(struct cras_bt_device *device);
+
+/* Iterate all possible AGs (theoratically only one) and signal its battery
+ * level */
+void cras_hfp_ag_resend_device_battery_level();
 
 #endif /* CRAS_HFP_AG_PROFILE_H_ */

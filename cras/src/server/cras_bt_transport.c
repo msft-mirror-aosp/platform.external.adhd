@@ -287,17 +287,24 @@ void cras_bt_transport_update_properties(struct cras_bt_transport *transport,
 		} else if (type == DBUS_TYPE_OBJECT_PATH) {
 			const char *obj_path;
 
-			/* Property: object Device [readonly] */
-			dbus_message_iter_get_basic(&variant_iter, &obj_path);
-			transport->device = cras_bt_device_get(obj_path);
-			if (!transport->device) {
-				syslog(LOG_ERR,
-				       "Device %s not found at update"
-				       "transport properties",
-				       obj_path);
-				transport->device = cras_bt_device_create(
-					transport->conn, obj_path);
-				cras_bt_transport_update_device(transport);
+			if (strcmp(key, "Device") == 0) {
+				/* Property: object Device [readonly] */
+				dbus_message_iter_get_basic(&variant_iter,
+							    &obj_path);
+				transport->device =
+					cras_bt_device_get(obj_path);
+				if (!transport->device) {
+					syslog(LOG_ERR,
+					       "Device %s not found at update "
+					       "transport properties",
+					       obj_path);
+					transport->device =
+						cras_bt_device_create(
+							transport->conn,
+							obj_path);
+					cras_bt_transport_update_device(
+						transport);
+				}
 			}
 		} else if (strcmp(dbus_message_iter_get_signature(&variant_iter),
 				  "ay") == 0 &&
@@ -324,6 +331,7 @@ void cras_bt_transport_update_properties(struct cras_bt_transport *transport,
 
 			dbus_message_iter_get_basic(&variant_iter, &volume);
 			transport->volume = volume;
+			BTLOG(btlog, BT_TRANSPORT_UPDATE_VOLUME, volume, 0);
 			cras_bt_transport_update_device(transport);
 		}
 
@@ -377,6 +385,7 @@ int cras_bt_transport_set_volume(struct cras_bt_transport *transport,
 	DBusMessageIter message_iter, variant;
 	DBusPendingCall *pending_call;
 
+	BTLOG(btlog, BT_TRANSPORT_SET_VOLUME, volume, 0);
 	method_call =
 		dbus_message_new_method_call(BLUEZ_SERVICE,
 					     transport->object_path,

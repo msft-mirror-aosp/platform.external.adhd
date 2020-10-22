@@ -310,7 +310,7 @@ put_stdin_samples(struct cras_client *client, cras_stream_id_t stream_id,
 	int rc = 0;
 	uint32_t frame_bytes = cras_client_format_bytes_per_frame(aud_format);
 
-	rc = read(0, playback_samples, frames * frame_bytes);
+	rc = read(0, playback_samples, (size_t)frames * (size_t)frame_bytes);
 	if (rc <= 0) {
 		terminate_stream_loop();
 		return -1;
@@ -504,17 +504,17 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 	unsigned int data2 = log->log[tag_idx].data2;
 	unsigned int data3 = log->log[tag_idx].data3;
 	time_t lt;
-	struct tm *t;
+	struct tm t;
 
 	/* Skip unused log entries. */
 	if (log->log[tag_idx].tag_sec == 0 && log->log[tag_idx].nsec == 0)
 		return;
 
-	/* Convert from monotomic raw clock to realtime clock. */
+	/* Convert from monotonic raw clock to realtime clock. */
 	convert_time(&sec, &nsec, sec_offset, nsec_offset);
 	lt = sec;
-	t = localtime(&lt);
-	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", t);
+	localtime_r(&lt, &t);
+	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", &t);
 
 	printf("%s.%09u cras atlog  ", time_str, nsec);
 
@@ -533,16 +533,16 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 	}
 	convert_time(&sec, &nsec, sec_offset, nsec_offset);
 	lt = sec;
-	t = localtime(&lt);
-	strftime(time_str, 128, " %H:%M:%S", t);
+	localtime_r(&lt, &t);
+	strftime(time_str, 128, " %H:%M:%S", &t);
 
 	switch (tag) {
 	case AUDIO_THREAD_WAKE:
 		printf("%-30s num_fds:%d\n", "WAKE", (int)data1);
 		break;
 	case AUDIO_THREAD_SLEEP:
-		printf("%-30s sleep:%09d.%09d\n", "SLEEP", (int)data1,
-		       (int)data2);
+		printf("%-30s sleep:%09d.%09d non_empty %u\n", "SLEEP",
+		       (int)data1, (int)data2, (int)data3);
 		break;
 	case AUDIO_THREAD_READ_AUDIO:
 		printf("%-30s dev:%u hw_level:%u read:%u\n", "READ_AUDIO",
@@ -775,8 +775,8 @@ static void print_audio_debug_info(const struct audio_debug_info *info)
 
 	for (i = 0; i < info->num_streams; i++) {
 		int channel;
-		printf("stream: %llu dev: %u\n",
-		       (unsigned long long)info->streams[i].stream_id,
+		printf("stream: 0x%" PRIx64 " dev: %u\n",
+		       info->streams[i].stream_id,
 		       (unsigned int)info->streams[i].dev_idx);
 		printf("direction: %s\n",
 		       (info->streams[i].direction == CRAS_STREAM_INPUT) ?
@@ -848,6 +848,92 @@ static void audio_debug_info(struct cras_client *client)
 	pthread_mutex_unlock(&done_mutex);
 }
 
+static void show_mainlog_tag(const struct main_thread_event_log *log,
+			     unsigned int tag_idx, int32_t sec_offset,
+			     int32_t nsec_offset)
+{
+	unsigned int tag = (log->log[tag_idx].tag_sec >> 24) & 0xff;
+	unsigned int sec = log->log[tag_idx].tag_sec & 0x00ffffff;
+	unsigned int nsec = log->log[tag_idx].nsec;
+	unsigned int data1 = log->log[tag_idx].data1;
+	unsigned int data2 = log->log[tag_idx].data2;
+	unsigned int data3 = log->log[tag_idx].data3;
+	time_t lt;
+	struct tm t;
+
+	/* Skip unused log entries. */
+	if (log->log[tag_idx].tag_sec == 0 && log->log[tag_idx].nsec == 0)
+		return;
+
+	/* Convert from monotomic raw clock to realtime clock. */
+	convert_time(&sec, &nsec, sec_offset, nsec_offset);
+	lt = sec;
+	localtime_r(&lt, &t);
+	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", &t);
+
+	printf("%s.%09u cras mainlog  ", time_str, nsec);
+
+	switch (tag) {
+	case MAIN_THREAD_DEV_CLOSE:
+		printf("%-30s dev %u\n", "DEV_CLOSE", data1);
+		break;
+	case MAIN_THREAD_DEV_DISABLE:
+		printf("%-30s dev %u force %u\n", "DEV_DISABLE", data1, data2);
+		break;
+	case MAIN_THREAD_DEV_INIT:
+		printf("%-30s dev %u ch %u rate %u\n", "DEV_INIT", data1, data2,
+		       data3);
+		break;
+	case MAIN_THREAD_DEV_REOPEN:
+		printf("%-30s new ch %u old ch %u rate %u\n", "DEV_REOPEN",
+		       data1, data2, data3);
+		break;
+	case MAIN_THREAD_ADD_ACTIVE_NODE:
+		printf("%-30s dev %u\n", "ADD_ACTIVE_NODE", data1);
+		break;
+	case MAIN_THREAD_SELECT_NODE:
+		printf("%-30s dev %u\n", "SELECT_NODE", data1);
+		break;
+	case MAIN_THREAD_ADD_TO_DEV_LIST:
+		printf("%-30s dev %u %s\n", "ADD_TO_DEV_LIST", data1,
+		       (data2 == CRAS_STREAM_OUTPUT) ? "output" : "input");
+		break;
+	case MAIN_THREAD_NODE_PLUGGED:
+		printf("%-30s dev %u %s\n", "NODE_PLUGGED", data1,
+		       data2 ? "plugged" : "unplugged");
+		break;
+	case MAIN_THREAD_INPUT_NODE_GAIN:
+		printf("%-30s dev %u gain %u\n", "INPUT_NODE_GAIN", data1,
+		       data2);
+		break;
+	case MAIN_THREAD_OUTPUT_NODE_VOLUME:
+		printf("%-30s dev %u volume %u\n", "OUTPUT_NODE_VOLUME", data1,
+		       data2);
+		break;
+	case MAIN_THREAD_SET_OUTPUT_USER_MUTE:
+		printf("%-30s mute %u\n", "SET_OUTPUT_USER_MUTE", data1);
+		break;
+	case MAIN_THREAD_RESUME_DEVS:
+		printf("RESUME_DEVS\n");
+		break;
+	case MAIN_THREAD_SUSPEND_DEVS:
+		printf("SUSPEND_DEVS\n");
+		break;
+	case MAIN_THREAD_STREAM_ADDED:
+		printf("%-30s %s stream 0x%x buffer frames %u\n",
+		       "STREAM_ADDED",
+		       (data2 == CRAS_STREAM_OUTPUT ? "output" : "input"),
+		       data1, data3);
+		break;
+	case MAIN_THREAD_STREAM_REMOVED:
+		printf("%-30s stream 0x%x\n", "STREAM_REMOVED", data1);
+		break;
+	default:
+		printf("%-30s\n", "UNKNOWN");
+		break;
+	}
+}
+
 static void show_btlog_tag(const struct cras_bt_event_log *log,
 			   unsigned int tag_idx, int32_t sec_offset,
 			   int32_t nsec_offset)
@@ -858,17 +944,17 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 	unsigned int data1 = log->log[tag_idx].data1;
 	unsigned int data2 = log->log[tag_idx].data2;
 	time_t lt;
-	struct tm *t;
+	struct tm t;
 
 	/* Skip unused log entries. */
 	if (log->log[tag_idx].tag_sec == 0 && log->log[tag_idx].nsec == 0)
 		return;
 
-	/* Convert from monotomic raw clock to realtime clock. */
+	/* Convert from monotonic raw clock to realtime clock. */
 	convert_time(&sec, &nsec, sec_offset, nsec_offset);
 	lt = sec;
-	t = localtime(&lt);
-	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", t);
+	localtime_r(&lt, &t);
+	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", &t);
 
 	printf("%s.%09u cras btlog  ", time_str, nsec);
 
@@ -905,7 +991,7 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		       data2);
 		break;
 	case BT_DEV_CONNECTED_CHANGE:
-		printf("%-30s profiles %u now %u\n", "DEV_CONENCTED_CHANGE",
+		printf("%-30s profiles %u now %u\n", "DEV_CONNECTED_CHANGE",
 		       data1, data2);
 		break;
 	case BT_DEV_CONN_WATCH_CB:
@@ -919,6 +1005,15 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 	case BT_HFP_HF_INDICATOR:
 		printf("%-30s HF read AG %s indicator\n", "HFP_HF_INDICATOR",
 		       data1 ? "enabled" : "supported");
+		break;
+	case BT_HFP_SET_SPEAKER_GAIN:
+		printf("%-30s HF set speaker gain %u\n", "HFP_SET_SPEAKER_GAIN",
+		       data1);
+		break;
+	case BT_HFP_UPDATE_SPEAKER_GAIN:
+		printf("%-30s HF update speaker gain %u\n",
+		       "HFP_UPDATE_SPEAKER_GAIN", data1);
+		break;
 	case BT_HFP_NEW_CONNECTION:
 		printf("%-30s\n", "HFP_NEW_CONNECTION");
 		break;
@@ -953,6 +1048,12 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 	case BT_TRANSPORT_RELEASE:
 		printf("%-30s\n", "TRANSPORT_RELEASE");
 		break;
+	case BT_TRANSPORT_SET_VOLUME:
+		printf("%-30s %d\n", "TRANSPORT_SET_VOLUME", data1);
+		break;
+	case BT_TRANSPORT_UPDATE_VOLUME:
+		printf("%-30s %d\n", "TRANSPORT_UPDATE_VOLUME", data1);
+		break;
 	default:
 		printf("%-30s\n", "UNKNOWN");
 		break;
@@ -975,6 +1076,30 @@ static void cras_bt_debug_info(struct cras_client *client)
 		show_btlog_tag(&info->bt_log, j, sec_offset, nsec_offset);
 		j++;
 		j %= info->bt_log.len;
+	}
+
+	/* Signal main thread we are done after the last chunk. */
+	pthread_mutex_lock(&done_mutex);
+	pthread_cond_signal(&done_cond);
+	pthread_mutex_unlock(&done_mutex);
+}
+
+static void main_thread_debug_info(struct cras_client *client)
+{
+	const struct main_thread_debug_info *info;
+	time_t sec_offset;
+	int32_t nsec_offset;
+	int i, j;
+
+	info = cras_client_get_main_thread_debug_info(client);
+	fill_time_offset(&sec_offset, &nsec_offset);
+	j = info->main_log.write_pos;
+	i = 0;
+	printf("Main debug log:\n");
+	for (; i < info->main_log.len; i++) {
+		show_mainlog_tag(&info->main_log, j, sec_offset, nsec_offset);
+		j++;
+		j %= info->main_log.len;
 	}
 
 	/* Signal main thread we are done after the last chunk. */
@@ -1416,6 +1541,22 @@ static void show_cras_bt_debug_info(struct cras_client *client)
 	pthread_mutex_unlock(&done_mutex);
 }
 
+static void show_main_thread_debug_info(struct cras_client *client)
+{
+	struct timespec wait_time;
+	cras_client_run_thread(client);
+	cras_client_connected_wait(client); /* To synchronize data. */
+	cras_client_update_main_thread_debug_info(client,
+						  main_thread_debug_info);
+
+	clock_gettime(CLOCK_REALTIME, &wait_time);
+	wait_time.tv_sec += 2;
+
+	pthread_mutex_lock(&done_mutex);
+	pthread_cond_timedwait(&done_cond, &done_mutex, &wait_time);
+	pthread_mutex_unlock(&done_mutex);
+}
+
 static void hotword_models_cb(struct cras_client *client,
 			      const char *hotword_models)
 {
@@ -1446,7 +1587,7 @@ static void check_output_plugged(struct cras_client *client, const char *name)
 	       cras_client_output_dev_plugged(client, name) ? "Yes" : "No");
 }
 
-/* Repeatedly mute and unmute the output until there is an error. */
+/* Repeatedly mute and un-mute the output until there is an error. */
 static void mute_loop_test(struct cras_client *client, int auto_reconnect)
 {
 	int mute = 0;
@@ -1587,6 +1728,7 @@ static struct option long_options[] = {
 	{"connection_type",     required_argument,      0, 'K'},
 	{"loopback_file",       required_argument,      0, 'L'},
 	{"mute_loop_test",      required_argument,      0, 'M'},
+	{"dump_main",		no_argument,		0, 'N'},
 	{"playback_file",       required_argument,      0, 'P'},
 	{"stream_type",         required_argument,      0, 'T'},
 	{0, 0, 0, 0}
@@ -1610,7 +1752,7 @@ static void show_usage()
 	printf("--capture_file <name> - "
 	       "Name of file to record to.\n");
 	printf("--capture_gain <dB> - "
-	       "Set system caputre gain in dB*100 (100 = 1dB).\n");
+	       "Set system capture gain in dB*100 (100 = 1dB).\n");
 	printf("--capture_mute <0|1> - "
 	       "Set capture mute state.\n");
 	printf("--channel_layout <layout_str> - "
@@ -1633,6 +1775,8 @@ static void show_usage()
 	       "Dumps audio thread info.\n");
 	printf("--dump_bt - "
 	       "Dumps debug info for bt audio\n");
+	printf("--dump_main - "
+	       "Dumps debug info from main thread\n");
 	printf("--dump_dsp - "
 	       "Print status of dsp to syslog.\n");
 	printf("--dump_server_info - "
@@ -1657,7 +1801,7 @@ static void show_usage()
 	printf("--mute <0|1> - "
 	       "Set system mute state.\n");
 	printf("--mute_loop_test <0|1> - "
-	       "Continuously loop mute/umute.\n"
+	       "Continuously loop mute/un-mute.\n"
 	       "                         "
 	       "Argument: 0 - stop on error.\n"
 	       "                         "
@@ -1711,7 +1855,7 @@ static void show_usage()
 	printf("--suspend <0|1> - "
 	       "Set audio suspend state.\n");
 	printf("--swap_left_right <N>:<M>:<0|1> - "
-	       "Swap or unswap (1 or 0) the left and right channel for the "
+	       "Swap or un-swap (1 or 0) the left and right channel for the "
 	       "ionode with the given index M on the device with index N\n");
 	printf("--stream_type <N> - "
 	       "Specify the type of the stream.\n");
@@ -2030,7 +2174,8 @@ int main(int argc, char **argv)
 
 			s = strtok(optarg, ":");
 			nch = atoi(s);
-			coeff = (float *)calloc(nch * nch, sizeof(*coeff));
+			coeff = (float *)calloc((size_t)nch * (size_t)nch,
+						sizeof(*coeff));
 			for (size = 0; size < nch * nch; size++) {
 				s = strtok(NULL, ",");
 				if (NULL == s)
@@ -2150,6 +2295,9 @@ int main(int argc, char **argv)
 			break;
 		case 'M':
 			mute_loop_test(client, atoi(optarg));
+			break;
+		case 'N':
+			show_main_thread_debug_info(client);
 			break;
 		case 'P':
 			playback_file = optarg;
