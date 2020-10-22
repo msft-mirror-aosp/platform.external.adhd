@@ -835,6 +835,7 @@ static void *audio_io_thread(void *arg)
 	while (1) {
 		struct timespec *wait_ts;
 		struct iodev_callback_list *iodev_cb;
+		int non_empty;
 
 		wait_ts = NULL;
 		thread->num_pollfds = 1;
@@ -843,6 +844,9 @@ static void *audio_io_thread(void *arg)
 		dev_io_run(&thread->open_devs[CRAS_STREAM_OUTPUT],
 			   &thread->open_devs[CRAS_STREAM_INPUT],
 			   thread->remix_converter);
+
+		non_empty = dev_io_check_non_empty_state_transition(
+			thread->open_devs[CRAS_STREAM_OUTPUT]);
 
 		if (fill_next_sleep_interval(thread, &ts))
 			wait_ts = &ts;
@@ -884,7 +888,7 @@ static void *audio_io_thread(void *arg)
 		log_busyloop(wait_ts);
 
 		ATLOG(atlog, AUDIO_THREAD_SLEEP, wait_ts ? wait_ts->tv_sec : 0,
-		      wait_ts ? wait_ts->tv_nsec : 0, 0);
+		      wait_ts ? wait_ts->tv_nsec : 0, non_empty);
 		if (wait_ts)
 			check_busyloop(wait_ts);
 
@@ -894,6 +898,16 @@ static void *audio_io_thread(void *arg)
 
 		rc = ppoll(thread->pollfds, thread->num_pollfds, wait_ts, NULL);
 		ATLOG(atlog, AUDIO_THREAD_WAKE, rc, 0, 0);
+
+		/* Handle callbacks registered by TRIGGER_WAKEUP */
+		DL_FOREACH (iodev_callbacks, iodev_cb) {
+			if (iodev_cb->trigger == TRIGGER_WAKEUP) {
+				ATLOG(atlog, AUDIO_THREAD_IODEV_CB, 0, 0, 0);
+				iodev_cb->cb(iodev_cb->cb_data, 0);
+			}
+		}
+
+		/* If there's no pollfd ready to handle. */
 		if (rc <= 0)
 			continue;
 
@@ -911,9 +925,6 @@ static void *audio_io_thread(void *arg)
 				      iodev_cb->events, 0);
 				iodev_cb->cb(iodev_cb->cb_data,
 					     iodev_cb->pollfd->revents);
-			} else if (iodev_cb->trigger == TRIGGER_WAKEUP) {
-				ATLOG(atlog, AUDIO_THREAD_IODEV_CB, 0, 0, 0);
-				iodev_cb->cb(iodev_cb->cb_data, 0);
 			}
 		}
 	}

@@ -134,22 +134,24 @@ impl FromStr for StreamEffect {
 pub trait StreamSource: Send {
     /// Returns a stream control and buffer generator object. These are separate as the buffer
     /// generator might want to be passed to the audio stream.
+    #[allow(clippy::type_complexity)]
     fn new_playback_stream(
         &mut self,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> Result<(Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>), BoxError>;
 
     /// Returns a stream control and buffer generator object. These are separate as the buffer
     /// generator might want to be passed to the audio stream.
     /// Default implementation returns `DummyStreamControl` and `DummyCaptureStream`.
+    #[allow(clippy::type_complexity)]
     fn new_capture_stream(
         &mut self,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> Result<
         (
@@ -318,7 +320,7 @@ impl DummyStream {
     pub fn new(
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> Self {
         let frame_size = format.sample_bytes() * num_channels;
@@ -378,11 +380,12 @@ impl DummyStreamSource {
 }
 
 impl StreamSource for DummyStreamSource {
+    #[allow(clippy::type_complexity)]
     fn new_playback_stream(
         &mut self,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> Result<(Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>), BoxError> {
         Ok((
@@ -426,7 +429,7 @@ mod tests {
             const FRAME_SIZE: usize = 4;
             let mut buf = [0u8; 480 * FRAME_SIZE];
             let mut pb_buf = PlaybackBuffer::new(FRAME_SIZE, &mut buf, &mut test_drop).unwrap();
-            pb_buf.write(&[0xa5u8; 480 * FRAME_SIZE]).unwrap();
+            pb_buf.write_all(&[0xa5u8; 480 * FRAME_SIZE]).unwrap();
         }
         assert_eq!(test_drop.frame_count, 480);
     }
