@@ -20,12 +20,12 @@
 #include "cras_server_metrics.h"
 #include "cras_system_state.h"
 #include "cras_iodev_list.h"
+#include "cras_observer.h"
 #include "utlist.h"
 
 #define HFP_AG_PROFILE_NAME "Hands-Free Voice gateway"
 #define HFP_AG_PROFILE_PATH "/org/chromium/Cras/Bluetooth/HFPAG"
-#define HFP_VERSION_1_5 0x0105
-#define HFP_VERSION_1_7 0x0107
+#define HFP_VERSION 0x0107
 #define HSP_AG_PROFILE_NAME "Headset Voice gateway"
 #define HSP_AG_PROFILE_PATH "/org/chromium/Cras/Bluetooth/HSPAG"
 #define HSP_VERSION_1_2 0x0102
@@ -76,8 +76,7 @@
 #define BSRF_SUPPORTED_FEATURES (AG_ENHANCED_CALL_STATUS | AG_HF_INDICATORS)
 
 /* The "SupportedFeatures" attribute value of HFP AG service record in CRAS. */
-#define SDP_SUPPORTED_FEATURES 0
-#define SDP_SUPPORTED_FEATURES_1_7 FEATURES_AG_WIDE_BAND_SPEECH
+#define SDP_SUPPORTED_FEATURES FEATURES_AG_WIDE_BAND_SPEECH
 
 /* Object representing the audio gateway role for HFP/HSP.
  * Members:
@@ -269,7 +268,7 @@ static int cras_hfp_ag_new_connection(DBusConnection *conn,
 	 * control whether to turn on WBS feature.
 	 */
 	ag_features = BSRF_SUPPORTED_FEATURES;
-	if (cras_system_get_bt_wbs_enabled() &&
+	if (cras_system_get_bt_wbs_enabled() && adapter &&
 	    cras_bt_adapter_wbs_supported(adapter))
 		ag_features |= AG_CODEC_NEGOTIATION;
 
@@ -289,10 +288,10 @@ static void cras_hfp_ag_request_disconnection(struct cras_bt_profile *profile,
 
 	DL_FOREACH (connected_ags, ag) {
 		if (ag->slc_handle && ag->device == device) {
-			destroy_audio_gateway(ag);
 			cras_bt_device_notify_profile_dropped(
 				ag->device,
 				CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+			destroy_audio_gateway(ag);
 		}
 	}
 }
@@ -305,7 +304,7 @@ static struct cras_bt_profile cras_hfp_ag_profile = {
 	.name = HFP_AG_PROFILE_NAME,
 	.object_path = HFP_AG_PROFILE_PATH,
 	.uuid = HFP_AG_UUID,
-	.version = HFP_VERSION_1_5,
+	.version = HFP_VERSION,
 	.role = NULL,
 	.features = SDP_SUPPORTED_FEATURES,
 	.record = NULL,
@@ -314,30 +313,6 @@ static struct cras_bt_profile cras_hfp_ag_profile = {
 	.request_disconnection = cras_hfp_ag_request_disconnection,
 	.cancel = cras_hfp_ag_cancel
 };
-
-int cras_hfp_ag_profile_next_handsfree(DBusConnection *conn, bool enabled)
-{
-	unsigned int target_version = HFP_VERSION_1_5;
-	unsigned int target_feature = SDP_SUPPORTED_FEATURES;
-
-	if (enabled) {
-		target_version = HFP_VERSION_1_7;
-		target_feature = SDP_SUPPORTED_FEATURES_1_7;
-	}
-
-	if (cras_hfp_ag_profile.version == target_version)
-		return 0;
-
-	cras_bt_unregister_profile(conn, &cras_hfp_ag_profile);
-	cras_bt_rm_profile(conn, &cras_hfp_ag_profile);
-
-	cras_hfp_ag_profile.features = target_feature;
-	cras_hfp_ag_profile.version = target_version;
-
-	cras_bt_add_profile(conn, &cras_hfp_ag_profile);
-	cras_bt_register_profile(conn, &cras_hfp_ag_profile);
-	return 0;
-}
 
 int cras_hfp_ag_profile_create(DBusConnection *conn)
 {
@@ -385,9 +360,9 @@ static void cras_hsp_ag_request_disconnection(struct cras_bt_profile *profile,
 
 	DL_FOREACH (connected_ags, ag) {
 		if (ag->slc_handle && ag->device == device) {
-			destroy_audio_gateway(ag);
 			cras_bt_device_notify_profile_dropped(
 				ag->device, CRAS_BT_DEVICE_PROFILE_HSP_HEADSET);
+			destroy_audio_gateway(ag);
 		}
 	}
 }
@@ -476,6 +451,19 @@ struct hfp_slc_handle *cras_hfp_ag_get_slc(struct cras_bt_device *device)
 			return ag->slc_handle;
 	}
 	return NULL;
+}
+
+void cras_hfp_ag_resend_device_battery_level()
+{
+	struct audio_gateway *ag;
+	int level;
+	DL_FOREACH (connected_ags, ag) {
+		level = hfp_slc_get_hf_battery_level(ag->slc_handle);
+		if (level >= 0 && level <= 100)
+			cras_observer_notify_bt_battery_changed(
+				cras_bt_device_address(ag->device),
+				(uint32_t)(level));
+	}
 }
 
 int cras_hsp_ag_profile_create(DBusConnection *conn)

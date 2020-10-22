@@ -46,6 +46,7 @@ pub struct CrasShmStream<'a> {
     header: CrasAudioHeader<'a>,
     frame_size: usize,
     num_channels: usize,
+    frame_rate: u32,
     // The index of the next buffer within SHM to set the buffer offset for.
     next_buffer_idx: usize,
 }
@@ -71,12 +72,14 @@ impl<'a> CrasShmStream<'a> {
     /// # Errors
     ///
     /// * If `header_fd` could not be successfully mmapped.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         stream_id: u32,
         server_socket: CrasServerSocket,
         audio_socket: AudioSocket,
         direction: StreamDirection,
         num_channels: usize,
+        frame_rate: u32,
         format: SampleFormat,
         header_fd: CrasAudioShmHeaderFd,
         samples_len: usize,
@@ -90,6 +93,7 @@ impl<'a> CrasShmStream<'a> {
             header,
             frame_size: format.sample_bytes() * num_channels,
             num_channels,
+            frame_rate,
             // We have either sent zero or two offsets to the server, so we will
             // need to update index 0 next.
             next_buffer_idx: 0,
@@ -115,6 +119,10 @@ impl<'a> ShmStream for CrasShmStream<'a> {
         self.num_channels
     }
 
+    fn frame_rate(&self) -> u32 {
+        self.frame_rate
+    }
+
     fn wait_for_next_action_with_timeout(
         &mut self,
         timeout: Duration,
@@ -129,7 +137,7 @@ impl<'a> ShmStream for CrasShmStream<'a> {
             .read_audio_message_with_timeout(Some(timeout))?
         {
             Some(AudioMessage::Success { id, frames }) if id == expected_id => {
-                return Ok(Some(ServerRequest::new(frames as usize, self)));
+                Ok(Some(ServerRequest::new(frames as usize, self)))
             }
             None => Ok(None),
             _ => Err(Box::new(Error::MessageTypeError)),
