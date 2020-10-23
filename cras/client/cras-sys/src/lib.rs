@@ -4,6 +4,7 @@
 extern crate audio_streams;
 extern crate data_model;
 
+use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
 use std::error;
 use std::fmt;
@@ -79,29 +80,86 @@ impl fmt::Display for Error {
 
 impl cras_audio_format_packed {
     /// Initializes `cras_audio_format_packed` from input parameters.
+    /// Field `channel_layout` will be assigned with default channel layout defined in
+    /// `Self::default_channel_layout`.
     ///
     /// # Arguments
     /// * `format` - Format in used.
     /// * `rate` - Rate in used.
     /// * `num_channels` - Number of channels in used.
+    /// * `direction` - Stream direction enumeration.
     ///
     /// # Returns
     /// Structure `cras_audio_format_packed`
-    pub fn new(format: _snd_pcm_format, rate: usize, num_channels: usize) -> Self {
-        let mut audio_format = Self {
+    pub fn new(
+        format: _snd_pcm_format,
+        rate: u32,
+        num_channels: usize,
+        direction: CRAS_STREAM_DIRECTION,
+    ) -> Self {
+        Self {
             format: format as i32,
-            frame_rate: rate as u32,
+            frame_rate: rate,
             num_channels: num_channels as u32,
-            channel_layout: [-1; CRAS_CHANNEL::CRAS_CH_MAX as usize],
-        };
-        for i in 0..CRAS_CHANNEL::CRAS_CH_MAX as usize {
-            if i < num_channels {
-                audio_format.channel_layout[i] = i as i8;
-            } else {
-                break;
+            channel_layout: Self::default_channel_layout(num_channels, direction),
+        }
+    }
+
+    /// Generates default channel layout by given number of channels and stream direction.
+    /// ```
+    /// use cras_sys::gen::{
+    ///     _snd_pcm_format,
+    ///     cras_audio_format_packed,
+    ///     CRAS_STREAM_DIRECTION::*
+    /// };
+    /// let test_one = | num_channels, direction, expected_results | {
+    ///     let default_channel_fmt = cras_audio_format_packed::new(
+    ///         _snd_pcm_format::SND_PCM_FORMAT_S16,
+    ///         48000,
+    ///         num_channels,
+    ///         direction
+    ///     );
+    ///     assert_eq!(default_channel_fmt.channel_layout, expected_results);
+    /// };
+    /// test_one(2, CRAS_STREAM_OUTPUT, [0, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
+    /// test_one(4, CRAS_STREAM_OUTPUT, [0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1]);
+    /// test_one(6, CRAS_STREAM_OUTPUT, [0, 1, 4, 5, 2, 3, -1, -1, -1, -1, -1]);
+    /// test_one(2, CRAS_STREAM_INPUT, [0, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
+    /// test_one(4, CRAS_STREAM_INPUT, [0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1]);
+    /// test_one(6, CRAS_STREAM_INPUT, [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]);
+    /// ```
+    fn default_channel_layout(
+        num_channels: usize,
+        direction: CRAS_STREAM_DIRECTION,
+    ) -> [i8; CRAS_CHANNEL::CRAS_CH_MAX as usize] {
+        use {CRAS_CHANNEL::*, CRAS_STREAM_DIRECTION::*};
+
+        let mut channel_layout = [-1; CRAS_CH_MAX as usize];
+        match (num_channels, direction) {
+            (6, CRAS_STREAM_OUTPUT) => {
+                [
+                    CRAS_CH_FL,
+                    CRAS_CH_FR,
+                    CRAS_CH_FC,
+                    CRAS_CH_LFE,
+                    CRAS_CH_RL,
+                    CRAS_CH_RR,
+                ]
+                .iter()
+                .enumerate()
+                .for_each(|(idx, &channel)| channel_layout[channel as usize] = idx as i8);
+            }
+            _ => {
+                for (i, channel) in channel_layout
+                    .iter_mut()
+                    .enumerate()
+                    .take(min(num_channels, CRAS_CH_MAX as usize))
+                {
+                    *channel = i as i8;
+                }
             }
         }
-        audio_format
+        channel_layout
     }
 }
 
@@ -121,6 +179,7 @@ impl Default for cras_iodev_info {
             idx: 0,
             name: [0; 64usize],
             stable_id: 0,
+            max_supported_channels: 0,
         }
     }
 }
@@ -168,7 +227,6 @@ impl Default for cras_ionode_info {
             left_right_swapped: 0,
             type_enum: 0,
             stable_id: 0,
-            mic_positions: [0; 128usize],
             type_: [0; 32usize],
             name: [0; 64usize],
             active_hotword_model: [0; 16usize],
@@ -362,6 +420,7 @@ impl TryFrom<u32> for CRAS_CLIENT_TYPE {
             5 => Ok(CRAS_CLIENT_TYPE_ARC),
             6 => Ok(CRAS_CLIENT_TYPE_CROSVM),
             7 => Ok(CRAS_CLIENT_TYPE_SERVER_STREAM),
+            8 => Ok(CRAS_CLIENT_TYPE_LACROS),
             _ => Err(Error::InvalidClientType(client_type)),
         }
     }
