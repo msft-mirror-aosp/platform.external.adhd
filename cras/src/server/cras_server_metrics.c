@@ -302,6 +302,8 @@ metrics_client_type_str(enum CRAS_CLIENT_TYPE client_type)
 		return "CrOSVM";
 	case CRAS_CLIENT_TYPE_SERVER_STREAM:
 		return "ServerStream";
+	case CRAS_CLIENT_TYPE_LACROS:
+		return "LaCrOS";
 	default:
 		return "InvalidType";
 	}
@@ -971,6 +973,11 @@ static void metrics_stream_runtime(struct cras_server_metrics_stream_data data)
 {
 	char metrics_name[METRICS_NAME_BUFFER_SIZE];
 
+	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE, "Cras.%sStreamRuntime",
+		 data.direction == CRAS_STREAM_INPUT ? "Input" : "Output");
+	cras_metrics_log_histogram(metrics_name, (unsigned)data.runtime.tv_sec,
+				   0, 10000, 20);
+
 	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE,
 		 "Cras.%sStreamRuntime.%s",
 		 data.direction == CRAS_STREAM_INPUT ? "Input" : "Output",
@@ -1008,10 +1015,15 @@ static void log_sparse_histogram_each_level(int num, int sample, ...)
 
 	va_start(valist, sample);
 
-	for (i = 0; i < num; i++) {
-		len += snprintf(metrics_name + len,
+	for (i = 0; i < num && len < METRICS_NAME_BUFFER_SIZE; i++) {
+		int metric_len = snprintf(metrics_name + len,
 				METRICS_NAME_BUFFER_SIZE - len, "%s%s",
 				i ? "." : "", va_arg(valist, char *));
+		// Exit early on error or running out of bufferspace. Avoids
+		// logging partial or corrupted strings.
+		if (metric_len < 0 || metric_len > METRICS_NAME_BUFFER_SIZE - len)
+			break;
+		len += metric_len;
 		cras_metrics_log_sparse_histogram(metrics_name, sample);
 	}
 

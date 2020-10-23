@@ -21,6 +21,7 @@
 #include "cras_dsp_pipeline.h"
 #include "cras_fmt_conv.h"
 #include "cras_iodev.h"
+#include "cras_main_thread_log.h"
 #include "cras_iodev_list.h"
 #include "cras_mix.h"
 #include "cras_ramp.h"
@@ -685,6 +686,8 @@ void cras_iodev_set_node_plugged(struct cras_ionode *node, int plugged)
 	if (node->plugged == plugged)
 		return;
 	node->plugged = plugged;
+	MAINLOG(main_log, MAIN_THREAD_NODE_PLUGGED, node->dev->info.idx,
+		plugged, 0);
 	if (plugged) {
 		gettimeofday(&node->plugged_time, NULL);
 	} else if (node == node->dev->active_node) {
@@ -1016,7 +1019,8 @@ int cras_iodev_close(struct cras_iodev *iodev)
 
 	rc = iodev->close_dev(iodev);
 	if (rc)
-		return rc;
+		syslog(LOG_ERR, "Error closing dev %s, rc %d", iodev->info.name,
+		       rc);
 	iodev->state = CRAS_IODEV_STATE_CLOSE;
 	if (iodev->ramp)
 		cras_ramp_reset(iodev->ramp);
@@ -1271,9 +1275,6 @@ int cras_iodev_frames_queued(struct cras_iodev *iodev,
 	int rc;
 
 	rc = iodev->frames_queued(iodev, hw_tstamp);
-	if (rc == -EPIPE)
-		cras_audio_thread_event_severe_underrun();
-
 	if (rc < 0)
 		return rc;
 
@@ -1323,7 +1324,7 @@ int cras_iodev_fill_odev_zeros(struct cras_iodev *odev, unsigned int frames)
 
 		/* This assumes consecutive channel areas. */
 		buf = area->channels[0].buf;
-		memset(buf, 0, frames_written * frame_bytes);
+		memset(buf, 0, (size_t)frames_written * (size_t)frame_bytes);
 		cras_iodev_put_output_buffer(odev, buf, frames_written, NULL,
 					     NULL);
 		frames -= frames_written;
