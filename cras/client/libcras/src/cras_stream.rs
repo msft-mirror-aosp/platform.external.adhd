@@ -119,7 +119,7 @@ pub struct CrasStream<'a, T: CrasStreamData<'a> + BufferDrop> {
     server_socket: CrasServerSocket,
     block_size: u32,
     direction: CRAS_STREAM_DIRECTION,
-    rate: usize,
+    rate: u32,
     num_channels: usize,
     format: snd_pcm_format_t,
     /// A structure for stream to interact with server audio thread.
@@ -134,12 +134,13 @@ impl<'a, T: CrasStreamData<'a> + BufferDrop> CrasStream<'a, T> {
     ///
     /// # Returns
     /// `CrasStream` - CRAS client stream.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         stream_id: u32,
         server_socket: CrasServerSocket,
         block_size: u32,
         direction: CRAS_STREAM_DIRECTION,
-        rate: usize,
+        rate: u32,
         num_channels: usize,
         format: snd_pcm_format_t,
         audio_sock: AudioSocket,

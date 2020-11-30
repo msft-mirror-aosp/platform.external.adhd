@@ -92,7 +92,7 @@ static inline int count_non_empty_dev(struct open_dev *adevs)
 	return count;
 }
 
-static void check_non_empty_state_transition(struct open_dev *adevs)
+int dev_io_check_non_empty_state_transition(struct open_dev *adevs)
 {
 	int new_non_empty_dev_count = count_non_empty_dev(adevs);
 
@@ -103,6 +103,7 @@ static void check_non_empty_state_transition(struct open_dev *adevs)
 									    0);
 
 	non_empty_device_count = new_non_empty_dev_count;
+	return non_empty_device_count > 0;
 }
 
 /* Checks whether it is time to fetch. */
@@ -385,11 +386,14 @@ static int set_input_dev_wake_ts(struct open_dev *adev, bool *need_to_drop)
 		clock_gettime(CLOCK_MONOTONIC_RAW, &level_tstamp);
 
 	/*
-	 * If any input device has more than largest_cb_level * 1.5 frames, need to
-	 * drop frames from all devices.
+	 * Drop frames from all devices if any device meets these requirements:
+	 * 1. The hw_level is larger than largest_cb_level * 1.5 or larger than
+	 *    buffer_size * 0.5.
+	 * 2. The time of those frames is larger than DROP_FRAMES_THRESHOLD_MS.
 	 */
 	if (input_devices_can_drop_samples(adev->dev) &&
-	    rc >= adev->dev->largest_cb_level * 1.5 &&
+	    (rc >= adev->dev->largest_cb_level * 1.5 ||
+	     rc >= adev->dev->buffer_size * 0.5) &&
 	    cras_frames_to_ms(rc, adev->dev->format->frame_rate) >=
 		    DROP_FRAMES_THRESHOLD_MS)
 		*need_to_drop = true;
@@ -849,7 +853,7 @@ static void get_input_devices_drop_time(struct open_dev *idev_list,
 static void dev_io_drop_samples(struct open_dev *idev_list)
 {
 	struct open_dev *adev;
-	struct timespec drop_time;
+	struct timespec drop_time = {};
 	int rc;
 
 	get_input_devices_drop_time(idev_list, &drop_time);
@@ -919,6 +923,7 @@ static void handle_dev_err(int err_rc, struct open_dev **odevs,
 		ATLOG(atlog, AUDIO_THREAD_SEVERE_UNDERRUN, adev->dev->info.idx,
 		      0, 0);
 		cras_iodev_reset_request(adev->dev);
+		cras_audio_thread_event_severe_underrun();
 	}
 	/* Device error, remove it. */
 	dev_io_rm_open_dev(odevs, adev);
@@ -1087,8 +1092,6 @@ void dev_io_run(struct open_dev **odevs, struct open_dev **idevs,
 	dev_io_capture(idevs);
 	dev_io_send_captured_samples(*idevs);
 	dev_io_playback_write(odevs, output_converter);
-
-	check_non_empty_state_transition(*odevs);
 }
 
 static int input_adev_ignore_wake(const struct open_dev *adev)
@@ -1214,7 +1217,7 @@ void dev_io_rm_open_dev(struct open_dev **odev_list, struct open_dev *dev_to_rm)
 	cras_server_metrics_highest_hw_level(dev_to_rm->dev->highest_hw_level,
 					     dev_to_rm->dev->direction);
 
-	check_non_empty_state_transition(*odev_list);
+	dev_io_check_non_empty_state_transition(*odev_list);
 
 	ATLOG(atlog, AUDIO_THREAD_DEV_REMOVED, dev_to_rm->dev->info.idx, 0, 0);
 

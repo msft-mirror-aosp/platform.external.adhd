@@ -17,6 +17,7 @@
 #include "cras_dbus_util.h"
 #include "cras_hfp_ag_profile.h"
 #include "cras_iodev_list.h"
+#include "cras_main_thread_log.h"
 #include "cras_observer.h"
 #include "cras_system_state.h"
 #include "cras_utf8.h"
@@ -92,9 +93,6 @@
 	"    <method name=\"RemoveActiveOutputNode\">\n"                        \
 	"      <arg name=\"node_id\" type=\"t\" direction=\"in\"/>\n"           \
 	"    </method>\n"                                                       \
-	"    <method name=\"SetNextHandsfreeProfile\">\n"                       \
-	"      <arg name=\"toggle\" type=\"b\" direction=\"in\"/>\n"            \
-	"    </method>\n"                                                       \
 	"    <method name=\"SetFixA2dpPacketSize\">\n"                          \
 	"      <arg name=\"toggle\" type=\"b\" direction=\"in\"/>\n"            \
 	"    </method>\n"                                                       \
@@ -132,6 +130,8 @@
 	"    </method>\n"                                                       \
 	"    <method name=\"SetPlayerMetadata\">\n"                             \
 	"      <arg name=\"metadata\" type=\"a{sv}\" direction=\"in\"/>\n"      \
+	"    </method>\n"                                                       \
+	"    <method name=\"ResendBluetoothBattery\">\n"                        \
 	"    </method>\n"                                                       \
 	"  </interface>\n"                                                      \
 	"  <interface name=\"" DBUS_INTERFACE_INTROSPECTABLE "\">\n"            \
@@ -369,6 +369,7 @@ static DBusHandlerResult handle_set_output_user_mute(DBusConnection *conn,
 		return rc;
 
 	cras_system_set_user_mute(new_mute);
+	MAINLOG(main_log, MAIN_THREAD_SET_OUTPUT_USER_MUTE, new_mute, 0, 0);
 
 	send_empty_reply(conn, message);
 
@@ -497,10 +498,8 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 	dbus_uint64_t id;
 	const char *dev_name = dev->name;
 	dbus_uint64_t stable_dev_id = node->stable_id;
-	dbus_uint32_t max_supported_channels = dev->max_supported_channels;
 	const char *node_type = node->type;
 	const char *node_name = node->name;
-	const char *mic_positions = node->mic_positions;
 	dbus_bool_t active;
 	dbus_uint64_t plugged_time = node->plugged_time.tv_sec * 1000000ULL +
 				     node->plugged_time.tv_usec;
@@ -540,18 +539,11 @@ static dbus_bool_t append_node_dict(DBusMessageIter *iter,
 	if (!append_key_value(&dict, "StableDeviceId", DBUS_TYPE_UINT64,
 			      DBUS_TYPE_UINT64_AS_STRING, &stable_dev_id))
 		return FALSE;
-	if (!append_key_value(&dict, "MaxSupportedChannels", DBUS_TYPE_UINT32,
-			      DBUS_TYPE_UINT32_AS_STRING,
-			      &max_supported_channels))
-		return FALSE;
 	if (!append_key_value(&dict, "Type", DBUS_TYPE_STRING,
 			      DBUS_TYPE_STRING_AS_STRING, &node_type))
 		return FALSE;
 	if (!append_key_value(&dict, "Name", DBUS_TYPE_STRING,
 			      DBUS_TYPE_STRING_AS_STRING, &node_name))
-		return FALSE;
-	if (!append_key_value(&dict, "MicPositions", DBUS_TYPE_STRING,
-			      DBUS_TYPE_STRING_AS_STRING, &mic_positions))
 		return FALSE;
 	if (!append_key_value(&dict, "Active", DBUS_TYPE_BOOLEAN,
 			      DBUS_TYPE_BOOLEAN_AS_STRING, &active))
@@ -726,28 +718,6 @@ handle_rm_active_node(DBusConnection *conn, DBusMessage *message, void *arg,
 		return rc;
 
 	cras_iodev_list_rm_active_node(direction, id);
-
-	send_empty_reply(conn, message);
-
-	return DBUS_HANDLER_RESULT_HANDLED;
-}
-
-static DBusHandlerResult handle_set_next_handsfree_profile(DBusConnection *conn,
-							   DBusMessage *message,
-							   void *arg)
-{
-	int rc;
-	dbus_bool_t enabled;
-
-	rc = get_single_arg(message, DBUS_TYPE_BOOLEAN, &enabled);
-	if (rc)
-		return rc;
-
-	/* Change HFP version to register with BlueZ and the
-	 * wbs enabled flag for codec negotiation in SLC.
-	 */
-	cras_hfp_ag_profile_next_handsfree(conn, enabled);
-	cras_system_set_bt_wbs_enabled(enabled);
 
 	send_empty_reply(conn, message);
 
@@ -1004,6 +974,17 @@ static DBusHandlerResult handle_set_player_metadata(DBusConnection *conn,
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
+static DBusHandlerResult handle_resend_bluetooth_battery(DBusConnection *conn,
+							 DBusMessage *message,
+							 void *arg)
+{
+	cras_hfp_ag_resend_device_battery_level();
+
+	send_empty_reply(conn, message);
+
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
 /* Handle incoming messages. */
 static DBusHandlerResult handle_control_message(DBusConnection *conn,
 						DBusMessage *message, void *arg)
@@ -1095,9 +1076,6 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 		return handle_rm_active_node(conn, message, arg,
 					     CRAS_STREAM_OUTPUT);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
-					       "SetNextHandsfreeProfile")) {
-		return handle_set_next_handsfree_profile(conn, message, arg);
-	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
 					       "SetFixA2dpPacketSize")) {
 		return handle_set_fix_a2dp_packet_size(conn, message, arg);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
@@ -1138,6 +1116,9 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
 					       "SetPlayerMetadata")) {
 		return handle_set_player_metadata(conn, message, arg);
+	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
+					       "ResendBluetoothBattery")) {
+		return handle_resend_bluetooth_battery(conn, message, arg);
 	}
 
 	return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
