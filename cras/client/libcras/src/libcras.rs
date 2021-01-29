@@ -29,7 +29,7 @@
 //! use audio_streams::{SampleFormat, StreamSource};
 //!
 //! const BUFFER_SIZE: usize = 256;
-//! const FRAME_RATE: usize = 44100;
+//! const FRAME_RATE: u32 = 44100;
 //! const NUM_CHANNELS: usize = 2;
 //! const FORMAT: SampleFormat = SampleFormat::S16LE;
 //!
@@ -82,7 +82,7 @@
 //! use audio_streams::{SampleFormat, StreamSource};
 //!
 //! const BUFFER_SIZE: usize = 256;
-//! const FRAME_RATE: usize = 44100;
+//! const FRAME_RATE: u32 = 44100;
 //! const NUM_CHANNELS: usize = 2;
 //! const FORMAT: SampleFormat = SampleFormat::S16LE;
 //!
@@ -396,14 +396,15 @@ impl<'a> CrasClient<'a> {
         device_index: Option<u32>,
         block_size: u32,
         direction: CRAS_STREAM_DIRECTION,
-        rate: usize,
+        rate: u32,
         channel_num: usize,
         format: SampleFormat,
     ) -> Result<CrasStream<'b, T>> {
         let stream_id = self.next_server_stream_id();
 
         // Prepares server message
-        let audio_format = cras_audio_format_packed::new(format.into(), rate, channel_num);
+        let audio_format =
+            cras_audio_format_packed::new(format.into(), rate, channel_num, direction);
         let msg_header = cras_server_message {
             length: mem::size_of::<cras_connect_message>() as u32,
             id: CRAS_SERVER_MESSAGE_ID::CRAS_SERVER_CONNECT_STREAM,
@@ -463,12 +464,13 @@ impl<'a> CrasClient<'a> {
     /// * `format` - The format to use for stream audio samples.
     /// * `frame_rate` - The sample rate of the stream.
     /// * `buffer_size` - The transfer size granularity in frames.
+    #[allow(clippy::type_complexity)]
     pub fn new_pinned_playback_stream(
         &mut self,
         device_index: u32,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> std::result::Result<(Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>), BoxError>
     {
@@ -497,12 +499,13 @@ impl<'a> CrasClient<'a> {
     /// * `format` - The format to use for stream audio samples.
     /// * `frame_rate` - The sample rate of the stream.
     /// * `buffer_size` - The transfer size granularity in frames.
+    #[allow(clippy::type_complexity)]
     pub fn new_pinned_capture_stream(
         &mut self,
         device_index: u32,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> std::result::Result<(Box<dyn StreamControl>, Box<dyn CaptureBufferStream>), BoxError> {
         Ok((
@@ -549,11 +552,12 @@ impl<'a> CrasClient<'a> {
 }
 
 impl<'a> StreamSource for CrasClient<'a> {
+    #[allow(clippy::type_complexity)]
     fn new_playback_stream(
         &mut self,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> std::result::Result<(Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>), BoxError>
     {
@@ -570,11 +574,12 @@ impl<'a> StreamSource for CrasClient<'a> {
         ))
     }
 
+    #[allow(clippy::type_complexity)]
     fn new_capture_stream(
         &mut self,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
     ) -> std::result::Result<(Box<dyn StreamControl>, Box<dyn CaptureBufferStream>), BoxError> {
         if self.cras_capture {
@@ -613,7 +618,7 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
         direction: StreamDirection,
         num_channels: usize,
         format: SampleFormat,
-        frame_rate: usize,
+        frame_rate: u32,
         buffer_size: usize,
         effects: &[StreamEffect],
         client_shm: &SharedMemory,
@@ -632,7 +637,12 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
 
         // Prepares server message
         let stream_id = self.next_server_stream_id();
-        let audio_format = cras_audio_format_packed::new(format.into(), frame_rate, num_channels);
+        let audio_format = cras_audio_format_packed::new(
+            format.into(),
+            frame_rate,
+            num_channels,
+            direction.into(),
+        );
         let msg_header = cras_server_message {
             length: mem::size_of::<cras_connect_message>() as u32,
             id: CRAS_SERVER_MESSAGE_ID::CRAS_SERVER_CONNECT_STREAM,
@@ -649,7 +659,7 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
             flags: 0,
             format: audio_format,
             dev_idx: CRAS_SPECIAL_DEVICE::NO_DEVICE as u32,
-            effects: effects.into_iter().collect::<CrasStreamEffect>().into(),
+            effects: effects.iter().collect::<CrasStreamEffect>().into(),
             client_type: self.client_type,
             client_shm_size: client_shm.size(),
             buffer_offsets,
@@ -673,6 +683,7 @@ impl<'a> ShmStreamSource for CrasClient<'a> {
                     audio_socket,
                     direction,
                     num_channels,
+                    frame_rate,
                     format,
                     header_fd,
                     client_shm.size() as usize,

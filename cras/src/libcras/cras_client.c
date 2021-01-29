@@ -1403,7 +1403,6 @@ static int stream_connected(struct client_stream *stream,
 		goto err_ret;
 	}
 
-	samples_prot = 0;
 	if (stream->direction == CRAS_STREAM_OUTPUT)
 		samples_prot = PROT_WRITE;
 	else
@@ -2138,7 +2137,7 @@ int cras_client_create_with_type(struct cras_client **client,
 
 	rc = fill_socket_file((*client), conn_type);
 	if (rc < 0) {
-		goto free_error;
+		goto free_server_event_fd;
 	}
 
 	rc = cras_file_wait_create((*client)->sock_file,
@@ -2171,10 +2170,11 @@ int cras_client_create_with_type(struct cras_client **client,
 
 	return 0;
 free_error:
-	if ((*client)->server_event_fd >= 0)
-		close((*client)->server_event_fd);
 	cras_file_wait_destroy((*client)->sock_file_wait);
 	free((void *)(*client)->sock_file);
+free_server_event_fd:
+	if ((*client)->server_event_fd >= 0)
+		close((*client)->server_event_fd);
 free_cond:
 	pthread_cond_destroy(&(*client)->stream_start_cond);
 free_lock:
@@ -2628,6 +2628,21 @@ cras_client_get_audio_debug_info(const struct cras_client *client)
 		return 0;
 
 	debug_info = &client->server_state->audio_debug_info;
+	server_state_unlock(client, lock_rc);
+	return debug_info;
+}
+
+const struct main_thread_debug_info *
+cras_client_get_main_thread_debug_info(const struct cras_client *client)
+{
+	const struct main_thread_debug_info *debug_info;
+	int lock_rc;
+
+	lock_rc = server_state_rdlock(client);
+	if (lock_rc)
+		return 0;
+
+	debug_info = &client->server_state->main_thread_debug_info;
 	server_state_unlock(client, lock_rc);
 	return debug_info;
 }
@@ -3168,6 +3183,20 @@ int cras_client_read_atlog(struct cras_client *client, uint64_t *read_idx,
 	return len;
 }
 
+int cras_client_update_main_thread_debug_info(
+	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
+{
+	struct cras_dump_main msg;
+
+	if (client == NULL)
+		return -EINVAL;
+	if (client->debug_info_callback != NULL)
+		return -EINVAL;
+	client->debug_info_callback = debug_info_cb;
+	cras_fill_dump_main(&msg);
+	return write_message_to_server(client, &msg.header);
+}
+
 int cras_client_update_bt_debug_info(
 	struct cras_client *client, void (*debug_info_cb)(struct cras_client *))
 {
@@ -3333,10 +3362,10 @@ int cras_client_config_global_remix(struct cras_client *client,
 {
 	struct cras_config_global_remix *msg;
 	int rc;
+	size_t nchan = (size_t)num_channels;
 
 	msg = (struct cras_config_global_remix *)malloc(
-		sizeof(*msg) +
-		num_channels * num_channels * sizeof(*coefficient));
+		sizeof(*msg) + nchan * nchan * sizeof(*coefficient));
 	cras_fill_config_global_remix_command(msg, num_channels, coefficient,
 					      num_channels * num_channels);
 	rc = write_message_to_server(client, &msg->header);
