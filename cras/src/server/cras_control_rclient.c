@@ -15,6 +15,7 @@
 #include "cras_dsp.h"
 #include "cras_iodev.h"
 #include "cras_iodev_list.h"
+#include "cras_hfp_ag_profile.h"
 #include "cras_main_thread_log.h"
 #include "cras_messages.h"
 #include "cras_observer.h"
@@ -298,15 +299,11 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 	switch (msg->id) {
 	case CRAS_SERVER_CONNECT_STREAM: {
 		int client_shm_fd = num_fds > 1 ? fds[1] : -1;
-		struct cras_connect_message cmsg;
 		if (MSG_LEN_VALID(msg, struct cras_connect_message)) {
 			rclient_handle_client_stream_connect(
 				client,
 				(const struct cras_connect_message *)msg, fd,
 				client_shm_fd);
-		} else if (!convert_connect_message_old(msg, &cmsg)) {
-			rclient_handle_client_stream_connect(client, &cmsg, fd,
-							     client_shm_fd);
 		} else {
 			return -EINVAL;
 		}
@@ -422,10 +419,15 @@ static int ccr_handle_message_from_client(struct cras_rclient *client,
 		state = cras_system_state_get_no_lock();
 #ifdef CRAS_DBUS
 		memcpy(&state->bt_debug_info.bt_log, btlog,
-		       sizeof(struct cras_bt_debug_info));
+		       sizeof(struct cras_bt_event_log));
+		memcpy(&state->bt_debug_info.wbs_logger,
+		       cras_hfp_ag_get_wbs_logger(),
+		       sizeof(struct packet_status_logger));
 #else
 		memset(&state->bt_debug_info.bt_log, 0,
 		       sizeof(struct cras_bt_debug_info));
+		memset(&state->bt_debug_info.wbs_logger, 0,
+		       sizeof(struct packet_status_logger));
 #endif
 
 		cras_fill_client_audio_debug_info_ready(&msg);
