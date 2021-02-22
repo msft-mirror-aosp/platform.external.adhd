@@ -390,18 +390,10 @@ unsigned int buffer_share_id_offset(const struct buffer_share* mix,
                                     unsigned int id) {
   return 0;
 }
-void ewma_power_init(struct ewma_power* ewma, unsigned int rate) {}
 
-void ewma_power_calculate(struct ewma_power* ewma,
-                          const int16_t* buf,
-                          unsigned int channels,
-                          unsigned int size) {}
+void cras_system_state_stream_added(enum CRAS_STREAM_DIRECTION direction) {}
 
-void cras_system_state_stream_added(enum CRAS_STREAM_DIRECTION direction,
-                                    enum CRAS_CLIENT_TYPE client_type) {}
-
-void cras_system_state_stream_removed(enum CRAS_STREAM_DIRECTION direction,
-                                      enum CRAS_CLIENT_TYPE client_type) {}
+void cras_system_state_stream_removed(enum CRAS_STREAM_DIRECTION direction) {}
 
 int cras_server_metrics_stream_create(
     const struct cras_rstream_config* config) {
@@ -413,12 +405,8 @@ int cras_server_metrics_stream_destroy(const struct cras_rstream* stream) {
 }
 
 #ifdef HAVE_WEBRTC_APM
-#define FAKE_CRAS_APM_PTR reinterpret_cast<struct cras_apm*>(0x99)
 struct cras_apm_list* cras_apm_list_create(void* stream_ptr, uint64_t effects) {
   return NULL;
-}
-struct cras_apm* cras_apm_list_get_active_apm(void* stream_ptr, void* dev_ptr) {
-  return FAKE_CRAS_APM_PTR;
 }
 int cras_apm_list_destroy(struct cras_apm_list* list) {
   return 0;

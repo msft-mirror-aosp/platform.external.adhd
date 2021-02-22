@@ -493,26 +493,6 @@ static void convert_time(unsigned int *sec, unsigned int *nsec,
 	*nsec = nsec_offset;
 }
 
-static float get_ewma_power_as_float(uint32_t data)
-{
-	float f = 0.0f;
-
-	/* Convert from the uint32_t log type back to float.
-	 * If data cannot be assigned to float, default value will
-	 * be printed as -inf to hint the problem.
-	 */
-	if (sizeof(uint32_t) == sizeof(float))
-		memcpy(&f, &data, sizeof(float));
-	else
-		printf("%-30s float to uint32_t\n", "MEMORY_NOT_ALIGNED");
-
-	/* Convert to dBFS and set to zero if it's
-	 * insignificantly low.  Picking the same threshold
-	 * 1.0e-10f as in Chrome.
-	 */
-	return (f < 1.0e-10f) ? -INFINITY : 10.0f * log10f(f);
-}
-
 static void show_alog_tag(const struct audio_thread_event_log *log,
 			  unsigned int tag_idx, int32_t sec_offset,
 			  int32_t nsec_offset)
@@ -572,30 +552,25 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 		printf("%-30s dev:%u tstamp:%s.%09u\n", "READ_AUDIO_TSTAMP",
 		       data1, time_str, nsec);
 		break;
-	case AUDIO_THREAD_READ_AUDIO_DONE: {
-		float f = get_ewma_power_as_float(data2);
-		printf("%-30s read_remainder:%u power:%f dBFS\n",
-		       "READ_AUDIO_DONE", data1, f);
+	case AUDIO_THREAD_READ_AUDIO_DONE:
+		printf("%-30s read_remainder:%u\n", "READ_AUDIO_DONE", data1);
 		break;
-	}
 	case AUDIO_THREAD_READ_OVERRUN:
 		printf("%-30s dev:%u stream:%x num_overruns:%u\n",
 		       "READ_AUDIO_OVERRUN", data1, data2, data3);
 		break;
 	case AUDIO_THREAD_FILL_AUDIO:
-		printf("%-30s dev:%u hw_level:%u min_cb_level:%u\n",
-		       "FILL_AUDIO", data1, data2, data3);
+		printf("%-30s dev:%u hw_level:%u\n", "FILL_AUDIO", data1,
+		       data2);
 		break;
 	case AUDIO_THREAD_FILL_AUDIO_TSTAMP:
 		printf("%-30s dev:%u tstamp:%s.%09u\n", "FILL_AUDIO_TSTAMP",
 		       data1, time_str, nsec);
 		break;
-	case AUDIO_THREAD_FILL_AUDIO_DONE: {
-		float f = get_ewma_power_as_float(data3);
-		printf("%-30s hw_level:%u total_written:%u power:%f dBFS\n",
-		       "FILL_AUDIO_DONE", data1, data2, f);
+	case AUDIO_THREAD_FILL_AUDIO_DONE:
+		printf("%-30s hw_level:%u total_written:%u min_cb_level:%u\n",
+		       "FILL_AUDIO_DONE", data1, data2, data3);
 		break;
-	}
 	case AUDIO_THREAD_WRITE_STREAMS_WAIT:
 		printf("%-30s stream:%x\n", "WRITE_STREAMS_WAIT", data1);
 		break;
@@ -613,12 +588,10 @@ static void show_alog_tag(const struct audio_thread_event_log *log,
 		printf("%-30s id:%x shm_frames:%u cb_pending:%u\n",
 		       "WRITE_STREAMS_STREAM", data1, data2, data3);
 		break;
-	case AUDIO_THREAD_FETCH_STREAM: {
-		float f = get_ewma_power_as_float(data3);
-		printf("%-30s id:%x cbth:%u power:%f dBFS\n",
-		       "WRITE_STREAMS_FETCH_STREAM", data1, data2, f);
+	case AUDIO_THREAD_FETCH_STREAM:
+		printf("%-30s id:%x cbth:%u delay:%u\n",
+		       "WRITE_STREAMS_FETCH_STREAM", data1, data2, data3);
 		break;
-	}
 	case AUDIO_THREAD_STREAM_ADDED:
 		printf("%-30s id:%x dev:%u\n", "STREAM_ADDED", data1, data2);
 		break;
@@ -993,7 +966,7 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		printf("%-30s\n", "ADAPTER_REMOVED");
 		break;
 	case BT_A2DP_CONFIGURED:
-		printf("%-30s connected profiles 0x%.2x\n", "A2DP_CONFIGURED",
+		printf("%-30s connected profiles %u\n", "A2DP_CONFIGURED",
 		       data1);
 		break;
 	case BT_A2DP_START:
@@ -1003,8 +976,8 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		printf("%-30s\n", "A2DP_SUSPENDED");
 		break;
 	case BT_AUDIO_GATEWAY_INIT:
-		printf("%-30s supported profiles 0x%.2x\n",
-		       "AUDIO_GATEWAY_INIT", data1);
+		printf("%-30s supported profiles %u\n", "AUDIO_GATEWAY_INIT",
+		       data1);
 		break;
 	case BT_AUDIO_GATEWAY_START:
 		printf("%-30s \n", "AUDIO_GATEWAY_START");
@@ -1018,12 +991,11 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		       data2);
 		break;
 	case BT_DEV_CONNECTED_CHANGE:
-		printf("%-30s supported profiles 0x%.2x now %s\n",
-		       "DEV_CONNECTED_CHANGE", data1,
-		       data2 ? "connected" : "disconnected");
+		printf("%-30s profiles %u now %u\n", "DEV_CONNECTED_CHANGE",
+		       data1, data2);
 		break;
 	case BT_DEV_CONN_WATCH_CB:
-		printf("%-30s %u retries left, supported profiles 0x%.2x\n",
+		printf("%-30s %u retries left, supported profiles %u\n",
 		       "DEV_CONN_WATCH_CB", data1, data2);
 		break;
 	case BT_DEV_SUSPEND_CB:
@@ -1049,8 +1021,8 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		printf("%-30s\n", "HFP_REQUEST_DISCONNECT");
 		break;
 	case BT_HFP_SUPPORTED_FEATURES:
-		printf("%-30s role %s features 0x%.4x\n",
-		       "HFP_SUPPORTED_FEATURES", data1 ? "AG" : "HF", data2);
+		printf("%-30s role %s features %u\n", "HFP_SUPPORTED_FEATURES",
+		       data1 ? "AG" : "HF", data2);
 		break;
 	case BT_HSP_NEW_CONNECTION:
 		printf("%-30s\n", "HSP_NEW_CONNECTION");
@@ -1059,7 +1031,7 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 		printf("%-30s\n", "HSP_REQUEST_DISCONNECT");
 		break;
 	case BT_NEW_AUDIO_PROFILE_AFTER_CONNECT:
-		printf("%-30s old 0x%.2x, new 0x%.2x\n",
+		printf("%-30s old %u, new %u\n",
 		       "NEW_AUDIO_PROFILE_AFTER_CONNECT", data1, data2);
 		break;
 	case BT_RESET:
@@ -1088,30 +1060,12 @@ static void show_btlog_tag(const struct cras_bt_event_log *log,
 	}
 }
 
-static void convert_to_time_str(const struct timespec *ts, time_t sec_offset,
-				int32_t nsec_offset)
-{
-	time_t lt = ts->tv_sec;
-	struct tm t;
-	unsigned int time_nsec;
-
-	/* Assuming tv_nsec doesn't exceed 10^9 */
-	time_nsec = ts->tv_nsec;
-	convert_time((unsigned int *)&lt, &time_nsec, sec_offset, nsec_offset);
-	localtime_r(&lt, &t);
-	strftime(time_str, 128, "%Y-%m-%dT%H:%M:%S", &t);
-	snprintf(time_str + strlen(time_str), 128 - strlen(time_str), ".%09u",
-		 time_nsec);
-}
-
 static void cras_bt_debug_info(struct cras_client *client)
 {
 	const struct cras_bt_debug_info *info;
 	time_t sec_offset;
 	int32_t nsec_offset;
 	int i, j;
-	struct timespec ts;
-	struct packet_status_logger wbs_logger;
 
 	info = cras_client_get_bt_debug_info(client);
 	fill_time_offset(&sec_offset, &nsec_offset);
@@ -1123,23 +1077,6 @@ static void cras_bt_debug_info(struct cras_client *client)
 		j++;
 		j %= info->bt_log.len;
 	}
-
-	printf("-------------WBS packet loss------------\n");
-	wbs_logger = info->wbs_logger;
-
-	packet_status_logger_begin_ts(&wbs_logger, &ts);
-	convert_to_time_str(&ts, sec_offset, nsec_offset);
-	printf("%s [begin]\n", time_str);
-
-	packet_status_logger_end_ts(&wbs_logger, &ts);
-	convert_to_time_str(&ts, sec_offset, nsec_offset);
-	printf("%s [end]\n", time_str);
-
-	printf("In hex format:\n");
-	packet_status_logger_dump_hex(&wbs_logger);
-
-	printf("In binary format:\n");
-	packet_status_logger_dump_binary(&wbs_logger);
 
 	/* Signal main thread we are done after the last chunk. */
 	pthread_mutex_lock(&done_mutex);

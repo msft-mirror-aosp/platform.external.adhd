@@ -3,14 +3,9 @@
  * found in the LICENSE file.
  */
 
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <stdint.h>
 #include <time.h>
-
-using testing::MatchesRegex;
-using testing::internal::CaptureStdout;
-using testing::internal::GetCapturedStdout;
 
 extern "C" {
 #include "cras_hfp_info.c"
@@ -509,26 +504,6 @@ TEST(HfpInfo, StartHfpInfoAndWriteMsbc) {
   hfp_info_destroy(info);
 }
 
-TEST(HfpInfo, WBSLoggerPacketStatusDumpBinary) {
-  struct packet_status_logger logger;
-  char log_regex[64];
-  int num_wraps[5] = {0, 0, 0, 1, 1};
-  int wp[5] = {40, 150, 162, 100, 32};
-
-  /* Expect the log line wraps at correct length to avoid feedback redact. */
-  snprintf(log_regex, 64, "([01D]{%d}\n)*", PACKET_STATUS_LOG_LINE_WRAP);
-
-  packet_status_logger_init(&logger);
-  logger.size = PACKET_STATUS_LEN_BYTES * 8;
-  for (int i = 0; i < 5; i++) {
-    CaptureStdout();
-    logger.num_wraps = num_wraps[i];
-    logger.wp = wp[i];
-    packet_status_logger_dump_binary(&logger);
-    EXPECT_THAT(GetCapturedStdout(), MatchesRegex(log_regex));
-  }
-}
-
 }  // namespace
 
 extern "C" {
@@ -574,10 +549,6 @@ int cras_msbc_plc_handle_good_frames(struct cras_msbc_plc* plc,
   cras_msbc_plc_handle_good_frames_called++;
   return MSBC_CODE_SIZE;
 }
-void packet_status_logger_init(struct packet_status_logger* logger) {}
-
-void packet_status_logger_update(struct packet_status_logger* logger,
-                                 bool val) {}
 }
 
 int main(int argc, char** argv) {
