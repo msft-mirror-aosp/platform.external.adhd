@@ -361,8 +361,7 @@ static void possibly_enable_echo_reference(struct cras_iodev *dev)
 	if (dev->echo_reference_dev == NULL)
 		return;
 
-	server_stream_create(stream_list, dev->echo_reference_dev->info.idx,
-			     dev->format);
+	server_stream_create(stream_list, dev->echo_reference_dev->info.idx);
 }
 
 /*

@@ -555,11 +555,8 @@ static void append_stream_dump_info(struct audio_debug_info *info,
 	si->runtime_nsec = time_since.tv_nsec;
 }
 
-/* Handle a message sent from main thread to the audio thread.
- * Returns:
- *    Error code when reading or sending message fails.
- */
-static int handle_audio_thread_message(struct audio_thread *thread)
+/* Handle a message sent to the playback thread */
+static int handle_playback_thread_message(struct audio_thread *thread)
 {
 	uint8_t buf[256];
 	struct audio_thread_msg *msg = (struct audio_thread_msg *)buf;
@@ -714,7 +711,7 @@ static int handle_audio_thread_message(struct audio_thread *thread)
 	err = audio_thread_send_response(thread, ret);
 	if (err < 0)
 		return err;
-	return 0;
+	return ret;
 }
 
 /* Returns the number of active streams plus the number of active devices. */
@@ -915,7 +912,7 @@ static void *audio_io_thread(void *arg)
 			continue;
 
 		if (thread->pollfds[0].revents & POLLIN) {
-			rc = handle_audio_thread_message(thread);
+			rc = handle_playback_thread_message(thread);
 			if (rc < 0)
 				syslog(LOG_ERR, "handle message %d", rc);
 		}
