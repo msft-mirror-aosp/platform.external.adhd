@@ -228,8 +228,7 @@ TEST_F(BtDeviceTestSuite, SetDeviceConnectedA2dpOnly) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(device,
-                                        CRAS_BT_DEVICE_PROFILE_A2DP_SINK);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -269,9 +268,8 @@ TEST_F(BtDeviceTestSuite, SetDeviceConnectedHfpHspOnly) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -312,10 +310,9 @@ TEST_F(BtDeviceTestSuite, SetDeviceConnectedA2dpHfpHsp) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-                  CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -363,10 +360,9 @@ TEST_F(BtDeviceTestSuite, DevConnectedConflictCheck) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-                  CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -402,10 +398,9 @@ TEST_F(BtDeviceTestSuite, A2dpDropped) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-                  CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -438,10 +433,9 @@ TEST_F(BtDeviceTestSuite, DevConnectDisconnectBackToBack) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-                  CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);
@@ -506,10 +500,9 @@ TEST_F(BtDeviceTestSuite, ConnectionWatchTimeout) {
   device = cras_bt_device_create(NULL, FAKE_OBJ_PATH);
   EXPECT_NE((void*)NULL, device);
 
-  cras_bt_device_set_supported_profiles(
-      device, CRAS_BT_DEVICE_PROFILE_A2DP_SINK |
-                  CRAS_BT_DEVICE_PROFILE_HSP_HEADSET |
-                  CRAS_BT_DEVICE_PROFILE_HFP_HANDSFREE);
+  cras_bt_device_add_supported_profiles(device, A2DP_SINK_UUID);
+  cras_bt_device_add_supported_profiles(device, HSP_HS_UUID);
+  cras_bt_device_add_supported_profiles(device, HFP_HF_UUID);
 
   cur = msg_root = NewMockDBusConnectedMessage(1);
   cras_bt_device_update_properties(device, (DBusMessageIter*)&cur, NULL);

@@ -47,8 +47,8 @@ static unsigned int stream_list_add_stream_called;
 static unsigned int stream_list_disconnect_stream_called;
 static unsigned int cras_iodev_list_rm_input_called;
 static unsigned int cras_iodev_list_rm_output_called;
-static struct cras_audio_shm mock_shm;
-static struct cras_rstream mock_rstream;
+static struct cras_audio_shm dummy_shm;
+static struct cras_rstream dummy_rstream;
 static size_t cras_observer_num_ops_registered;
 static size_t cras_observer_register_notify_called;
 static size_t cras_observer_add_called;
@@ -220,6 +220,30 @@ TEST_F(RClientMessagesSuite, ConnectMsgWithBadFd) {
   EXPECT_NE(0, out_msg.err);
   EXPECT_EQ(stream_list_add_stream_called,
             stream_list_disconnect_stream_called);
+}
+
+TEST_F(RClientMessagesSuite, ConnectMsgFromOldClient) {
+  struct cras_client_stream_connected out_msg;
+  int rc;
+
+  cras_rstream_create_stream_out = rstream_;
+  cras_iodev_attach_stream_retval = 0;
+
+  connect_msg_.header.length = sizeof(struct cras_connect_message_old);
+  connect_msg_.proto_version = 5;
+
+  fd_ = 100;
+  rc = rclient_->ops->handle_message_from_client(rclient_, &connect_msg_.header,
+                                                 &fd_, 1);
+  EXPECT_EQ(0, rc);
+  EXPECT_EQ(1, cras_make_fd_nonblocking_called);
+
+  rc = read(pipe_fds_[0], &out_msg, sizeof(out_msg));
+  EXPECT_EQ(sizeof(out_msg), rc);
+  EXPECT_EQ(stream_id_, out_msg.stream_id);
+  EXPECT_EQ(0, out_msg.err);
+  EXPECT_EQ(1, stream_list_add_stream_called);
+  EXPECT_EQ(0, stream_list_disconnect_stream_called);
 }
 
 TEST_F(RClientMessagesSuite, StreamConnectMessageValidDirection) {
@@ -887,16 +911,16 @@ int stream_list_add(struct stream_list* list,
                     struct cras_rstream** stream) {
   int ret;
 
-  *stream = &mock_rstream;
+  *stream = &dummy_rstream;
 
   stream_list_add_stream_called++;
   ret = stream_list_add_stream_return;
   if (ret)
     stream_list_add_stream_return = -EINVAL;
 
-  mock_rstream.shm = &mock_shm;
-  mock_rstream.direction = config->direction;
-  mock_rstream.stream_id = config->stream_id;
+  dummy_rstream.shm = &dummy_shm;
+  dummy_rstream.direction = config->direction;
+  dummy_rstream.stream_id = config->stream_id;
 
   return ret;
 }
@@ -961,10 +985,6 @@ void cras_observer_remove(struct cras_observer_client* client) {
 
 bool cras_audio_format_valid(const struct cras_audio_format* fmt) {
   return true;
-}
-
-struct packet_status_logger* cras_hfp_ag_get_wbs_logger() {
-  return NULL;
 }
 
 }  // extern "C"
