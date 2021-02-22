@@ -113,6 +113,7 @@ struct alsa_input_node {
  * is_first - true if this is the first iodev on the card.
  * fully_specified - true if this device and it's nodes were fully specified.
  *     That is, don't automatically create nodes for it.
+ * enable_htimestamp - True when the device's htimestamp is used.
  * handle - Handle to the opened ALSA device.
  * num_severe_underruns - Number of times we have run out of data badly.
                           Unlike num_underruns which records for the duration
@@ -147,6 +148,7 @@ struct alsa_io {
 	enum CRAS_ALSA_CARD_TYPE card_type;
 	int is_first;
 	int fully_specified;
+	int enable_htimestamp;
 	snd_pcm_t *handle;
 	unsigned int num_severe_underruns;
 	snd_pcm_stream_t alsa_stream;
@@ -329,7 +331,8 @@ static int frames_queued(const struct cras_iodev *iodev,
 			aio->num_severe_underruns++;
 		return rc;
 	}
-	clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
+	if (!aio->enable_htimestamp)
+		clock_gettime(CLOCK_MONOTONIC_RAW, tstamp);
 	if (iodev->direction == CRAS_STREAM_INPUT)
 		return (int)frames;
 
@@ -371,7 +374,7 @@ static int close_dev(struct cras_iodev *iodev)
 	return 0;
 }
 
-static int empty_hotword_cb(void *arg, int revents)
+static int dummy_hotword_cb(void *arg, int revents)
 {
 	/* Only need this once. */
 	struct alsa_io *aio = (struct alsa_io *)arg;
@@ -446,7 +449,7 @@ static int configure_dev(struct cras_iodev *iodev)
 		return rc;
 
 	/* Configure software params. */
-	rc = cras_alsa_set_swparams(aio->handle);
+	rc = cras_alsa_set_swparams(aio->handle, &aio->enable_htimestamp);
 	if (rc < 0)
 		return rc;
 
@@ -487,7 +490,7 @@ static int configure_dev(struct cras_iodev *iodev)
 
 		if (aio->poll_fd >= 0)
 			audio_thread_add_events_callback(
-				aio->poll_fd, empty_hotword_cb, aio, POLLIN);
+				aio->poll_fd, dummy_hotword_cb, aio, POLLIN);
 	}
 
 	/* Capture starts right away, playback will wait for samples. */
@@ -1546,7 +1549,7 @@ static void jack_output_plug_event(const struct cras_alsa_jack *jack,
 	 * For HDMI plug event cases, update max supported channels according
 	 * to the current active node.
 	 */
-	if (node->base.type == CRAS_NODE_TYPE_HDMI && plugged)
+	if (node->base.type == CRAS_NODE_TYPE_HDMI)
 		update_max_supported_channels(&aio->base);
 }
 
@@ -2131,6 +2134,8 @@ alsa_iodev_create(size_t card_index, const char *card_name, size_t device_index,
 		rc = ucm_get_min_buffer_level(ucm, &level);
 		if (!rc && direction == CRAS_STREAM_OUTPUT)
 			iodev->min_buffer_level = level;
+
+		aio->enable_htimestamp = ucm_get_enable_htimestamp_flag(ucm);
 	}
 
 	set_iodev_name(iodev, card_name, dev_name, card_index, device_index,
@@ -2350,11 +2355,8 @@ void alsa_iodev_ucm_complete_init(struct cras_iodev *iodev)
 
 	set_default_hotword_model(iodev);
 
-	node = iodev->active_node;
-
 	/* Record max supported channels into cras_iodev_info. */
-	if (node && node->plugged)
-		update_max_supported_channels(iodev);
+	update_max_supported_channels(iodev);
 }
 
 void alsa_iodev_destroy(struct cras_iodev *iodev)
