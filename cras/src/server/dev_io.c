@@ -126,19 +126,6 @@ static bool is_time_to_fetch(const struct dev_stream *dev_stream,
 	return 0;
 }
 
-/* The log only accepts uint32 arguments, so the float power
- * must be written as bits and assumed to have a float when
- * parsing the log.
- */
-static uint32_t get_ewma_power_as_int(struct ewma_power *ewma)
-{
-	uint32_t pow_as_int = 0;
-
-	if (sizeof(uint32_t) == sizeof(float))
-		memcpy(&pow_as_int, &ewma->power, sizeof(uint32_t));
-	return pow_as_int;
-}
-
 /* Asks any stream with room for more data. Sets the time stamp for all streams.
  * Args:
  *    adev - The output device streams are attached to.
@@ -207,8 +194,7 @@ static int fetch_streams(struct open_dev *adev)
 		dev_stream_set_delay(dev_stream, delay);
 
 		ATLOG(atlog, AUDIO_THREAD_FETCH_STREAM, rstream->stream_id,
-		      cras_rstream_get_cb_threshold(rstream),
-		      get_ewma_power_as_int(&rstream->ewma));
+		      cras_rstream_get_cb_threshold(rstream), delay);
 
 		rc = dev_stream_request_playback_samples(dev_stream, &now);
 		if (rc < 0) {
@@ -564,8 +550,7 @@ static int capture_to_streams(struct open_dev *adev)
 			break;
 	}
 
-	ATLOG(atlog, AUDIO_THREAD_READ_AUDIO_DONE, remainder,
-	      get_ewma_power_as_int(&idev->ewma), 0);
+	ATLOG(atlog, AUDIO_THREAD_READ_AUDIO_DONE, remainder, 0, 0);
 
 	return 0;
 }
@@ -748,8 +733,7 @@ int write_output_samples(struct open_dev **odevs, struct open_dev *adev,
 		if (cras_iodev_update_rate(odev, hw_level, &hw_tstamp))
 			update_estimated_rate(adev);
 	}
-	ATLOG(atlog, AUDIO_THREAD_FILL_AUDIO, adev->dev->info.idx, hw_level,
-	      odev->min_cb_level);
+	ATLOG(atlog, AUDIO_THREAD_FILL_AUDIO, adev->dev->info.idx, hw_level, 0);
 
 	/* Don't request more than hardware can hold. Note that min_buffer_level
 	 * has been subtracted from the actual hw_level so we need to take it
@@ -813,7 +797,7 @@ int write_output_samples(struct open_dev **odevs, struct open_dev *adev,
 	}
 
 	ATLOG(atlog, AUDIO_THREAD_FILL_AUDIO_DONE, hw_level, total_written,
-	      get_ewma_power_as_int(&odev->ewma));
+	      odev->min_cb_level);
 
 	return total_written;
 }

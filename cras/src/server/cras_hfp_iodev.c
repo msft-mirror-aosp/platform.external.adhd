@@ -350,8 +350,6 @@ struct cras_iodev *hfp_iodev_create(enum CRAS_STREAM_DIRECTION dir,
 	/* Record max supported channels into cras_iodev_info. */
 	iodev->info.max_supported_channels = 1;
 
-	ewma_power_disable(&iodev->ewma);
-
 	return iodev;
 
 error:
