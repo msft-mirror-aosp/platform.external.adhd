@@ -13,14 +13,14 @@
 //! the samples written to it are committed to the `PlaybackBufferStream` it came from.
 //!
 //! ```
-//! use audio_streams::{BoxError, SampleFormat, StreamSource, NoopStreamSource};
+//! use audio_streams::{BoxError, SampleFormat, StreamSource, DummyStreamSource};
 //! use std::io::Write;
 //!
 //! const buffer_size: usize = 120;
 //! const num_channels: usize = 2;
 //!
 //! # fn main() -> std::result::Result<(), BoxError> {
-//! let mut stream_source = NoopStreamSource::new();
+//! let mut stream_source = DummyStreamSource::new();
 //! let sample_format = SampleFormat::S16LE;
 //! let frame_size = num_channels * sample_format.sample_bytes();
 //!
@@ -55,7 +55,7 @@ pub enum SampleFormat {
 }
 
 impl SampleFormat {
-    pub fn sample_bytes(self) -> usize {
+    pub fn sample_bytes(&self) -> usize {
         use SampleFormat::*;
         match self {
             U8 => 1,
@@ -145,7 +145,7 @@ pub trait StreamSource: Send {
 
     /// Returns a stream control and buffer generator object. These are separate as the buffer
     /// generator might want to be passed to the audio stream.
-    /// Default implementation returns `NoopStreamControl` and `NoopCaptureStream`.
+    /// Default implementation returns `DummyStreamControl` and `DummyCaptureStream`.
     #[allow(clippy::type_complexity)]
     fn new_capture_stream(
         &mut self,
@@ -161,8 +161,8 @@ pub trait StreamSource: Send {
         BoxError,
     > {
         Ok((
-            Box::new(NoopStreamControl::new()),
-            Box::new(capture::NoopCaptureStream::new(
+            Box::new(DummyStreamControl::new()),
+            Box::new(capture::DummyCaptureStream::new(
                 num_channels,
                 format,
                 frame_rate,
@@ -295,28 +295,28 @@ impl<'a> Drop for PlaybackBuffer<'a> {
 }
 
 /// Stream that accepts playback samples but drops them.
-pub struct NoopStream {
+pub struct DummyStream {
     buffer: Vec<u8>,
     frame_size: usize,
     interval: Duration,
     next_frame: Duration,
     start_time: Option<Instant>,
-    buffer_drop: NoopBufferDrop,
+    buffer_drop: DummyBufferDrop,
 }
 
-/// NoopStream data that is needed from the buffer complete callback.
-struct NoopBufferDrop {
+/// DummyStream data that is needed from the buffer complete callback.
+struct DummyBufferDrop {
     which_buffer: bool,
 }
 
-impl BufferDrop for NoopBufferDrop {
+impl BufferDrop for DummyBufferDrop {
     fn trigger(&mut self, _nwritten: usize) {
         // When a buffer completes, switch to the other one.
         self.which_buffer ^= true;
     }
 }
 
-impl NoopStream {
+impl DummyStream {
     pub fn new(
         num_channels: usize,
         format: SampleFormat,
@@ -325,20 +325,20 @@ impl NoopStream {
     ) -> Self {
         let frame_size = format.sample_bytes() * num_channels;
         let interval = Duration::from_millis(buffer_size as u64 * 1000 / frame_rate as u64);
-        NoopStream {
+        DummyStream {
             buffer: vec![0; buffer_size * frame_size],
             frame_size,
             interval,
             next_frame: interval,
             start_time: None,
-            buffer_drop: NoopBufferDrop {
+            buffer_drop: DummyBufferDrop {
                 which_buffer: false,
             },
         }
     }
 }
 
-impl PlaybackBufferStream for NoopStream {
+impl PlaybackBufferStream for DummyStream {
     fn next_playback_buffer(&mut self) -> Result<PlaybackBuffer, BoxError> {
         if let Some(start_time) = self.start_time {
             if start_time.elapsed() < self.next_frame {
@@ -357,8 +357,7 @@ impl PlaybackBufferStream for NoopStream {
     }
 }
 
-/// No-op control for `NoopStream`s.
-/// Should be deprecated once all existing use of DummyStreamControl removed.
+/// No-op control for `DummyStream`s.
 #[derive(Default)]
 pub struct DummyStreamControl;
 
@@ -370,29 +369,17 @@ impl DummyStreamControl {
 
 impl StreamControl for DummyStreamControl {}
 
-/// No-op control for `NoopStream`s.
+/// Source of `DummyStream` and `DummyStreamControl` objects.
 #[derive(Default)]
-pub struct NoopStreamControl;
+pub struct DummyStreamSource;
 
-impl NoopStreamControl {
+impl DummyStreamSource {
     pub fn new() -> Self {
-        NoopStreamControl {}
+        DummyStreamSource {}
     }
 }
 
-impl StreamControl for NoopStreamControl {}
-
-/// Source of `NoopStream` and `NoopStreamControl` objects.
-#[derive(Default)]
-pub struct NoopStreamSource;
-
-impl NoopStreamSource {
-    pub fn new() -> Self {
-        NoopStreamSource {}
-    }
-}
-
-impl StreamSource for NoopStreamSource {
+impl StreamSource for DummyStreamSource {
     #[allow(clippy::type_complexity)]
     fn new_playback_stream(
         &mut self,
@@ -402,8 +389,8 @@ impl StreamSource for NoopStreamSource {
         buffer_size: usize,
     ) -> Result<(Box<dyn StreamControl>, Box<dyn PlaybackBufferStream>), BoxError> {
         Ok((
-            Box::new(NoopStreamControl::new()),
-            Box::new(NoopStream::new(
+            Box::new(DummyStreamControl::new()),
+            Box::new(DummyStream::new(
                 num_channels,
                 format,
                 frame_rate,
@@ -421,7 +408,7 @@ mod tests {
     fn invalid_buffer_length() {
         // Playback buffers can't be created with a size that isn't divisible by the frame size.
         let mut pb_buf = [0xa5u8; 480 * 2 * 2 + 1];
-        let mut buffer_drop = NoopBufferDrop {
+        let mut buffer_drop = DummyBufferDrop {
             which_buffer: false,
         };
         assert!(PlaybackBuffer::new(2, &mut pb_buf, &mut buffer_drop).is_err());
@@ -449,7 +436,7 @@ mod tests {
 
     #[test]
     fn sixteen_bit_stereo() {
-        let mut server = NoopStreamSource::new();
+        let mut server = DummyStreamSource::new();
         let (_, mut stream) = server
             .new_playback_stream(2, SampleFormat::S16LE, 48000, 480)
             .unwrap();
@@ -461,7 +448,7 @@ mod tests {
 
     #[test]
     fn consumption_rate() {
-        let mut server = NoopStreamSource::new();
+        let mut server = DummyStreamSource::new();
         let (_, mut stream) = server
             .new_playback_stream(2, SampleFormat::S16LE, 48000, 480)
             .unwrap();

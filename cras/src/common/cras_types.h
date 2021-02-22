@@ -15,7 +15,6 @@
 
 #include "cras_audio_format.h"
 #include "cras_iodev_info.h"
-#include "packet_status_logger.h"
 
 /* Architecture independent timespec */
 struct __attribute__((__packed__)) cras_timespec {
@@ -51,8 +50,6 @@ enum CRAS_CONNECTION_TYPE {
 	CRAS_CAPTURE, // For capture client.
 	CRAS_VMS_LEGACY, // For legacy client in vms.
 	CRAS_VMS_UNIFIED, // For unified client in vms.
-	CRAS_PLUGIN_PLAYBACK, // For playback client in vms/plugin.
-	CRAS_PLUGIN_UNIFIED, // For unified client in vms/plugin.
 	CRAS_NUM_CONN_TYPE,
 };
 
@@ -168,14 +165,7 @@ enum CRAS_CLIENT_TYPE {
 	CRAS_CLIENT_TYPE_CROSVM, /* CROSVM */
 	CRAS_CLIENT_TYPE_SERVER_STREAM, /* Server stream */
 	CRAS_CLIENT_TYPE_LACROS, /* LaCrOS */
-	CRAS_CLIENT_TYPE_PLUGIN, /* PluginVM */
-	CRAS_NUM_CLIENT_TYPE, /* numbers of CRAS_CLIENT_TYPE */
 };
-
-static inline bool cras_validate_client_type(enum CRAS_CLIENT_TYPE client_type)
-{
-	return 0 <= client_type && client_type < CRAS_NUM_CLIENT_TYPE;
-}
 
 #define ENUM_STR(x)                                                            \
 	case x:                                                                \
@@ -212,7 +202,6 @@ cras_client_type_str(enum CRAS_CLIENT_TYPE client_type)
 	ENUM_STR(CRAS_CLIENT_TYPE_CROSVM)
 	ENUM_STR(CRAS_CLIENT_TYPE_SERVER_STREAM)
 	ENUM_STR(CRAS_CLIENT_TYPE_LACROS)
-	ENUM_STR(CRAS_CLIENT_TYPE_PLUGIN)
 	default:
 		return "INVALID_CLIENT_TYPE";
 	}
@@ -490,7 +479,6 @@ struct __attribute__((__packed__)) cras_bt_event_log {
 
 struct __attribute__((__packed__)) cras_bt_debug_info {
 	struct cras_bt_event_log bt_log;
-	struct packet_status_logger wbs_logger;
 };
 
 /*
@@ -568,11 +556,7 @@ struct __attribute__((__packed__)) cras_audio_thread_snapshot_buffer {
  *    snapshot_buffer - ring buffer for storing audio thread snapshots.
  *    bt_debug_info - ring buffer for storing bluetooth event logs.
  *    bt_wbs_enabled - Whether or not bluetooth wideband speech is enabled.
- *    deprioritize_bt_wbs_mic - Whether Bluetooth wideband speech mic
- *        should be deprioritized for selecting as default audio input.
  *    main_thread_debug_info - ring buffer for storing main thread event logs.
- *    num_input_streams_with_permission - An array containing numbers of input
- *        streams with permission in each client type.
  */
 #define CRAS_SERVER_STATE_VERSION 2
 struct __attribute__((packed, aligned(4))) cras_server_state {
@@ -609,9 +593,7 @@ struct __attribute__((packed, aligned(4))) cras_server_state {
 	struct cras_audio_thread_snapshot_buffer snapshot_buffer;
 	struct cras_bt_debug_info bt_debug_info;
 	int32_t bt_wbs_enabled;
-	int32_t deprioritize_bt_wbs_mic;
 	struct main_thread_debug_info main_thread_debug_info;
-	uint32_t num_input_streams_with_permission[CRAS_NUM_CLIENT_TYPE];
 };
 
 /* Actions for card add/remove/change. */
