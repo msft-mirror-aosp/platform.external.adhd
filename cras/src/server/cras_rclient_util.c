@@ -80,13 +80,6 @@ rclient_validate_stream_connect_message(const struct cras_rclient *client,
 		       msg->direction, client->id);
 		return -EINVAL;
 	}
-
-	if (!cras_validate_client_type(msg->client_type)) {
-		syslog(LOG_ERR,
-		       "stream_connect: invalid stream client_type: %x for "
-		       "client: %zx.\n",
-		       msg->client_type, client->id);
-	}
 	return 0;
 }
 
@@ -162,9 +155,6 @@ int rclient_handle_client_stream_connect(struct cras_rclient *client,
 
 	stream_config = cras_rstream_config_init_with_message(
 		client, msg, &aud_fd, &client_shm_fd, &remote_fmt);
-	/* Overwrite client_type if client->client_type is set. */
-	if (client->client_type != CRAS_CLIENT_TYPE_UNKNOWN)
-		stream_config.client_type = client->client_type;
 	rc = stream_list_add(cras_iodev_list_get_stream_list(), &stream_config,
 			     &stream);
 	if (rc)
@@ -289,11 +279,15 @@ int rclient_handle_message_from_client(struct cras_rclient *client,
 	switch (msg->id) {
 	case CRAS_SERVER_CONNECT_STREAM: {
 		int client_shm_fd = num_fds > 1 ? fds[1] : -1;
+		struct cras_connect_message cmsg;
 		if (MSG_LEN_VALID(msg, struct cras_connect_message)) {
 			rclient_handle_client_stream_connect(
 				client,
 				(const struct cras_connect_message *)msg, fd,
 				client_shm_fd);
+		} else if (!convert_connect_message_old(msg, &cmsg)) {
+			rclient_handle_client_stream_connect(client, &cmsg, fd,
+							     client_shm_fd);
 		} else {
 			return -EINVAL;
 		}
