@@ -46,6 +46,7 @@ noinst_PROGRAMS =
 if HAVE_DBUS
 CRAS_DBUS_SOURCES = \
 	common/cras_sbc_codec.c \
+	common/packet_status_logger.c \
 	server/cras_bt_manager.c \
 	server/cras_bt_adapter.c \
 	server/cras_bt_device.c \
@@ -155,6 +156,7 @@ cras_server_SOURCES = \
 	server/cras_volume_curve.c \
 	server/dev_io.c \
 	server/dev_stream.c \
+	server/ewma_power.c \
 	server/input_data.c \
 	server/linear_resampler.c \
 	server/polled_interval_checker.c \
@@ -280,6 +282,7 @@ include_HEADERS = \
 	common/cras_types.h \
 	common/cras_util.h \
 	common/edid_utils.h \
+	common/packet_status_logger.h \
 	common/utlist.h \
 	libcras/cras_client.h \
 	libcras/cras_helpers.h
@@ -437,6 +440,7 @@ TESTS = \
 	edid_utils_unittest \
 	empty_iodev_unittest \
 	expr_unittest \
+	ewma_power_unittest \
 	file_wait_unittest \
 	float_buffer_unittest \
 	fmt_conv_unittest \
@@ -880,6 +884,14 @@ buffer_share_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server
 buffer_share_unittest_LDADD = -lgtest -liniparser -lpthread
 
+ewma_power_unittest_SOURCES = tests/ewma_power_unittest.cc \
+	common/cras_audio_format.c server/cras_audio_area.c \
+	server/ewma_power.c
+
+ewma_power_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
+	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server
+ewma_power_unittest_LDADD = -lgtest
+
 iodev_list_unittest_SOURCES = tests/iodev_list_unittest.cc \
 	server/cras_iodev_list.c
 iodev_list_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
@@ -949,8 +961,9 @@ control_rclient_unittest_SOURCES = tests/control_rclient_unittest.cc \
 				   server/cras_rstream_config.c
 control_rclient_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common \
-	-I$(top_srcdir)/src/server $(CRAS_UT_TMPDIR_CFLAGS)
-control_rclient_unittest_LDADD = -lgtest -lpthread
+	-I$(top_srcdir)/src/server $(CRAS_UT_TMPDIR_CFLAGS) \
+	$(DBUS_CFLAGS)
+control_rclient_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
 
 playback_rclient_unittest_SOURCES = tests/playback_rclient_unittest.cc \
 				    server/cras_rstream_config.c
