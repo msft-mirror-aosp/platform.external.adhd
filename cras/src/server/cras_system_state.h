@@ -122,6 +122,12 @@ void cras_system_set_bt_wbs_enabled(bool enabled);
 /* Gets the elable flag of bluetooth wideband speech feature. */
 bool cras_system_get_bt_wbs_enabled();
 
+/*
+ * Returns if Bluetooth WBS mic should be deprioritized for selecting
+ * as default audio input option.
+ */
+bool cras_system_get_deprioritize_bt_wbs_mic();
+
 /* Sets the flag to enable or disable Bluetooth fixed A2DP packet size. */
 void cras_system_set_bt_fix_a2dp_packet_size_enabled(bool enabled);
 
@@ -226,16 +232,20 @@ int cras_system_add_task(void (*callback)(void *data), void *callback_data);
  * subsystem is idle.
  * Args:
  *   direction - Directions of audio streams.
+ *   client_type - CRAS_CLIENT_TYPE of the audio stream.
  */
-void cras_system_state_stream_added(enum CRAS_STREAM_DIRECTION direction);
+void cras_system_state_stream_added(enum CRAS_STREAM_DIRECTION direction,
+				    enum CRAS_CLIENT_TYPE client_type);
 
 /* Signals that an audio input or output stream has been removed from the
  * system.  This allows the count of active streams can be used to notice when
  * the audio subsystem is idle.
  * Args:
  *   direction - Directions of audio stream.
+ *   client_type - CRAS_CLIENT_TYPE of the audio stream.
  */
-void cras_system_state_stream_removed(enum CRAS_STREAM_DIRECTION direction);
+void cras_system_state_stream_removed(enum CRAS_STREAM_DIRECTION direction,
+				      enum CRAS_CLIENT_TYPE client_type);
 
 /* Returns the number of active playback and capture streams. */
 unsigned cras_system_state_get_active_streams();
@@ -246,6 +256,16 @@ unsigned cras_system_state_get_active_streams();
  */
 unsigned cras_system_state_get_active_streams_by_direction(
 	enum CRAS_STREAM_DIRECTION direction);
+
+/* Returns the number of input streams with permission per CRAS_CLIENT_TYPE.
+ *
+ * Returns:
+ *   num_input_streams - An array with length = CRAS_NUM_CLIENT_TYPE and each
+ *                        element is the number of the current input
+ *                        streams with permission in each client type.
+ */
+void cras_system_state_get_input_streams_with_permission(
+	uint32_t num_input_streams[CRAS_NUM_CLIENT_TYPE]);
 
 /* Fills ts with the time the last stream was removed from the system, the time
  * the stream count went to zero.
