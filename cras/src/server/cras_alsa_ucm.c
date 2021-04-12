@@ -22,7 +22,6 @@ static const char override_type_name_var[] = "OverrideNodeType";
 static const char dsp_name_var[] = "DspName";
 static const char playback_mixer_elem_var[] = "PlaybackMixerElem";
 static const char capture_mixer_elem_var[] = "CaptureMixerElem";
-static const char swap_mode_suffix[] = "Swap Mode";
 static const char min_buffer_level_var[] = "MinBufferLevel";
 static const char dma_period_var[] = "DmaPeriodMicrosecs";
 static const char disable_software_volume[] = "DisableSoftwareVolume";
@@ -37,6 +36,11 @@ static const char coupled_mixers[] = "CoupledMixers";
 static const char dependent_device_name_var[] = "DependentPCM";
 static const char preempt_hotword_var[] = "PreemptHotword";
 static const char echo_reference_dev_name_var[] = "EchoReferenceDev";
+
+/* SectionModifier prefixes and suffixes. */
+static const char hotword_model_prefix[] = "Hotword Model";
+static const char swap_mode_suffix[] = "Swap Mode";
+static const char noise_cancellation_suffix[] = "Noise Cancellation";
 
 /*
  * Set this value in a SectionDevice to specify the intrinsic sensitivity in
@@ -54,7 +58,6 @@ static const char intrinsic_sensitivity_var[] = "IntrinsicSensitivity";
  * 0.01 dB.
  */
 static const char default_node_gain[] = "DefaultNodeGain";
-static const char hotword_model_prefix[] = "Hotword Model";
 static const char fully_specified_ucm_var[] = "FullySpecifiedUCM";
 static const char main_volume_names[] = "MainVolumeNames";
 
@@ -64,6 +67,8 @@ static const char *use_case_verbs[] = {
 	"Speech", "Pro Audio",	"Accessibility",
 };
 
+static const size_t max_section_name_len = 100;
+
 /* Represents a list of section names found in UCM. */
 struct section_name {
 	const char *name;
@@ -72,9 +77,10 @@ struct section_name {
 
 struct cras_use_case_mgr {
 	snd_use_case_mgr_t *mgr;
-	const char *name;
+	char *name;
 	unsigned int avail_use_cases;
 	enum CRAS_STREAM_TYPE use_case;
+	char *hotword_modifier;
 };
 
 static inline const char *uc_verb(struct cras_use_case_mgr *mgr)
@@ -376,6 +382,21 @@ static struct mixer_name *ucm_get_mixer_names(struct cras_use_case_mgr *mgr,
 	return names;
 }
 
+/* Gets the modifier name of Noise Cancellation for the given node_name. */
+static void ucm_get_node_noise_cancellation_name(const char *node_name,
+						 char *mod_name)
+{
+	size_t len =
+		strlen(node_name) + 1 + strlen(noise_cancellation_suffix) + 1;
+	if (len > max_section_name_len) {
+		syslog(LOG_ERR,
+		       "Length of the given section name is %zu > %zu(max)",
+		       len, max_section_name_len);
+		len = max_section_name_len;
+	}
+	snprintf(mod_name, len, "%s %s", node_name, noise_cancellation_suffix);
+}
+
 /* Exported Interface */
 
 struct cras_use_case_mgr *ucm_create(const char *name)
@@ -394,6 +415,10 @@ struct cras_use_case_mgr *ucm_create(const char *name)
 	if (!mgr)
 		return NULL;
 
+	mgr->name = strdup(name);
+	if (!mgr->name)
+		goto cleanup;
+
 	rc = snd_use_case_mgr_open(&mgr->mgr, name);
 	if (rc) {
 		syslog(LOG_WARNING, "Can not open ucm for card %s, rc = %d",
@@ -401,8 +426,8 @@ struct cras_use_case_mgr *ucm_create(const char *name)
 		goto cleanup;
 	}
 
-	mgr->name = name;
 	mgr->avail_use_cases = 0;
+	mgr->hotword_modifier = NULL;
 	num_verbs = snd_use_case_get_list(mgr->mgr, "_verbs", &list);
 	for (i = 0; i < num_verbs; i += 2) {
 		for (j = 0; j < CRAS_STREAM_NUM_TYPES; ++j) {
@@ -424,6 +449,7 @@ struct cras_use_case_mgr *ucm_create(const char *name)
 cleanup_mgr:
 	snd_use_case_mgr_close(mgr->mgr);
 cleanup:
+	free(mgr->name);
 	free(mgr);
 	return NULL;
 }
@@ -431,6 +457,8 @@ cleanup:
 void ucm_destroy(struct cras_use_case_mgr *mgr)
 {
 	snd_use_case_mgr_close(mgr->mgr);
+	free(mgr->hotword_modifier);
+	free(mgr->name);
 	free(mgr);
 }
 
@@ -484,6 +512,51 @@ int ucm_enable_swap_mode(struct cras_use_case_mgr *mgr, const char *node_name,
 	}
 	rc = ucm_set_modifier_enabled(mgr, swap_mod, enable);
 	free((void *)swap_mod);
+	return rc;
+}
+
+int ucm_node_noise_cancellation_exists(struct cras_use_case_mgr *mgr,
+				       const char *node_name)
+{
+	char *node_modifier_name = NULL;
+	int exists;
+
+	node_modifier_name = (char *)malloc(max_section_name_len);
+	if (!node_modifier_name)
+		return 0;
+	ucm_get_node_noise_cancellation_name(node_name, node_modifier_name);
+	exists = ucm_mod_exists_with_name(mgr, node_modifier_name);
+	free((void *)node_modifier_name);
+	return exists;
+}
+
+int ucm_enable_node_noise_cancellation(struct cras_use_case_mgr *mgr,
+				       const char *node_name, int enable)
+{
+	char *node_modifier_name = NULL;
+	int rc;
+
+	node_modifier_name = (char *)malloc(max_section_name_len);
+	if (!node_modifier_name)
+		return -ENOMEM;
+	ucm_get_node_noise_cancellation_name(node_name, node_modifier_name);
+	if (!ucm_mod_exists_with_name(mgr, node_modifier_name)) {
+		syslog(LOG_ERR, "Can not find modifier %s.",
+		       node_modifier_name);
+		free((void *)node_modifier_name);
+		return -EPERM;
+	}
+	if (modifier_enabled(mgr, node_modifier_name) == !!enable) {
+		syslog(LOG_DEBUG, "Modifier %s is already %s.",
+		       node_modifier_name, enable ? "enabled" : "disabled");
+		free((void *)node_modifier_name);
+		return 0;
+	}
+
+	syslog(LOG_DEBUG, "UCM %s Modifier %s", enable ? "enable" : "disable",
+	       node_modifier_name);
+	rc = ucm_set_modifier_enabled(mgr, node_modifier_name, enable);
+	free((void *)node_modifier_name);
 	return rc;
 }
 
@@ -984,14 +1057,61 @@ char *ucm_get_hotword_models(struct cras_use_case_mgr *mgr)
 	return models;
 }
 
-int ucm_set_hotword_model(struct cras_use_case_mgr *mgr, const char *model)
+void ucm_disable_all_hotword_models(struct cras_use_case_mgr *mgr)
 {
 	const char **list;
 	int num_enmods, mod_idx;
-	char *model_mod = NULL;
+
+	if (!mgr)
+		return;
+
+	/* Disable all currently enabled hotword model modifiers. */
+	num_enmods = snd_use_case_get_list(mgr->mgr, "_enamods", &list);
+	if (num_enmods <= 0)
+		return;
+
+	for (mod_idx = 0; mod_idx < num_enmods; mod_idx++) {
+		if (!strncmp(list[mod_idx], hotword_model_prefix,
+			     strlen(hotword_model_prefix)))
+			ucm_set_modifier_enabled(mgr, list[mod_idx], 0);
+	}
+	snd_use_case_free_list(list, num_enmods);
+}
+
+int ucm_enable_hotword_model(struct cras_use_case_mgr *mgr)
+{
+	if (mgr->hotword_modifier)
+		return ucm_set_modifier_enabled(mgr, mgr->hotword_modifier, 1);
+	return -EINVAL;
+}
+
+static int ucm_is_modifier_enabled(struct cras_use_case_mgr *mgr,
+				   char *modifier, long *value)
+{
+	int rc;
+	char *id;
+	size_t len = strlen(modifier) + 11 + 1;
+
+	id = (char *)malloc(len);
+
+	if (!id)
+		return -ENOMEM;
+
+	snprintf(id, len, "_modstatus/%s", modifier);
+	rc = snd_use_case_geti(mgr->mgr, id, value);
+	free(id);
+	return rc;
+}
+
+int ucm_set_hotword_model(struct cras_use_case_mgr *mgr, const char *model)
+{
+	char *model_mod;
+	long mod_status = 0;
 	size_t model_mod_size =
 		strlen(model) + 1 + strlen(hotword_model_prefix) + 1;
+
 	model_mod = (char *)malloc(model_mod_size);
+
 	if (!model_mod)
 		return -ENOMEM;
 	snprintf(model_mod, model_mod_size, "%s %s", hotword_model_prefix,
@@ -1001,21 +1121,16 @@ int ucm_set_hotword_model(struct cras_use_case_mgr *mgr, const char *model)
 		return -EINVAL;
 	}
 
-	/* Disable all currently enabled horword model modifiers. */
-	num_enmods = snd_use_case_get_list(mgr->mgr, "_enamods", &list);
-	if (num_enmods <= 0)
-		goto enable_mod;
+	/* If check failed, just move on, dont fail incoming model */
+	if (mgr->hotword_modifier)
+		ucm_is_modifier_enabled(mgr, mgr->hotword_modifier,
+					&mod_status);
 
-	for (mod_idx = 0; mod_idx < num_enmods; mod_idx++) {
-		if (!strncmp(list[mod_idx], hotword_model_prefix,
-			     strlen(hotword_model_prefix)))
-			ucm_set_modifier_enabled(mgr, list[mod_idx], 0);
-	}
-	snd_use_case_free_list(list, num_enmods);
-
-enable_mod:
-	ucm_set_modifier_enabled(mgr, model_mod, 1);
-	free((void *)model_mod);
+	ucm_disable_all_hotword_models(mgr);
+	free(mgr->hotword_modifier);
+	mgr->hotword_modifier = model_mod;
+	if (mod_status)
+		return ucm_enable_hotword_model(mgr);
 	return 0;
 }
 
