@@ -17,7 +17,6 @@
 #include "cras_iodev.h"
 #include "cras_system_state.h"
 #include "cras_util.h"
-#include "sfh.h"
 #include "utlist.h"
 
 /* Implementation of bluetooth hands-free profile iodev.
@@ -167,6 +166,7 @@ static int configure_dev(struct cras_iodev *iodev)
 	hfpio->filled_zeros = 0;
 add_dev:
 	hfp_info_add_iodev(hfpio->info, iodev->direction, iodev->format);
+	hfp_set_call_status(hfpio->slc, 1);
 
 	iodev->buffer_size = hfp_buf_size(hfpio->info, iodev->direction);
 
@@ -181,8 +181,10 @@ static int close_dev(struct cras_iodev *iodev)
 	struct hfp_io *hfpio = (struct hfp_io *)iodev;
 
 	hfp_info_rm_iodev(hfpio->info, iodev->direction);
-	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info))
+	if (hfp_info_running(hfpio->info) && !hfp_info_has_iodev(hfpio->info)) {
 		hfp_info_stop(hfpio->info);
+		hfp_set_call_status(hfpio->slc, 0);
+	}
 
 	cras_iodev_free_format(iodev);
 	cras_iodev_free_audio_area(iodev);
@@ -306,10 +308,7 @@ struct cras_iodev *hfp_iodev_create(enum CRAS_STREAM_DIRECTION dir,
 
 	snprintf(iodev->info.name, sizeof(iodev->info.name), "%s", name);
 	iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] = 0;
-	iodev->info.stable_id =
-		SuperFastHash(cras_bt_device_object_path(device),
-			      strlen(cras_bt_device_object_path(device)),
-			      strlen(cras_bt_device_object_path(device)));
+	iodev->info.stable_id = cras_bt_device_get_stable_id(device);
 
 	iodev->configure_dev = configure_dev;
 	iodev->frames_queued = frames_queued;

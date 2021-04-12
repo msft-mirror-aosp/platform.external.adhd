@@ -732,6 +732,17 @@ bool cras_iodev_is_aec_use_case(const struct cras_ionode *node)
 	return false;
 }
 
+bool cras_iodev_is_on_internal_card(const struct cras_ionode *node)
+{
+	if (node->type == CRAS_NODE_TYPE_INTERNAL_SPEAKER)
+		return true;
+	if (node->type == CRAS_NODE_TYPE_HEADPHONE)
+		return true;
+	if (node->type == CRAS_NODE_TYPE_MIC)
+		return true;
+	return false;
+}
+
 float cras_iodev_get_software_volume_scaler(struct cras_iodev *iodev)
 {
 	unsigned int volume;
@@ -1010,6 +1021,7 @@ int cras_iodev_close(struct cras_iodev *iodev)
 
 	if (iodev->active_node) {
 		cras_server_metrics_device_runtime(iodev);
+		cras_server_metrics_device_gain(iodev);
 		cras_server_metrics_device_volume(iodev);
 	}
 
@@ -1694,4 +1706,14 @@ int cras_iodev_drop_frames_by_time(struct cras_iodev *iodev, struct timespec ts)
 	rc = cras_iodev_drop_frames(iodev, frames_to_set);
 
 	return rc;
+}
+
+bool cras_iodev_support_noise_cancellation(const struct cras_iodev *iodev)
+{
+	if (iodev->direction != CRAS_STREAM_INPUT)
+		return false;
+
+	if (iodev->support_noise_cancellation)
+		return !!iodev->support_noise_cancellation(iodev);
+	return false;
 }

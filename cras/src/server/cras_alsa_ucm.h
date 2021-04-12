@@ -67,6 +67,28 @@ int ucm_swap_mode_exists(struct cras_use_case_mgr *mgr);
 int ucm_enable_swap_mode(struct cras_use_case_mgr *mgr, const char *node_name,
 			 int enable);
 
+/* Checks if modifier of noise cancellation for given node_name exists in ucm.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    node_name - The node name.
+ * Returns:
+ *    1 if it exists, 0 otherwise.
+ */
+int ucm_node_noise_cancellation_exists(struct cras_use_case_mgr *mgr,
+				       const char *node_name);
+
+/* Enables or disables noise cancellation for the given node_name. First checks
+ * if the modifier is already enabled or disabled.
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    node_name - The node name.
+ *    enable - Enable device if non-zero.
+ * Returns:
+ *    0 on success or negative error code on failure.
+ */
+int ucm_enable_node_noise_cancellation(struct cras_use_case_mgr *mgr,
+				       const char *node_name, int enable);
+
 /* Enables or disables a UCM device.  First checks if the device is already
  * enabled or disabled.
  * Args:
@@ -306,10 +328,25 @@ char *ucm_get_hotword_models(struct cras_use_case_mgr *mgr);
 /* Sets the desired hotword model.
  * Args:
  *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ *    model - locale for model
  * Returns:
  *    0 on success or negative error code on failure.
  */
 int ucm_set_hotword_model(struct cras_use_case_mgr *mgr, const char *model);
+
+/* Enable previously set hotword modifier
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ * Returns:
+ *    0 on success or negative error code on failure.
+ */
+int ucm_enable_hotword_model(struct cras_use_case_mgr *mgr);
+
+/* Disable all hotword model modifiers
+ * Args:
+ *    mgr - The cras_use_case_mgr pointer returned from alsa_ucm_create.
+ */
+void ucm_disable_all_hotword_models(struct cras_use_case_mgr *mgr);
 
 /* Checks if this card has fully specified UCM config.
  *
