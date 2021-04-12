@@ -259,7 +259,7 @@ TEST_F(HfpAlsaIodev, ConfigureDev) {
               hfp_alsa_io->aio->format->channel_layout[i]);
 
   EXPECT_EQ(1, fake_configure_dev_called);
-  EXPECT_EQ(0, hfp_set_call_status_called);
+  EXPECT_EQ(1, hfp_set_call_status_called);
   EXPECT_EQ(buf_size, iodev->buffer_size);
 
   hfp_alsa_iodev_destroy(iodev);
@@ -273,7 +273,7 @@ TEST_F(HfpAlsaIodev, CloseDev) {
                                 CRAS_BT_DEVICE_PROFILE_HFP_AUDIOGATEWAY);
   iodev->close_dev(iodev);
 
-  EXPECT_EQ(0, hfp_set_call_status_called);
+  EXPECT_EQ(1, hfp_set_call_status_called);
   EXPECT_EQ(1, cras_iodev_free_format_called);
   EXPECT_EQ(1, fake_close_dev_called);
 
@@ -505,6 +505,10 @@ void cras_bt_device_rm_iodev(struct cras_bt_device* device,
 
 const char* cras_bt_device_object_path(const struct cras_bt_device* device) {
   return "/fake/object/path";
+}
+
+int cras_bt_device_get_stable_id(const struct cras_bt_device* device) {
+  return 123;
 }
 
 void cras_iodev_free_resources(struct cras_iodev* iodev) {
