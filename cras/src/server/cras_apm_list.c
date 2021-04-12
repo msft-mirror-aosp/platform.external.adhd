@@ -61,9 +61,10 @@
  *        stream.
  *    work_queue - A task queue instance created and destroyed by
  *        libwebrtc_apm.
- *    use_tuned_settings - True if this APM uses settings tuned specifically
- *        for this hardware in AEC use case. Otherwise it uses the generic
- *        settings like run inside browser.
+ *    is_aec_use_case - True if the input and output devices pair is in the
+ *        typical AEC use case. This flag decides whether to use settings
+ *        tuned specifically for this hardware if exists. Otherwise it uses
+ *        the generic settings like run inside browser.
  */
 struct cras_apm {
 	webrtc_apm apm_ptr;
@@ -74,7 +75,7 @@ struct cras_apm {
 	struct cras_audio_format fmt;
 	struct cras_audio_area *area;
 	void *work_queue;
-	bool use_tuned_settings;
+	bool is_aec_use_case;
 	struct cras_apm *prev, *next;
 };
 
@@ -239,13 +240,12 @@ static void get_best_channels(struct cras_audio_format *apm_fmt)
 	int ch;
 	int8_t layout[CRAS_CH_MAX];
 
-	/* Assume device format has correct channel layout populated. */
-	if (apm_fmt->num_channels <= 2)
-		return;
-
-	/* If the device provides recording from more channels than we care
-	 * about, construct a new channel layout containing subset of original
-	 * channels that matches either FL, FR, or FC.
+	/* Using the format from dev_fmt is dangerous because input device
+	 * could have wild configurations like unuse the 1st channel and
+	 * connects 2nd channel to the only mic. Data in the first channel
+	 * is what APM cares about so always construct a new channel layout
+	 * containing subset of original channels that matches either FL, FR,
+	 * or FC.
 	 * TODO(hychao): extend the logic when we have a stream that wants
 	 * to record channels like RR(rear right).
 	 */
@@ -290,16 +290,16 @@ struct cras_apm *cras_apm_list_add_apm(struct cras_apm_list *list,
 
 	/* Use tuned settings only when the forward dev(capture) and reverse
 	 * dev(playback) both are in typical AEC use case. */
-	apm->use_tuned_settings = is_aec_use_case;
+	apm->is_aec_use_case = is_aec_use_case;
 	if (rmodule->odev) {
-		apm->use_tuned_settings &=
+		apm->is_aec_use_case &=
 			cras_iodev_is_aec_use_case(rmodule->odev->active_node);
 	}
 
 	/* Use the configs tuned specifically for internal device. Otherwise
 	 * just pass NULL so every other settings will be default. */
 	apm->apm_ptr =
-		apm->use_tuned_settings ?
+		apm->is_aec_use_case ?
 			webrtc_apm_create(apm->fmt.num_channels,
 					  apm->fmt.frame_rate, aec_ini,
 					  apm_ini) :
@@ -691,7 +691,9 @@ struct cras_audio_format *cras_apm_list_get_format(struct cras_apm *apm)
 
 bool cras_apm_list_get_use_tuned_settings(struct cras_apm *apm)
 {
-	return apm->use_tuned_settings;
+	/* If input and output devices in AEC use case, plus that a
+	 * tuned setting is provided. */
+	return apm->is_aec_use_case && (aec_ini || apm_ini);
 }
 
 void cras_apm_list_set_aec_dump(struct cras_apm_list *list, void *dev_ptr,

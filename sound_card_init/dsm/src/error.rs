@@ -1,14 +1,18 @@
 // Copyright 2020 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+use std::any::Any;
 use std::error;
 use std::fmt;
 use std::io;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 use std::sync::PoisonError;
 use std::time;
 
 use remain::sorted;
+
+use crate::CalibData;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,28 +21,41 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     AlsaCardError(cros_alsa::CardError),
     AlsaControlError(cros_alsa::ControlError),
-    CalibrationFailed,
+    AlsaControlTLVError(cros_alsa::ControlTLVError),
     CalibrationTimeout,
     CrasClientFailed(libcras::Error),
     DeserializationFailed(String, serde_yaml::Error),
-    FileIOFailed(String, io::Error),
-    HotSpeaker,
+    DSMParamUpdateFailed(cros_alsa::ControlTLVError),
+    FileIOFailed(PathBuf, io::Error),
     InternalSpeakerNotFound,
     InvalidDatastore,
+    InvalidDSMParam,
     InvalidShutDownTime,
-    InvalidTemperature(i32),
-    LargeCalibrationDiff(i32, i32),
+    InvalidTemperature(f32),
+    LargeCalibrationDiff(CalibData),
     MissingDSMParam,
     MutexPoisonError,
     NewPlayStreamFailed(libcras::BoxError),
     NextPlaybackBufferFailed(libcras::BoxError),
     PlaybackFailed(io::Error),
-    ReadTimestampFailed(utils::error::Error),
-    SerializationFailed(serde_yaml::Error),
+    SerdeError(PathBuf, serde_yaml::Error),
     StartPlaybackTimeout,
     SystemTimeError(time::SystemTimeError),
+    UnsupportedSoundCard(String),
     VPDParseFailed(String, ParseIntError),
-    WorkerPanics,
+    WorkerPanics(Box<dyn Any + Send + 'static>),
+    ZeroPlayerIsNotRunning,
+    ZeroPlayerIsRunning,
+}
+
+impl PartialEq for Error {
+    // Implement eq for more Error when needed.
+    fn eq(&self, other: &Error) -> bool {
+        match (self, other) {
+            (Error::InvalidDSMParam, Error::InvalidDSMParam) => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<cros_alsa::CardError> for Error {
@@ -50,6 +67,12 @@ impl From<cros_alsa::CardError> for Error {
 impl From<cros_alsa::ControlError> for Error {
     fn from(err: cros_alsa::ControlError) -> Error {
         Error::AlsaControlError(err)
+    }
+}
+
+impl From<cros_alsa::ControlTLVError> for Error {
+    fn from(err: cros_alsa::ControlTLVError) -> Error {
+        Error::AlsaControlTLVError(err)
     }
 }
 
@@ -65,13 +88,16 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Error::*;
         match self {
-            AlsaCardError(e) => write!(f, "{}", e),
-            AlsaControlError(e) => write!(f, "{}", e),
-            CalibrationFailed => write!(f, "amp calibration failed"),
+            AlsaCardError(e) => write!(f, "AlsaCardError: {}", e),
+            AlsaControlError(e) => write!(f, "AlsaControlError: {}", e),
+            AlsaControlTLVError(e) => write!(f, "AlsaControlTLVError: {}", e),
             CalibrationTimeout => write!(f, "calibration is not finished in time"),
+            DSMParamUpdateFailed(e) => write!(f, "failed to update DsmParam, err: {}", e),
             CrasClientFailed(e) => write!(f, "failed to create cras client: {}", e),
-            DeserializationFailed(file, e) => write!(f, "failed to parse {}: {}", file, e),
-            FileIOFailed(file, e) => write!(f, "{}: {}", file, e),
+            DeserializationFailed(file_path, e) => {
+                write!(f, "failed to parse {}: {}", file_path, e)
+            }
+            FileIOFailed(file_path, e) => write!(f, "{:#?}: {}", file_path, e),
             InvalidShutDownTime => write!(f, "invalid shutdown time"),
             InternalSpeakerNotFound => write!(f, "internal speaker is not found in cras"),
             InvalidTemperature(temp) => write!(
@@ -80,23 +106,23 @@ impl fmt::Display for Error {
                 temp
             ),
             InvalidDatastore => write!(f, "invalid datastore format"),
-            HotSpeaker => write!(f, "skip boot time calibration as the speakers may be hot"),
-            LargeCalibrationDiff(rdc, temp) => write!(
-                f,
-                "calibration difference is too large, rdc: {}, temp: {}",
-                rdc, temp
-            ),
+            InvalidDSMParam => write!(f, "invalid dsm param from kcontrol"),
+            LargeCalibrationDiff(calib) => {
+                write!(f, "calibration difference is too large, calib: {:?}", calib)
+            }
             MissingDSMParam => write!(f, "missing dsm_param.bin"),
             MutexPoisonError => write!(f, "mutex is poisoned"),
             NewPlayStreamFailed(e) => write!(f, "{}", e),
             NextPlaybackBufferFailed(e) => write!(f, "{}", e),
             PlaybackFailed(e) => write!(f, "{}", e),
-            ReadTimestampFailed(e) => write!(f, "{}", e),
-            SerializationFailed(e) => write!(f, "failed to serialize yaml: {}", e),
+            SerdeError(file_path, e) => write!(f, "{:?}: {}", file_path, e),
             StartPlaybackTimeout => write!(f, "playback is not started in time"),
             SystemTimeError(e) => write!(f, "{}", e),
-            VPDParseFailed(file, e) => write!(f, "failed to parse vpd {}: {}", file, e),
-            WorkerPanics => write!(f, "run_play_zero_worker panics"),
+            UnsupportedSoundCard(name) => write!(f, "unsupported sound card: {}", name),
+            VPDParseFailed(file_path, e) => write!(f, "failed to parse vpd {}: {}", file_path, e),
+            WorkerPanics(e) => write!(f, "run_play_zero_worker panics: {:#?}", e),
+            ZeroPlayerIsNotRunning => write!(f, "zero player is not running"),
+            ZeroPlayerIsRunning => write!(f, "zero player is running"),
         }
     }
 }
