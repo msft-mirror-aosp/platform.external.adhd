@@ -169,6 +169,7 @@ enum CRAS_CLIENT_TYPE {
 	CRAS_CLIENT_TYPE_SERVER_STREAM, /* Server stream */
 	CRAS_CLIENT_TYPE_LACROS, /* LaCrOS */
 	CRAS_CLIENT_TYPE_PLUGIN, /* PluginVM */
+	CRAS_CLIENT_TYPE_ARCVM, /* ARCVM */
 	CRAS_NUM_CLIENT_TYPE, /* numbers of CRAS_CLIENT_TYPE */
 };
 
@@ -213,6 +214,7 @@ cras_client_type_str(enum CRAS_CLIENT_TYPE client_type)
 	ENUM_STR(CRAS_CLIENT_TYPE_SERVER_STREAM)
 	ENUM_STR(CRAS_CLIENT_TYPE_LACROS)
 	ENUM_STR(CRAS_CLIENT_TYPE_PLUGIN)
+	ENUM_STR(CRAS_CLIENT_TYPE_ARCVM)
 	default:
 		return "INVALID_CLIENT_TYPE";
 	}
@@ -368,7 +370,8 @@ enum CRAS_BT_LOG_EVENTS {
 	BT_A2DP_START,
 	BT_A2DP_SUSPENDED,
 	BT_CODEC_SELECTION,
-	BT_DEV_CONNECTED_CHANGE,
+	BT_DEV_CONNECTED,
+	BT_DEV_DISCONNECTED,
 	BT_DEV_CONN_WATCH_CB,
 	BT_DEV_SUSPEND_CB,
 	BT_HFP_NEW_CONNECTION,
@@ -573,6 +576,12 @@ struct __attribute__((__packed__)) cras_audio_thread_snapshot_buffer {
  *    main_thread_debug_info - ring buffer for storing main thread event logs.
  *    num_input_streams_with_permission - An array containing numbers of input
  *        streams with permission in each client type.
+ *    noise_cancellation_enabled - Whether or not Noise Cancellation is enabled.
+ *    hotword_pause_at_suspend - 1 = Pause hotword detection when the system
+ *        suspends. Hotword detection is resumed after system resumes.
+ *        0 - Hotword detection is allowed to continue running after system
+ *        suspends, so a detected hotword can wake up the device.
+ *
  */
 #define CRAS_SERVER_STATE_VERSION 2
 struct __attribute__((packed, aligned(4))) cras_server_state {
@@ -612,6 +621,8 @@ struct __attribute__((packed, aligned(4))) cras_server_state {
 	int32_t deprioritize_bt_wbs_mic;
 	struct main_thread_debug_info main_thread_debug_info;
 	uint32_t num_input_streams_with_permission[CRAS_NUM_CLIENT_TYPE];
+	int32_t noise_cancellation_enabled;
+	int32_t hotword_pause_at_suspend;
 };
 
 /* Actions for card add/remove/change. */
