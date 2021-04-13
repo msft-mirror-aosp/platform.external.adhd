@@ -62,6 +62,7 @@ struct cras_bt_device;
 #define CRAS_HFP_BATTERY_INDICATOR_NONE 0x0
 #define CRAS_HFP_BATTERY_INDICATOR_HFP 0x1
 #define CRAS_HFP_BATTERY_INDICATOR_APPLE 0x2
+#define CRAS_HFP_BATTERY_INDICATOR_PLANTRONICS 0x4
 
 /* Callback to call when service level connection initialized. */
 typedef int (*hfp_slc_init_cb)(struct hfp_slc_handle *handle);
@@ -144,10 +145,6 @@ int hfp_slc_get_ag_codec_negotiation_supported(struct hfp_slc_handle *handle);
 /* Gets an enum representing which spec the HF supports battery indicator.
  * Apple, HFP, none, or both. */
 int hfp_slc_get_hf_supports_battery_indicator(struct hfp_slc_handle *handle);
-
-/* Gets the battery level for the HF. The data ranges 0 ~ 100. Use -1 for no
- * battery level reported.*/
-int hfp_slc_get_hf_battery_level(struct hfp_slc_handle *handle);
 
 /* Init the codec negotiation process if needed. */
 int hfp_slc_codec_connection_setup(struct hfp_slc_handle *handle);

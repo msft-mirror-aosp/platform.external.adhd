@@ -39,7 +39,9 @@ static size_t cras_observer_notify_capture_mute_called;
 static size_t cras_observer_notify_suspend_changed_called;
 static size_t cras_observer_notify_num_active_streams_called;
 static size_t cras_observer_notify_input_streams_with_permission_called;
+static size_t cras_iodev_list_reset_for_noise_cancellation_called;
 static struct cras_board_config fake_board_config;
+static size_t cras_alert_process_all_pending_alerts_called;
 
 static void ResetStubData() {
   cras_alsa_card_create_called = 0;
@@ -60,6 +62,8 @@ static void ResetStubData() {
   cras_observer_notify_suspend_changed_called = 0;
   cras_observer_notify_num_active_streams_called = 0;
   cras_observer_notify_input_streams_with_permission_called = 0;
+  cras_alert_process_all_pending_alerts_called = 0;
+  cras_iodev_list_reset_for_noise_cancellation_called = 0;
   memset(&fake_board_config, 0, sizeof(fake_board_config));
 }
 
@@ -275,6 +279,7 @@ TEST(SystemStateSuite, Suspend) {
 
   cras_system_set_suspended(1);
   EXPECT_EQ(1, cras_observer_notify_suspend_changed_called);
+  EXPECT_EQ(1, cras_alert_process_all_pending_alerts_called);
   EXPECT_EQ(1, cras_system_get_suspended());
 
   cras_system_set_suspended(0);
@@ -431,6 +436,33 @@ TEST(SystemStateSuite, IgnoreUCMSuffix) {
   cras_system_state_deinit();
 }
 
+TEST(SystemStateSuite, SetNoiseCancellationEnabled) {
+  ResetStubData();
+  do_sys_init();
+
+  EXPECT_EQ(0, cras_system_get_noise_cancellation_enabled());
+
+  cras_system_set_noise_cancellation_enabled(0);
+  EXPECT_EQ(0, cras_system_get_noise_cancellation_enabled());
+  EXPECT_EQ(0, cras_iodev_list_reset_for_noise_cancellation_called);
+
+  cras_system_set_noise_cancellation_enabled(1);
+  EXPECT_EQ(1, cras_system_get_noise_cancellation_enabled());
+  EXPECT_EQ(1, cras_iodev_list_reset_for_noise_cancellation_called);
+
+  cras_system_set_noise_cancellation_enabled(1);
+  EXPECT_EQ(1, cras_system_get_noise_cancellation_enabled());
+  // cras_iodev_list_reset_for_noise_cancellation shouldn't be called if state
+  // is already enabled/disabled.
+  EXPECT_EQ(1, cras_iodev_list_reset_for_noise_cancellation_called);
+
+  cras_system_set_noise_cancellation_enabled(0);
+  EXPECT_EQ(0, cras_system_get_noise_cancellation_enabled());
+  EXPECT_EQ(2, cras_iodev_list_reset_for_noise_cancellation_called);
+
+  cras_system_state_deinit();
+}
+
 extern "C" {
 
 struct cras_alsa_card* cras_alsa_card_create(
@@ -525,6 +557,14 @@ void cras_observer_notify_input_streams_with_permission(
 void cras_board_config_get(const char* config_path,
                            struct cras_board_config* board_config) {
   *board_config = fake_board_config;
+}
+
+void cras_alert_process_all_pending_alerts() {
+  cras_alert_process_all_pending_alerts_called++;
+}
+
+void cras_iodev_list_reset_for_noise_cancellation() {
+  cras_iodev_list_reset_for_noise_cancellation_called++;
 }
 
 }  // extern "C"

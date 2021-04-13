@@ -25,7 +25,9 @@ const char kBusyloop[] = "Cras.Busyloop";
 const char kBusyloopLength[] = "Cras.BusyloopLength";
 const char kDeviceTypeInput[] = "Cras.DeviceTypeInput";
 const char kDeviceTypeOutput[] = "Cras.DeviceTypeOutput";
+const char kDeviceGain[] = "Cras.DeviceGain";
 const char kDeviceVolume[] = "Cras.DeviceVolume";
+const char kFetchDelayMilliSeconds[] = "Cras.FetchDelayMilliSeconds";
 const char kHighestDeviceDelayInput[] = "Cras.HighestDeviceDelayInput";
 const char kHighestDeviceDelayOutput[] = "Cras.HighestDeviceDelayOutput";
 const char kHighestInputHardwareLevel[] = "Cras.HighestInputHardwareLevel";
@@ -47,12 +49,12 @@ const char kMissedCallbackSecondTimeInput[] =
 const char kMissedCallbackSecondTimeOutput[] =
 	"Cras.MissedCallbackSecondTimeOutput";
 const char kNoCodecsFoundMetric[] = "Cras.NoCodecsFoundAtBoot";
-const char kStreamTimeoutMilliSeconds[] = "Cras.StreamTimeoutMilliSeconds";
 const char kStreamCallbackThreshold[] = "Cras.StreamCallbackThreshold";
 const char kStreamClientTypeInput[] = "Cras.StreamClientTypeInput";
 const char kStreamClientTypeOutput[] = "Cras.StreamClientTypeOutput";
 const char kStreamFlags[] = "Cras.StreamFlags";
 const char kStreamEffects[] = "Cras.StreamEffects";
+const char kStreamRuntime[] = "Cras.StreamRuntime";
 const char kStreamSamplingFormat[] = "Cras.StreamSamplingFormat";
 const char kStreamSamplingRate[] = "Cras.StreamSamplingRate";
 const char kUnderrunsPerDevice[] = "Cras.UnderrunsPerDevice";
@@ -93,6 +95,7 @@ enum CRAS_SERVER_METRICS_TYPE {
 	BT_WIDEBAND_SELECTED_CODEC,
 	BUSYLOOP,
 	BUSYLOOP_LENGTH,
+	DEVICE_GAIN,
 	DEVICE_RUNTIME,
 	DEVICE_VOLUME,
 	HIGHEST_DEVICE_DELAY_INPUT,
@@ -163,7 +166,8 @@ struct cras_server_metrics_device_data {
 };
 
 struct cras_server_metrics_stream_data {
-	enum CRAS_CLIENT_TYPE type;
+	enum CRAS_CLIENT_TYPE client_type;
+	enum CRAS_STREAM_TYPE stream_type;
 	enum CRAS_STREAM_DIRECTION direction;
 	struct timespec runtime;
 };
@@ -304,6 +308,31 @@ metrics_client_type_str(enum CRAS_CLIENT_TYPE client_type)
 		return "ServerStream";
 	case CRAS_CLIENT_TYPE_LACROS:
 		return "LaCrOS";
+	case CRAS_CLIENT_TYPE_PLUGIN:
+		return "PluginVM";
+	case CRAS_CLIENT_TYPE_ARCVM:
+		return "ARCVM";
+	default:
+		return "InvalidType";
+	}
+}
+
+static inline const char *
+metrics_stream_type_str(enum CRAS_STREAM_TYPE stream_type)
+{
+	switch (stream_type) {
+	case CRAS_STREAM_TYPE_DEFAULT:
+		return "Default";
+	case CRAS_STREAM_TYPE_MULTIMEDIA:
+		return "Multimedia";
+	case CRAS_STREAM_TYPE_VOICE_COMMUNICATION:
+		return "VoiceCommunication";
+	case CRAS_STREAM_TYPE_SPEECH_RECOGNITION:
+		return "SpeechRecognition";
+	case CRAS_STREAM_TYPE_PRO_AUDIO:
+		return "ProAudio";
+	case CRAS_STREAM_TYPE_ACCESSIBILITY:
+		return "Accessibility";
 	default:
 		return "InvalidType";
 	}
@@ -392,6 +421,69 @@ get_metrics_device_type(struct cras_iodev *iodev)
 	default:
 		return CRAS_METRICS_DEVICE_UNKNOWN;
 	}
+}
+
+/*
+ * Logs metrics for each group it belongs to. The UMA does not merge subgroups
+ * automatically so we need to log them separately.
+ *
+ * For example, if we call this function with argument (3, 48000,
+ * Cras.StreamSamplingRate, Input, Chrome), it will send 48000 to below
+ * metrics:
+ * Cras.StreamSamplingRate.Input.Chrome
+ * Cras.StreamSamplingRate.Input
+ * Cras.StreamSamplingRate
+ */
+static void log_sparse_histogram_each_level(int num, int sample, ...)
+{
+	char metrics_name[METRICS_NAME_BUFFER_SIZE] = {};
+	va_list valist;
+	int i, len = 0;
+
+	va_start(valist, sample);
+
+	for (i = 0; i < num && len < METRICS_NAME_BUFFER_SIZE; i++) {
+		int metric_len =
+			snprintf(metrics_name + len,
+				 METRICS_NAME_BUFFER_SIZE - len, "%s%s",
+				 i ? "." : "", va_arg(valist, char *));
+		// Exit early on error or running out of bufferspace. Avoids
+		// logging partial or corrupted strings.
+		if (metric_len < 0 ||
+		    metric_len > METRICS_NAME_BUFFER_SIZE - len)
+			break;
+		len += metric_len;
+		cras_metrics_log_sparse_histogram(metrics_name, sample);
+	}
+
+	va_end(valist);
+}
+
+static void log_histogram_each_level(int num, int sample, int min, int max,
+				     int nbuckets, ...)
+{
+	char metrics_name[METRICS_NAME_BUFFER_SIZE] = {};
+	va_list valist;
+	int i, len = 0;
+
+	va_start(valist, nbuckets);
+
+	for (i = 0; i < num && len < METRICS_NAME_BUFFER_SIZE; i++) {
+		int metric_len =
+			snprintf(metrics_name + len,
+				 METRICS_NAME_BUFFER_SIZE - len, "%s%s",
+				 i ? "." : "", va_arg(valist, char *));
+		// Exit early on error or running out of bufferspace. Avoids
+		// logging partial or corrupted strings.
+		if (metric_len < 0 ||
+		    metric_len > METRICS_NAME_BUFFER_SIZE - len)
+			break;
+		len += metric_len;
+		cras_metrics_log_histogram(metrics_name, sample, min, max,
+					   nbuckets);
+	}
+
+	va_end(valist);
 }
 
 int cras_server_metrics_hfp_sco_connection_error(
@@ -536,6 +628,31 @@ int cras_server_metrics_device_runtime(struct cras_iodev *iodev)
 	return 0;
 }
 
+int cras_server_metrics_device_gain(struct cras_iodev *iodev)
+{
+	struct cras_server_metrics_message msg;
+	union cras_server_metrics_data data;
+	int err;
+
+	if (iodev->direction == CRAS_STREAM_OUTPUT)
+		return 0;
+
+	data.device_data.type = get_metrics_device_type(iodev);
+	data.device_data.value =
+		(unsigned)100 * iodev->active_node->ui_gain_scaler;
+
+	init_server_metrics_msg(&msg, DEVICE_GAIN, data);
+
+	err = cras_server_metrics_message_send(
+		(struct cras_main_message *)&msg);
+	if (err < 0) {
+		syslog(LOG_ERR, "Failed to send metrics message: DEVICE_GAIN");
+		return err;
+	}
+
+	return 0;
+}
+
 int cras_server_metrics_device_volume(struct cras_iodev *iodev)
 {
 	struct cras_server_metrics_message msg;
@@ -640,13 +757,31 @@ int cras_server_metrics_highest_hw_level(unsigned hw_level,
 	return 0;
 }
 
-int cras_server_metrics_longest_fetch_delay(unsigned delay_msec)
+/* Logs longest fetch delay of a stream. */
+int cras_server_metrics_longest_fetch_delay(const struct cras_rstream *stream)
 {
 	struct cras_server_metrics_message msg;
 	union cras_server_metrics_data data;
 	int err;
 
-	data.value = delay_msec;
+	data.stream_data.client_type = stream->client_type;
+	data.stream_data.stream_type = stream->stream_type;
+	data.stream_data.direction = stream->direction;
+
+	/*
+	 * There is no delay when the sleep_interval_ts larger than the
+	 * longest_fetch_interval.
+	 */
+	if (!timespec_after(&stream->longest_fetch_interval,
+			    &stream->sleep_interval_ts)) {
+		data.stream_data.runtime.tv_sec = 0;
+		data.stream_data.runtime.tv_nsec = 0;
+	} else {
+		subtract_timespecs(&stream->longest_fetch_interval,
+				   &stream->sleep_interval_ts,
+				   &data.stream_data.runtime);
+	}
+
 	init_server_metrics_msg(&msg, LONGEST_FETCH_DELAY, data);
 	err = cras_server_metrics_message_send(
 		(struct cras_main_message *)&msg);
@@ -869,7 +1004,8 @@ int cras_server_metrics_stream_runtime(const struct cras_rstream *stream)
 	struct timespec now;
 	int err;
 
-	data.stream_data.type = stream->client_type;
+	data.stream_data.client_type = stream->client_type;
+	data.stream_data.stream_type = stream->stream_type;
 	data.stream_data.direction = stream->direction;
 	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
 	subtract_timespecs(&now, &stream->start_ts, &data.stream_data.runtime);
@@ -899,7 +1035,9 @@ int cras_server_metrics_stream_destroy(const struct cras_rstream *stream)
 	if (rc < 0)
 		return rc;
 	rc = cras_server_metrics_stream_runtime(stream);
-	return rc;
+	if (rc < 0)
+		return rc;
+	return cras_server_metrics_longest_fetch_delay(stream);
 }
 
 int cras_server_metrics_busyloop(struct timespec *ts, unsigned count)
@@ -960,6 +1098,15 @@ static void metrics_device_runtime(struct cras_server_metrics_device_data data)
 		cras_metrics_log_sparse_histogram(kDeviceTypeOutput, data.type);
 }
 
+static void metrics_device_gain(struct cras_server_metrics_device_data data)
+{
+	char metrics_name[METRICS_NAME_BUFFER_SIZE];
+
+	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE, "%s.%s", kDeviceGain,
+		 metrics_device_type_str(data.type));
+	cras_metrics_log_histogram(metrics_name, data.value, 0, 2000, 20);
+}
+
 static void metrics_device_volume(struct cras_server_metrics_device_data data)
 {
 	char metrics_name[METRICS_NAME_BUFFER_SIZE];
@@ -969,21 +1116,24 @@ static void metrics_device_volume(struct cras_server_metrics_device_data data)
 	cras_metrics_log_histogram(metrics_name, data.value, 0, 100, 20);
 }
 
+static void
+metrics_longest_fetch_delay(struct cras_server_metrics_stream_data data)
+{
+	int fetch_delay_msec =
+		data.runtime.tv_sec * 1000 + data.runtime.tv_nsec / 1000000;
+	log_histogram_each_level(3, fetch_delay_msec, 0, 10000, 20,
+				 kFetchDelayMilliSeconds,
+				 metrics_client_type_str(data.client_type),
+				 metrics_stream_type_str(data.stream_type));
+}
+
 static void metrics_stream_runtime(struct cras_server_metrics_stream_data data)
 {
-	char metrics_name[METRICS_NAME_BUFFER_SIZE];
-
-	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE, "Cras.%sStreamRuntime",
-		 data.direction == CRAS_STREAM_INPUT ? "Input" : "Output");
-	cras_metrics_log_histogram(metrics_name, (unsigned)data.runtime.tv_sec,
-				   0, 10000, 20);
-
-	snprintf(metrics_name, METRICS_NAME_BUFFER_SIZE,
-		 "Cras.%sStreamRuntime.%s",
-		 data.direction == CRAS_STREAM_INPUT ? "Input" : "Output",
-		 metrics_client_type_str(data.type));
-	cras_metrics_log_histogram(metrics_name, (unsigned)data.runtime.tv_sec,
-				   0, 10000, 20);
+	log_histogram_each_level(
+		4, (int)data.runtime.tv_sec, 0, 10000, 20, kStreamRuntime,
+		data.direction == CRAS_STREAM_INPUT ? "Input" : "Output",
+		metrics_client_type_str(data.client_type),
+		metrics_stream_type_str(data.stream_type));
 }
 
 static void metrics_busyloop(struct cras_server_metrics_timespec_data data)
@@ -994,40 +1144,6 @@ static void metrics_busyloop(struct cras_server_metrics_timespec_data data)
 		 get_timespec_period_str(data.runtime));
 
 	cras_metrics_log_histogram(metrics_name, data.count, 0, 1000, 20);
-}
-
-/*
- * Logs metrics for each group it belongs to. The UMA does not merge subgroups
- * automatically so we need to log them separately.
- *
- * For example, if we call this function with argument (3, 48000,
- * Cras.StreamSamplingRate, Input, Chrome), it will send 48000 to below
- * metrics:
- * Cras.StreamSamplingRate.Input.Chrome
- * Cras.StreamSamplingRate.Input
- * Cras.StreamSamplingRate
- */
-static void log_sparse_histogram_each_level(int num, int sample, ...)
-{
-	char metrics_name[METRICS_NAME_BUFFER_SIZE] = {};
-	va_list valist;
-	int i, len = 0;
-
-	va_start(valist, sample);
-
-	for (i = 0; i < num && len < METRICS_NAME_BUFFER_SIZE; i++) {
-		int metric_len = snprintf(metrics_name + len,
-				METRICS_NAME_BUFFER_SIZE - len, "%s%s",
-				i ? "." : "", va_arg(valist, char *));
-		// Exit early on error or running out of bufferspace. Avoids
-		// logging partial or corrupted strings.
-		if (metric_len < 0 || metric_len > METRICS_NAME_BUFFER_SIZE - len)
-			break;
-		len += metric_len;
-		cras_metrics_log_sparse_histogram(metrics_name, sample);
-	}
-
-	va_end(valist);
 }
 
 static void
@@ -1105,6 +1221,9 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 			kHfpWidebandSpeechSelectedCodec,
 			metrics_msg->data.value);
 		break;
+	case DEVICE_GAIN:
+		metrics_device_gain(metrics_msg->data.device_data);
+		break;
 	case DEVICE_RUNTIME:
 		metrics_device_runtime(metrics_msg->data.device_data);
 		break;
@@ -1132,9 +1251,7 @@ static void handle_metrics_message(struct cras_main_message *msg, void *arg)
 					   20);
 		break;
 	case LONGEST_FETCH_DELAY:
-		cras_metrics_log_histogram(kStreamTimeoutMilliSeconds,
-					   metrics_msg->data.value, 1, 20000,
-					   10);
+		metrics_longest_fetch_delay(metrics_msg->data.stream_data);
 		break;
 	case MISSED_CB_FIRST_TIME_INPUT:
 		cras_metrics_log_histogram(kMissedCallbackFirstTimeInput,
