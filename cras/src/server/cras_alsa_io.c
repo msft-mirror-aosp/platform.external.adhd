@@ -391,6 +391,7 @@ static int open_dev(struct cras_iodev *iodev)
 	snd_pcm_t *handle;
 	int rc;
 	const char *pcm_name = NULL;
+	int enable_noise_cancellation;
 
 	if (aio->base.direction == CRAS_STREAM_OUTPUT) {
 		struct alsa_output_node *aout =
@@ -411,6 +412,19 @@ static int open_dev(struct cras_iodev *iodev)
 		return rc;
 
 	aio->handle = handle;
+
+	/* Enable or disable noise cancellation if it supports. */
+	if (aio->ucm && iodev->direction == CRAS_STREAM_INPUT &&
+	    ucm_node_noise_cancellation_exists(aio->ucm,
+					       iodev->active_node->name)) {
+		enable_noise_cancellation =
+			cras_system_get_noise_cancellation_enabled();
+		rc = ucm_enable_node_noise_cancellation(
+			aio->ucm, iodev->active_node->name,
+			enable_noise_cancellation);
+		if (rc < 0)
+			return rc;
+	}
 
 	return 0;
 }
@@ -2021,6 +2035,17 @@ static int get_valid_frames(struct cras_iodev *odev, struct timespec *tstamp)
 	return 0;
 }
 
+static int support_noise_cancellation(const struct cras_iodev *iodev)
+{
+	struct alsa_io *aio = (struct alsa_io *)iodev;
+
+	if (!aio->ucm || !iodev->active_node)
+		return 0;
+
+	return ucm_node_noise_cancellation_exists(aio->ucm,
+						  iodev->active_node->name);
+}
+
 /*
  * Exported Interface.
  */
@@ -2098,6 +2123,7 @@ alsa_iodev_create(size_t card_index, const char *card_name, size_t device_index,
 	iodev->get_num_severe_underruns = get_num_severe_underruns;
 	iodev->get_valid_frames = get_valid_frames;
 	iodev->set_swap_mode_for_node = cras_iodev_dsp_set_swap_mode_for_node;
+	iodev->support_noise_cancellation = support_noise_cancellation;
 
 	if (card_type == ALSA_CARD_TYPE_USB)
 		iodev->min_buffer_level = USB_EXTRA_BUFFER_FRAMES;
@@ -2418,12 +2444,10 @@ static int alsa_iodev_set_active_node(struct cras_iodev *iodev,
 				      unsigned dev_enabled)
 {
 	struct alsa_io *aio = (struct alsa_io *)iodev;
+	int rc = 0;
 
-	if (iodev->active_node == ionode) {
-		enable_active_ucm(aio, dev_enabled);
-		init_device_settings(aio);
-		return 0;
-	}
+	if (iodev->active_node == ionode)
+		goto skip;
 
 	/* Disable jack ucm before switching node. */
 	enable_active_ucm(aio, 0);
@@ -2433,7 +2457,16 @@ static int alsa_iodev_set_active_node(struct cras_iodev *iodev,
 	cras_iodev_set_active_node(iodev, ionode);
 	aio->base.dsp_name = get_active_dsp_name(aio);
 	cras_iodev_update_dsp(iodev);
+skip:
 	enable_active_ucm(aio, dev_enabled);
+	if (ionode->type == CRAS_NODE_TYPE_HOTWORD) {
+		if (dev_enabled) {
+			rc = ucm_enable_hotword_model(aio->ucm);
+			if (rc < 0)
+				return rc;
+		} else
+			ucm_disable_all_hotword_models(aio->ucm);
+	}
 	/* Setting the volume will also unmute if the system isn't muted. */
 	init_device_settings(aio);
 	return 0;

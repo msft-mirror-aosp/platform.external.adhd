@@ -55,6 +55,7 @@ CRAS_DBUS_SOURCES = \
 	server/cras_bt_player.c \
 	server/cras_bt_io.c \
 	server/cras_bt_profile.c \
+	server/cras_bt_battery_provider.c \
 	server/cras_dbus.c \
 	server/cras_dbus_util.c \
 	server/cras_dbus_control.c \
@@ -426,6 +427,7 @@ TESTS = \
 	byte_buffer_unittest \
 	card_config_unittest \
 	checksum_unittest \
+	cras_abi_unittest \
 	cras_client_unittest \
 	cras_tm_unittest \
 	device_monitor_unittest \
@@ -613,7 +615,7 @@ a2dp_info_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common
 a2dp_info_unittest_LDADD = -lgtest -lpthread
 
-a2dp_iodev_unittest_SOURCES = tests/a2dp_iodev_unittest.cc common/sfh.c
+a2dp_iodev_unittest_SOURCES = tests/a2dp_iodev_unittest.cc
 a2dp_iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common $(DBUS_CFLAGS)
 a2dp_iodev_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
@@ -686,7 +688,7 @@ audio_thread_monitor_unittest_LDADD = -lgtest -lpthread -lrt
 if HAVE_DBUS
 bt_device_unittest_SOURCES = tests/bt_device_unittest.cc \
 	server/cras_bt_device.c \
-	tests/metrics_stub.cc
+	tests/metrics_stub.cc common/sfh.c
 bt_device_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/server \
 	-I$(top_srcdir)/src/common $(DBUS_CFLAGS)
 bt_device_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
@@ -717,6 +719,13 @@ card_config_unittest_LDADD = -lgtest -liniparser -lpthread
 checksum_unittest_SOURCES = tests/checksum_unittest.cc common/cras_checksum.c
 checksum_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common
 checksum_unittest_LDADD = -lgtest -lpthread
+
+cras_abi_unittest_SOURCES = tests/cras_abi_unittest.cc \
+	common/cras_config.c common/cras_shm.c common/cras_util.c \
+	common/cras_file_wait.c common/cras_audio_format.c
+cras_abi_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
+	-I$(top_srcdir)/src/libcras
+cras_abi_unittest_LDADD = -lgtest -lpthread -lrt -lspeexdsp
 
 cras_client_unittest_SOURCES = tests/cras_client_unittest.cc \
 	common/cras_config.c common/cras_shm.c common/cras_util.c \
@@ -854,13 +863,13 @@ hfp_info_unittest_LDADD = -lgtest -lpthread
 
 if HAVE_DBUS
 hfp_iodev_unittest_SOURCES = tests/hfp_iodev_unittest.cc \
-	server/cras_hfp_iodev.c common/sfh.c
+	server/cras_hfp_iodev.c
 hfp_iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) -I$(top_srcdir)/src/common \
 	-I$(top_srcdir)/src/server $(DBUS_CFLAGS)
 hfp_iodev_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
 
 hfp_alsa_iodev_unittest_SOURCES = tests/hfp_alsa_iodev_unittest.cc \
-	server/cras_hfp_alsa_iodev.c common/sfh.c
+	server/cras_hfp_alsa_iodev.c
 hfp_alsa_iodev_unittest_CPPFLAGS = $(COMMON_CPPFLAGS) \
 	-I$(top_srcdir)/src/common -I$(top_srcdir)/src/server $(DBUS_CFLAGS)
 hfp_alsa_iodev_unittest_LDADD = -lgtest -lpthread $(DBUS_LIBS)
