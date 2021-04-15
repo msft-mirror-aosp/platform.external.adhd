@@ -49,6 +49,9 @@ int cras_server_metrics_hfp_packet_loss(float packet_loss_ratio);
 /* Logs runtime of a device. */
 int cras_server_metrics_device_runtime(struct cras_iodev *iodev);
 
+/* Logs the gain of a device. */
+int cras_server_metrics_device_gain(struct cras_iodev *iodev);
+
 /* Logs the volume of a device. */
 int cras_server_metrics_device_volume(struct cras_iodev *iodev);
 
@@ -60,9 +63,6 @@ int cras_server_metrics_highest_device_delay(
 /* Logs the highest hardware level of a device. */
 int cras_server_metrics_highest_hw_level(unsigned hw_level,
 					 enum CRAS_STREAM_DIRECTION direction);
-
-/* Logs the longest fetch delay of a stream in millisecond. */
-int cras_server_metrics_longest_fetch_delay(unsigned delay_msec);
 
 /* Logs the number of underruns of a device. */
 int cras_server_metrics_num_underruns(unsigned num_underruns);

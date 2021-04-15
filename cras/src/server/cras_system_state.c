@@ -14,9 +14,11 @@
 #include <syslog.h>
 
 #include "cras_alsa_card.h"
+#include "cras_alert.h"
 #include "cras_board_config.h"
 #include "cras_config.h"
 #include "cras_device_blocklist.h"
+#include "cras_iodev_list.h"
 #include "cras_observer.h"
 #include "cras_shm.h"
 #include "cras_system_state.h"
@@ -158,6 +160,9 @@ void cras_system_state_init(const char *device_config_dir, const char *shm_name,
 	exp_state->bt_wbs_enabled = board_config.bt_wbs_enabled;
 	exp_state->deprioritize_bt_wbs_mic =
 		board_config.deprioritize_bt_wbs_mic;
+	exp_state->noise_cancellation_enabled = 0;
+	exp_state->hotword_pause_at_suspend =
+		board_config.hotword_pause_at_suspend;
 
 	if ((rc = pthread_mutex_init(&state.update_lock, 0) != 0)) {
 		syslog(LOG_ERR, "Fatal: system state mutex init");
@@ -341,6 +346,7 @@ void cras_system_set_suspended(int suspended)
 {
 	state.exp_state->suspended = suspended;
 	cras_observer_notify_suspend_changed(suspended);
+	cras_alert_process_all_pending_alerts();
 }
 
 void cras_system_set_volume_limits(long min, long max)
@@ -399,6 +405,20 @@ bool cras_system_get_bt_fix_a2dp_packet_size_enabled()
 	return state.bt_fix_a2dp_packet_size;
 }
 
+void cras_system_set_noise_cancellation_enabled(bool enabled)
+{
+	/* When the flag is toggled, propagate to all iodevs immediately. */
+	if (cras_system_get_noise_cancellation_enabled() != enabled) {
+		state.exp_state->noise_cancellation_enabled = enabled;
+		cras_iodev_list_reset_for_noise_cancellation();
+	}
+}
+
+bool cras_system_get_noise_cancellation_enabled()
+{
+	return !!state.exp_state->noise_cancellation_enabled;
+}
+
 bool cras_system_check_ignore_ucm_suffix(const char *card_name)
 {
 	/* Check the general case: ALSA Loopback card "Loopback". */
@@ -412,6 +432,16 @@ bool cras_system_check_ignore_ucm_suffix(const char *card_name)
 			return true;
 	}
 	return false;
+}
+
+bool cras_system_get_hotword_pause_at_suspend()
+{
+	return !!state.exp_state->hotword_pause_at_suspend;
+}
+
+void cras_system_set_hotword_pause_at_suspend(bool pause)
+{
+	state.exp_state->hotword_pause_at_suspend = pause;
 }
 
 int cras_system_add_alsa_card(struct cras_alsa_card_info *alsa_card_info)
