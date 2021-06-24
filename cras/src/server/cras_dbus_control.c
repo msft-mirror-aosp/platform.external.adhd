@@ -125,6 +125,9 @@
 	"    <method name=\"SetWbsEnabled\">\n"                                 \
 	"      <arg name=\"enabled\" type=\"b\" direction=\"in\"/>\n"           \
 	"    </method>\n"                                                       \
+	"    <method name=\"SetNoiseCancellationEnabled\">\n"                   \
+	"      <arg name=\"enabled\" type=\"b\" direction=\"in\"/>\n"           \
+	"    </method>\n"                                                       \
 	"    <method name=\"SetPlayerPlaybackStatus\">\n"                       \
 	"      <arg name=\"status\" type=\"s\" direction=\"in\"/>\n"            \
 	"    </method>\n"                                                       \
@@ -136,8 +139,6 @@
 	"    </method>\n"                                                       \
 	"    <method name=\"SetPlayerMetadata\">\n"                             \
 	"      <arg name=\"metadata\" type=\"a{sv}\" direction=\"in\"/>\n"      \
-	"    </method>\n"                                                       \
-	"    <method name=\"ResendBluetoothBattery\">\n"                        \
 	"    </method>\n"                                                       \
 	"  </interface>\n"                                                      \
 	"  <interface name=\"" DBUS_INTERFACE_INTROSPECTABLE "\">\n"            \
@@ -960,6 +961,24 @@ static DBusHandlerResult handle_set_wbs_enabled(DBusConnection *conn,
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
+static DBusHandlerResult
+handle_set_noise_cancellation_enabled(DBusConnection *conn,
+				      DBusMessage *message, void *arg)
+{
+	int rc;
+	dbus_bool_t enabled;
+
+	rc = get_single_arg(message, DBUS_TYPE_BOOLEAN, &enabled);
+	if (rc)
+		return rc;
+
+	cras_system_set_noise_cancellation_enabled(enabled);
+
+	send_empty_reply(conn, message);
+
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
 static DBusHandlerResult handle_set_player_playback_status(DBusConnection *conn,
 							   DBusMessage *message,
 							   void *arg)
@@ -1054,17 +1073,6 @@ static DBusHandlerResult handle_set_player_metadata(DBusConnection *conn,
 		syslog(LOG_WARNING, "CRAS failed to update BT Metadata: %d",
 		       rc);
 	}
-
-	send_empty_reply(conn, message);
-
-	return DBUS_HANDLER_RESULT_HANDLED;
-}
-
-static DBusHandlerResult handle_resend_bluetooth_battery(DBusConnection *conn,
-							 DBusMessage *message,
-							 void *arg)
-{
-	cras_hfp_ag_resend_device_battery_level();
 
 	send_empty_reply(conn, message);
 
@@ -1199,6 +1207,10 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 					       "SetWbsEnabled")) {
 		return handle_set_wbs_enabled(conn, message, arg);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
+					       "SetNoiseCancellationEnabled")) {
+		return handle_set_noise_cancellation_enabled(conn, message,
+							     arg);
+	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
 					       "SetPlayerPlaybackStatus")) {
 		return handle_set_player_playback_status(conn, message, arg);
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
@@ -1210,9 +1222,6 @@ static DBusHandlerResult handle_control_message(DBusConnection *conn,
 	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
 					       "SetPlayerMetadata")) {
 		return handle_set_player_metadata(conn, message, arg);
-	} else if (dbus_message_is_method_call(message, CRAS_CONTROL_INTERFACE,
-					       "ResendBluetoothBattery")) {
-		return handle_resend_bluetooth_battery(conn, message, arg);
 	}
 
 	return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -1324,8 +1333,8 @@ static void signal_active_node_changed(void *context,
 	dbus_uint32_t serial = 0;
 
 	msg = create_dbus_message((dir == CRAS_STREAM_OUTPUT) ?
-					  "ActiveOutputNodeChanged" :
-					  "ActiveInputNodeChanged");
+						"ActiveOutputNodeChanged" :
+						"ActiveInputNodeChanged");
 	if (!msg)
 		return;
 	dbus_message_append_args(msg, DBUS_TYPE_UINT64, &node_id,
@@ -1463,25 +1472,6 @@ static void signal_non_empty_audio_state_changed(void *context, int non_empty)
 	dbus_message_unref(msg);
 }
 
-static void signal_bt_battery_changed(void *context, const char *address,
-				      uint32_t level)
-{
-	struct cras_dbus_control *control = (struct cras_dbus_control *)context;
-	dbus_uint32_t serial = 0;
-	DBusMessage *msg;
-
-	msg = create_dbus_message("BluetoothBatteryChanged");
-	if (!msg)
-		return;
-
-	dbus_message_append_args(msg, DBUS_TYPE_STRING, &address,
-				 DBUS_TYPE_INVALID);
-	dbus_message_append_args(msg, DBUS_TYPE_UINT32, &level,
-				 DBUS_TYPE_INVALID);
-	dbus_connection_send(control->conn, msg, &serial);
-	dbus_message_unref(msg);
-}
-
 /* Exported Interface */
 
 void cras_dbus_control_start(DBusConnection *conn)
@@ -1523,7 +1513,6 @@ void cras_dbus_control_start(DBusConnection *conn)
 	observer_ops.hotword_triggered = signal_hotword_triggered;
 	observer_ops.non_empty_audio_state_changed =
 		signal_non_empty_audio_state_changed;
-	observer_ops.bt_battery_changed = signal_bt_battery_changed;
 
 	dbus_control.observer = cras_observer_add(&observer_ops, &dbus_control);
 }

@@ -12,7 +12,6 @@
 #include "cras_iodev.h"
 #include "cras_system_state.h"
 #include "cras_util.h"
-#include "sfh.h"
 #include "utlist.h"
 #include "cras_bt_device.h"
 
@@ -108,6 +107,7 @@ static int hfp_alsa_configure_dev(struct cras_iodev *iodev)
 		return rc;
 	}
 
+	hfp_set_call_status(hfp_alsa_io->slc, 1);
 	iodev->buffer_size = aio->buffer_size;
 
 	return 0;
@@ -118,6 +118,7 @@ static int hfp_alsa_close_dev(struct cras_iodev *iodev)
 	struct hfp_alsa_io *hfp_alsa_io = (struct hfp_alsa_io *)iodev;
 	struct cras_iodev *aio = hfp_alsa_io->aio;
 
+	hfp_set_call_status(hfp_alsa_io->slc, 0);
 	cras_bt_device_put_sco(hfp_alsa_io->device);
 	cras_iodev_free_format(iodev);
 	return aio->close_dev(aio);
@@ -259,10 +260,7 @@ struct cras_iodev *hfp_alsa_iodev_create(struct cras_iodev *aio,
 		name = cras_bt_device_object_path(device);
 	snprintf(iodev->info.name, sizeof(iodev->info.name), "%s", name);
 	iodev->info.name[ARRAY_SIZE(iodev->info.name) - 1] = 0;
-	iodev->info.stable_id =
-		SuperFastHash(cras_bt_device_object_path(device),
-			      strlen(cras_bt_device_object_path(device)),
-			      strlen(cras_bt_device_object_path(device)));
+	iodev->info.stable_id = cras_bt_device_get_stable_id(device);
 
 	iodev->open_dev = hfp_alsa_open_dev;
 	iodev->update_supported_formats = hfp_alsa_update_supported_formats;
