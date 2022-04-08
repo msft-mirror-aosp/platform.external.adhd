@@ -37,7 +37,7 @@ float_buffer_create(unsigned int max_size, unsigned int num_channels)
 	b->fp = (float **)malloc(num_channels * sizeof(float *));
 	b->buf = (struct byte_buffer *)calloc(
 		1, sizeof(struct byte_buffer) +
-			   sizeof(float) * max_size * num_channels);
+			   max_size * num_channels * sizeof(float));
 	b->buf->max_size = max_size;
 	b->buf->used_size = max_size;
 	return b;

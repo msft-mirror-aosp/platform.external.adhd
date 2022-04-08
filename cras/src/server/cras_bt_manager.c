@@ -19,7 +19,6 @@
 #include "cras_bt_player.h"
 #include "cras_bt_profile.h"
 #include "cras_bt_transport.h"
-#include "cras_bt_battery_provider.h"
 #include "utlist.h"
 
 struct cras_bt_event_log *btlog;
@@ -42,6 +41,9 @@ static void cras_bt_interface_added(DBusConnection *conn,
 			if (adapter) {
 				cras_bt_adapter_update_properties(
 					adapter, properties_array_iter, NULL);
+				cras_bt_register_endpoints(conn, adapter);
+				cras_bt_register_player(conn, adapter);
+				cras_bt_register_profiles(conn);
 
 				syslog(LOG_INFO, "Bluetooth Adapter: %s added",
 				       cras_bt_adapter_address(adapter));
@@ -51,28 +53,6 @@ static void cras_bt_interface_added(DBusConnection *conn,
 				       object_path);
 			}
 		}
-
-	} else if (strcmp(interface_name, BLUEZ_INTERFACE_MEDIA) == 0) {
-		struct cras_bt_adapter *adapter;
-
-		adapter = cras_bt_adapter_get(object_path);
-		if (adapter) {
-			cras_bt_register_endpoints(conn, adapter);
-			cras_bt_register_player(conn, adapter);
-
-			syslog(LOG_INFO,
-			       "Bluetooth Endpoint and/or Player: %s added",
-			       cras_bt_adapter_address(adapter));
-		} else {
-			syslog(LOG_WARNING,
-			       "Failed to create Bluetooth Endpoint and/or Player: %s",
-			       object_path);
-		}
-
-	} else if (strcmp(interface_name, BLUEZ_PROFILE_MGMT_INTERFACE) == 0) {
-		cras_bt_register_profiles(conn);
-
-		syslog(LOG_INFO, "Bluetooth Profile Manager added");
 
 	} else if (strcmp(interface_name, BLUEZ_INTERFACE_DEVICE) == 0) {
 		struct cras_bt_device *device;
@@ -121,32 +101,6 @@ static void cras_bt_interface_added(DBusConnection *conn,
 				       object_path);
 			}
 		}
-	} else if (strcmp(interface_name,
-			  BLUEZ_INTERFACE_BATTERY_PROVIDER_MANAGER) == 0) {
-		struct cras_bt_adapter *adapter;
-		int ret;
-
-		syslog(LOG_INFO,
-		       "Bluetooth Battery Provider Manager available");
-
-		adapter = cras_bt_adapter_get(object_path);
-		if (adapter) {
-			syslog(LOG_INFO,
-			       "Registering Battery Provider for adapter %s",
-			       cras_bt_adapter_address(adapter));
-			ret = cras_bt_register_battery_provider(conn, adapter);
-			if (ret != 0) {
-				syslog(LOG_ERR,
-				       "Error registering Battery Provider "
-				       "for adapter %s: %s",
-				       cras_bt_adapter_address(adapter),
-				       strerror(-ret));
-			}
-		} else {
-			syslog(LOG_WARNING,
-			       "Adapter not available when trying to create "
-			       "Battery Provider");
-		}
 	}
 }
 
@@ -185,10 +139,6 @@ static void cras_bt_interface_removed(DBusConnection *conn,
 			       cras_bt_transport_object_path(transport));
 			cras_bt_transport_remove(transport);
 		}
-	} else if (strcmp(interface_name,
-			  BLUEZ_INTERFACE_BATTERY_PROVIDER_MANAGER) == 0) {
-		syslog(LOG_INFO, "Bluetooth Battery Provider Manager removed");
-		cras_bt_battery_provider_reset();
 	}
 }
 

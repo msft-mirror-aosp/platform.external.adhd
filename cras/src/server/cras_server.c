@@ -79,18 +79,16 @@ struct attached_client {
  * to watch file descriptors.  The client can then read or write the fd.
  * Members:
  *    fd - The file descriptor passed to select.
- *    callback - The funciton to call when fd is ready.
+ *    callack - The funciton to call when fd is ready.
  *    callback_data - Pointer passed to the callback.
  *    pollfd - Pointer to struct pollfd for this callback.
- *    events - The events to poll for.
  */
 struct client_callback {
 	int select_fd;
-	void (*callback)(void *data, int revents);
+	void (*callback)(void *);
 	void *callback_data;
 	struct pollfd *pollfd;
 	int deleted;
-	int events;
 	struct client_callback *prev, *next;
 };
 
@@ -279,8 +277,8 @@ error:
 /* Add a file descriptor to be passed to select in the main loop. This is
  * registered with system state so that it is called when any client asks to
  * have a callback triggered based on an fd being readable. */
-static int add_select_fd(int fd, void (*cb)(void *data, int events),
-			 void *callback_data, int events, void *server_data)
+static int add_select_fd(int fd, void (*cb)(void *data), void *callback_data,
+			 void *server_data)
 {
 	struct client_callback *new_cb;
 	struct client_callback *client_cb;
@@ -303,7 +301,6 @@ static int add_select_fd(int fd, void (*cb)(void *data, int events),
 	new_cb->callback = cb;
 	new_cb->callback_data = callback_data;
 	new_cb->deleted = 0;
-	new_cb->events = events;
 	new_cb->pollfd = NULL;
 
 	DL_APPEND(serv->client_callbacks, new_cb);
@@ -477,7 +474,7 @@ int cras_server_init()
  * Returns 0 on success and leaves the created fd and the address information
  * in server_socket.
  * When error occurs, the created fd will be closed and the file path will be
- * unlinked and returns negative error code.
+ * unlinked.
  */
 static int create_and_listen_server_socket(enum CRAS_CONNECTION_TYPE conn_type,
 					   struct server_socket *server_socket)
@@ -511,7 +508,7 @@ static int create_and_listen_server_socket(enum CRAS_CONNECTION_TYPE conn_type,
 		  sizeof(struct sockaddr_un));
 	if (rc < 0) {
 		syslog(LOG_ERR, "Bind to server socket failed.");
-		rc = -errno;
+		rc = errno;
 		goto error;
 	}
 
@@ -522,7 +519,7 @@ static int create_and_listen_server_socket(enum CRAS_CONNECTION_TYPE conn_type,
 
 	if (listen(socket_fd, 5) != 0) {
 		syslog(LOG_ERR, "Listen on server socket failed.");
-		rc = -errno;
+		rc = errno;
 		goto error;
 	}
 
@@ -644,7 +641,7 @@ int cras_server_run(unsigned int profile_disable_mask)
 			if (client_cb->deleted)
 				continue;
 			pollfds[num_pollfds].fd = client_cb->select_fd;
-			pollfds[num_pollfds].events = client_cb->events;
+			pollfds[num_pollfds].events = POLLIN;
 			client_cb->pollfd = &pollfds[num_pollfds];
 			num_pollfds++;
 		}
@@ -690,9 +687,8 @@ int cras_server_run(unsigned int profile_disable_mask)
 		/* Check any client-registered fd/callback pairs. */
 		DL_FOREACH (server_instance.client_callbacks, client_cb)
 			if (!client_cb->deleted && client_cb->pollfd &&
-			    (client_cb->pollfd->revents & client_cb->events))
-				client_cb->callback(client_cb->callback_data,
-						    client_cb->pollfd->revents);
+			    (client_cb->pollfd->revents & POLLIN))
+				client_cb->callback(client_cb->callback_data);
 
 		cleanup_select_fds(&server_instance);
 

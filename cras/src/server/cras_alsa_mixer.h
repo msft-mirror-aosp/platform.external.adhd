@@ -6,6 +6,9 @@
 #ifndef _CRAS_ALSA_MIXER_H
 #define _CRAS_ALSA_MIXER_H
 
+#include <alsa/asoundlib.h>
+#include <iniparser.h>
+
 #include "cras_types.h"
 
 /* cras_alsa_mixer represents the alsa mixer interface for an alsa card.  It
@@ -147,7 +150,7 @@ void cras_alsa_mixer_set_mute(struct cras_alsa_mixer *cras_mixer, int muted,
  * Args:
  *    cras_mixer - Mixer to set the volume in.
  *    muted - 1 if muted, 0 if not.
- *    mixer_input - The mixer input to mute if no card mute.
+ *    mixer_input - The mixer input to mute if no master mute.
  */
 void cras_alsa_mixer_set_capture_mute(struct cras_alsa_mixer *cras_mixer,
 				      int muted,

@@ -271,7 +271,7 @@ static void fill_usb_card_info(struct cras_alsa_card_info *card_info,
 
 	card_info->usb_desc_checksum = calculate_desc_checksum(parent_dev);
 
-	syslog(LOG_INFO,
+	syslog(LOG_ERR,
 	       "USB card: vendor:%04x, product:%04x, serial num:%s, "
 	       "checksum:%08x",
 	       card_info->usb_vendor_id, card_info->usb_product_id,
@@ -367,7 +367,7 @@ static void enumerate_devices(struct udev_callback_data *data)
 	udev_enumerate_unref(enumerate);
 }
 
-static void udev_sound_subsystem_callback(void *arg, int revents)
+static void udev_sound_subsystem_callback(void *arg)
 {
 	struct udev_callback_data *data = (struct udev_callback_data *)arg;
 	struct udev_device *dev;
@@ -408,9 +408,8 @@ void cras_udev_start_sound_subsystem_monitor()
 	udev_monitor_enable_receiving(udev_data.mon);
 	udev_data.fd = udev_monitor_get_fd(udev_data.mon);
 
-	r = cras_system_add_select_fd(udev_data.fd,
-				      udev_sound_subsystem_callback, &udev_data,
-				      POLLIN);
+	r = cras_system_add_select_fd(
+		udev_data.fd, udev_sound_subsystem_callback, &udev_data);
 	assert(r == 0);
 	compile_regex(&pcm_regex, pcm_regex_string);
 	compile_regex(&card_regex, card_regex_string);

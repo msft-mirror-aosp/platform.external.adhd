@@ -7,22 +7,12 @@
 #define CRAS_HFP_AG_PROFILE_H_
 
 #include <dbus/dbus.h>
-#include <stdbool.h>
 
 #include "cras_bt_device.h"
 #include "cras_hfp_slc.h"
 
-/*
- * For service record profile, 'SupportedFearues' attribute bit mapping
- * for HFP AG. Bits 0 to 4 are identical to the unsolicited result code
- * of +BRSF command.
- */
-#define FEATURES_AG_THREE_WAY_CALLING 0x0001
-#define FEATURES_AG_EC_ANDOR_NR 0x0002
-#define FEATURES_AG_VOICE_RECOGNITION 0x0004
-#define FEATURES_AG_INBAND_RINGTONE 0x0008
-#define FEATURES_AG_ATTACH_NUMBER_TO_VOICETAG 0x0010
-#define FEATURES_AG_WIDE_BAND_SPEECH 0x0020
+/* The bitmap of HFP AG feature supported by CRAS */
+#define CRAS_AG_SUPPORTED_FEATURES (AG_ENHANCED_CALL_STATUS)
 
 struct hfp_slc_handle;
 
@@ -52,8 +42,5 @@ struct hfp_slc_handle *cras_hfp_ag_get_active_handle();
 
 /* Gets the SLC handle for given cras_bt_device. */
 struct hfp_slc_handle *cras_hfp_ag_get_slc(struct cras_bt_device *device);
-
-/* Gets the logger for WBS packet status. */
-struct packet_status_logger *cras_hfp_ag_get_wbs_logger();
 
 #endif /* CRAS_HFP_AG_PROFILE_H_ */

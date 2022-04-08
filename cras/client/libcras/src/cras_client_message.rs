@@ -16,7 +16,7 @@ use crate::cras_shm::*;
 use crate::cras_stream;
 
 #[derive(Debug)]
-pub enum Error {
+enum ErrorType {
     IoError(io::Error),
     SysUtilError(sys_util::Error),
     CrasStreamError(cras_stream::Error),
@@ -29,21 +29,32 @@ pub enum Error {
     MessageFromSliceError,
 }
 
+#[derive(Debug)]
+pub struct Error {
+    error_type: ErrorType,
+}
+
+impl Error {
+    fn new(error_type: ErrorType) -> Error {
+        Error { error_type }
+    }
+}
+
 impl error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::IoError(ref err) => err.fmt(f),
-            Error::SysUtilError(ref err) => err.fmt(f),
-            Error::MessageTypeError => write!(f, "Message type error"),
-            Error::CrasStreamError(ref err) => err.fmt(f),
-            Error::ArrayTryFromSliceError(ref err) => err.fmt(f),
-            Error::MessageNumFdError => write!(f, "Message the number of fds is not matched"),
-            Error::MessageTruncated => write!(f, "Read truncated message"),
-            Error::MessageIdError => write!(f, "No such id"),
-            Error::MessageFromSliceError => write!(f, "Message from slice error"),
-            Error::InvalidSize => write!(f, "Invalid data size"),
+        match self.error_type {
+            ErrorType::IoError(ref err) => err.fmt(f),
+            ErrorType::SysUtilError(ref err) => err.fmt(f),
+            ErrorType::MessageTypeError => write!(f, "Message type error"),
+            ErrorType::CrasStreamError(ref err) => err.fmt(f),
+            ErrorType::ArrayTryFromSliceError(ref err) => err.fmt(f),
+            ErrorType::MessageNumFdError => write!(f, "Message the number of fds is not matched"),
+            ErrorType::MessageTruncated => write!(f, "Read truncated message"),
+            ErrorType::MessageIdError => write!(f, "No such id"),
+            ErrorType::MessageFromSliceError => write!(f, "Message from slice error"),
+            ErrorType::InvalidSize => write!(f, "Invalid data size"),
         }
     }
 }
@@ -52,25 +63,25 @@ type Result<T> = std::result::Result<T, Error>;
 
 impl From<io::Error> for Error {
     fn from(io_err: io::Error) -> Self {
-        Error::IoError(io_err)
+        Self::new(ErrorType::IoError(io_err))
     }
 }
 
 impl From<sys_util::Error> for Error {
     fn from(sys_util_err: sys_util::Error) -> Self {
-        Error::SysUtilError(sys_util_err)
+        Self::new(ErrorType::SysUtilError(sys_util_err))
     }
 }
 
 impl From<cras_stream::Error> for Error {
     fn from(err: cras_stream::Error) -> Self {
-        Error::CrasStreamError(err)
+        Self::new(ErrorType::CrasStreamError(err))
     }
 }
 
 impl From<TryFromSliceError> for Error {
     fn from(err: TryFromSliceError) -> Self {
-        Error::ArrayTryFromSliceError(err)
+        Self::new(ErrorType::ArrayTryFromSliceError(err))
     }
 }
 
@@ -80,7 +91,6 @@ pub enum ServerResult {
     Connected(u32, CrasServerStateShmFd),
     /// stream_id, header_fd, samples_fd
     StreamConnected(u32, CrasAudioShmHeaderFd, CrasShmFd),
-    DebugInfoReady,
 }
 
 impl ServerResult {
@@ -112,10 +122,7 @@ impl ServerResult {
                     unsafe { CrasShmFd::new(message.fds[1], cmsg.samples_shm_size as usize) },
                 ))
             }
-            CRAS_CLIENT_MESSAGE_ID::CRAS_CLIENT_AUDIO_DEBUG_INFO_READY => {
-                Ok(ServerResult::DebugInfoReady)
-            }
-            _ => Err(Error::MessageTypeError),
+            _ => Err(Error::new(ErrorType::MessageTypeError)),
         }
     }
 }
@@ -147,7 +154,7 @@ impl CrasClientMessage {
         let (len, fd_nums) = server_socket.recv_with_fds(&mut message.data, &mut message.fds)?;
 
         if len < mem::size_of::<cras_client_message>() {
-            Err(Error::MessageTruncated)
+            Err(Error::new(ErrorType::MessageTruncated))
         } else {
             message.len = len;
             message.check_fd_nums(fd_nums)?;
@@ -160,20 +167,16 @@ impl CrasClientMessage {
         match self.get_id()? {
             CRAS_CLIENT_CONNECTED => match fd_nums {
                 1 => Ok(()),
-                _ => Err(Error::MessageNumFdError),
+                _ => Err(Error::new(ErrorType::MessageNumFdError)),
             },
             CRAS_CLIENT_STREAM_CONNECTED => match fd_nums {
                 // CRAS should return two shared memory areas the first which has
                 // mem::size_of::<cras_audio_shm_header>() bytes, and the second which has
                 // `samples_shm_size` bytes.
                 2 => Ok(()),
-                _ => Err(Error::MessageNumFdError),
+                _ => Err(Error::new(ErrorType::MessageNumFdError)),
             },
-            CRAS_CLIENT_AUDIO_DEBUG_INFO_READY => match fd_nums {
-                0 => Ok(()),
-                _ => Err(Error::MessageNumFdError),
-            },
-            _ => Err(Error::MessageTypeError),
+            _ => Err(Error::new(ErrorType::MessageTypeError)),
         }
     }
 
@@ -183,18 +186,16 @@ impl CrasClientMessage {
         match u32::from_le_bytes(self.data[offset..offset + 4].try_into()?) {
             id if id == (CRAS_CLIENT_CONNECTED as u32) => Ok(CRAS_CLIENT_CONNECTED),
             id if id == (CRAS_CLIENT_STREAM_CONNECTED as u32) => Ok(CRAS_CLIENT_STREAM_CONNECTED),
-            id if id == (CRAS_CLIENT_AUDIO_DEBUG_INFO_READY as u32) => {
-                Ok(CRAS_CLIENT_AUDIO_DEBUG_INFO_READY)
-            }
-            _ => Err(Error::MessageIdError),
+            _ => Err(Error::new(ErrorType::MessageIdError)),
         }
     }
 
     // Gets a reference to the message content
     fn get_message<T: DataInit>(&self) -> Result<&T> {
         if self.len != mem::size_of::<T>() {
-            return Err(Error::InvalidSize);
+            return Err(Error::new(ErrorType::InvalidSize));
         }
-        T::from_slice(&self.data[..mem::size_of::<T>()]).ok_or(Error::MessageFromSliceError)
+        T::from_slice(&self.data[..mem::size_of::<T>()])
+            .ok_or_else(|| Error::new(ErrorType::MessageFromSliceError))
     }
 }

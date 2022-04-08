@@ -36,7 +36,6 @@ fn copy_headers(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
         "cras_shm.h",
         "cras_types.h",
         "cras_util.h",
-        "packet_status_logger.h",
     ];
 
     for header in &header_files {
@@ -111,10 +110,8 @@ fn gen() -> String {
         .whitelist_type("CRAS_.*")
         .whitelist_var("CRAS_.*")
         .whitelist_type("audio_message")
-        .whitelist_var("MAX_DEBUG_.*")
         .rustified_enum("CRAS_.*")
         .rustified_enum("_snd_pcm_.*")
-        .bitfield_enum("CRAS_STREAM_EFFECT")
         .generate()
         .expect(format!("Unable to generate {} code", name).as_str());
 
@@ -134,11 +131,7 @@ fn write_output(output_path: &Path, output: String) -> std::io::Result<()> {
  * cras_shm.h
  * cras_types.h
  * cras_util.h
- * packet_status_logger.h
  */
-
-#![allow(clippy::unreadable_literal)]
-#![allow(clippy::cognitive_complexity)]
 ";
 
     let mut output_file = File::create(output_path)?;

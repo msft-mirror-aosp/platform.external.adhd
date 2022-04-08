@@ -380,7 +380,7 @@ static void display_info_delay_cb(struct cras_timer *timer, void *arg)
  *   file has data to read.  Perform autoswitching to / from the
  *   associated device when data is available.
  */
-static void gpio_switch_callback(void *arg, int events)
+static void gpio_switch_callback(void *arg)
 {
 	struct cras_alsa_jack *jack = arg;
 	int i;
@@ -408,30 +408,38 @@ static void gpio_switch_callback(void *arg, int events)
 static unsigned int
 gpio_jack_match_device(const struct cras_alsa_jack *jack,
 		       struct cras_alsa_jack_list *jack_list,
+		       const char *card_name,
 		       enum CRAS_STREAM_DIRECTION direction)
 {
-	int target_dev_idx;
+	const char *target_device_name = NULL;
+	char current_device_name[CRAS_IODEV_NAME_BUFFER_SIZE];
+	unsigned int rc;
 
 	/* If the device name is not specified in UCM, assume it should be
 	 * associated with device 0. */
 	if (!jack_list->ucm || !jack->ucm_device)
 		return jack_list->is_first_device;
 
-	/* If jack has valid ucm_device, that means this jack has already been
-	 * associated to this card. Next step to match device index on this
-	 * card. */
-	target_dev_idx = ucm_get_alsa_dev_idx_for_dev(
+	/* Look for device name specified in a device section of UCM. */
+	target_device_name = ucm_get_device_name_for_dev(
 		jack_list->ucm, jack->ucm_device, direction);
 
-	if (target_dev_idx < 0)
+	if (!target_device_name)
 		return jack_list->is_first_device;
 
 	syslog(LOG_DEBUG,
-	       "Matching GPIO jack, target device idx: %d, "
+	       "Matching GPIO jack, target device name: %s, "
 	       "current card name: %s, device index: %zu\n",
-	       target_dev_idx, jack_list->card_name, jack_list->device_index);
+	       target_device_name, card_name, jack_list->device_index);
 
-	return (target_dev_idx == jack_list->device_index);
+	/* Device name of format "hw:<card_name>,<device_index>", should fit
+	 * in the string of size CRAS_IODEV_NAME_BUFFER_SIZE.*/
+	snprintf(current_device_name, sizeof(current_device_name), "hw:%s,%zu",
+		 card_name, jack_list->device_index);
+
+	rc = !strcmp(current_device_name, target_device_name);
+	free((void *)target_device_name);
+	return rc;
 }
 
 static int create_jack_for_gpio(struct cras_alsa_jack_list *jack_list,
@@ -503,8 +511,8 @@ static int cras_complete_gpio_jack(struct gpio_switch_list_data *data,
 		cras_free_jack(jack, 0);
 		return -EIO;
 	}
-	r = cras_system_add_select_fd(jack->gpio.fd, gpio_switch_callback, jack,
-				      POLLIN);
+	r = cras_system_add_select_fd(jack->gpio.fd, gpio_switch_callback,
+				      jack);
 	if (r < 0) {
 		/* Not yet registered with system select. */
 		cras_free_jack(jack, 0);
@@ -532,6 +540,7 @@ static int open_and_monitor_gpio(struct gpio_switch_list_data *data,
 {
 	struct cras_alsa_jack *jack;
 	struct cras_alsa_jack_list *jack_list = data->jack_list;
+	const char *card_name = jack_list->card_name;
 	enum CRAS_STREAM_DIRECTION direction = jack_list->direction;
 	int r;
 
@@ -544,7 +553,7 @@ static int open_and_monitor_gpio(struct gpio_switch_list_data *data,
 		jack->ucm_device = ucm_get_dev_for_jack(
 			jack_list->ucm, jack->gpio.device_name, direction);
 
-	if (!gpio_jack_match_device(jack, jack_list, direction)) {
+	if (!gpio_jack_match_device(jack, jack_list, card_name, direction)) {
 		cras_free_jack(jack, 0);
 		return -EIO;
 	}
@@ -719,31 +728,6 @@ static int gpio_switch_list_by_matching(const char *dev_path,
 	return data->rc;
 }
 
-/* Find ELD control for HDMI/DP gpio jack. */
-static snd_hctl_elem_t *find_eld_control_by_dev_index(snd_hctl_t *hctl,
-						      unsigned int dev_idx)
-{
-	static const char eld_control_name[] = "ELD";
-	snd_ctl_elem_id_t *elem_id;
-
-	snd_ctl_elem_id_alloca(&elem_id);
-	snd_ctl_elem_id_clear(elem_id);
-	snd_ctl_elem_id_set_interface(elem_id, SND_CTL_ELEM_IFACE_PCM);
-	snd_ctl_elem_id_set_device(elem_id, dev_idx);
-	snd_ctl_elem_id_set_name(elem_id, eld_control_name);
-	return snd_hctl_find_elem(hctl, elem_id);
-}
-
-/* For non-gpio jack, check if it's of type hdmi/dp by
- * matching jack name. */
-static int is_jack_hdmi_dp(const char *jack_name)
-{
-	// TODO(hychao): Use the information provided in UCM instead of
-	// name matching.
-	static const char *hdmi_dp = "HDMI";
-	return !!strstr(jack_name, hdmi_dp);
-}
-
 /* Find GPIO jacks for this jack_list.
  * Args:
  *    jack_list - Jack list to add to.
@@ -779,17 +763,8 @@ static int find_gpio_jacks(struct cras_alsa_jack_list *jack_list,
 		gpio_switch_list_for_each(gpio_switch_list_with_section, &data);
 	else
 		gpio_switch_list_for_each(gpio_switch_list_by_matching, &data);
-	if (result_jack) {
+	if (result_jack)
 		*result_jack = data.result_jack;
-
-		/* Find ELD control only for HDMI/DP gpio jack. */
-		if (*result_jack &&
-		    is_jack_hdmi_dp((*result_jack)->gpio.device_name))
-			(*result_jack)->eld_control =
-				find_eld_control_by_dev_index(
-					jack_list->hctl,
-					jack_list->device_index);
-	}
 	return data.rc;
 }
 
@@ -844,6 +819,14 @@ static unsigned int hctl_jack_device_index(const char *name)
 	return (unsigned int)device_index;
 }
 
+/* For non-gpio jack, check if it's of type hdmi/dp by
+ * matching jack name. */
+static int is_jack_hdmi_dp(const char *jack_name)
+{
+	static const char *hdmi_dp = "HDMI/DP";
+	return strncmp(jack_name, hdmi_dp, strlen(hdmi_dp)) == 0;
+}
+
 /* Checks if the given control name is in the supplied list of possible jack
  * control base names. */
 static int is_jack_control_in_list(const char *const *list,
@@ -884,6 +867,7 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 	static const char *const input_jack_base_names[] = {
 		"Mic Jack",
 	};
+	static const char eld_control_name[] = "ELD";
 	const char *const *jack_names;
 	unsigned int num_jack_names;
 
@@ -957,9 +941,17 @@ static int find_jack_controls(struct cras_alsa_jack_list *jack_list)
 		name = snd_hctl_elem_get_name(jack->elem);
 		if (!is_jack_hdmi_dp(name))
 			continue;
-
-		jack->eld_control = find_eld_control_by_dev_index(
-			jack_list->hctl, jack_list->device_index);
+		for (elem = snd_hctl_first_elem(jack_list->hctl); elem != NULL;
+		     elem = snd_hctl_elem_next(elem)) {
+			if (strcmp(snd_hctl_elem_get_name(elem),
+				   eld_control_name))
+				continue;
+			if (snd_hctl_elem_get_device(elem) !=
+			    jack_list->device_index)
+				continue;
+			jack->eld_control = elem;
+			break;
+		}
 	}
 
 	return 0;
@@ -985,6 +977,7 @@ static int find_hctl_jack_for_section(struct cras_alsa_jack_list *jack_list,
 				      struct ucm_section *section,
 				      struct cras_alsa_jack **result_jack)
 {
+	static const char eld_control_name[] = "ELD";
 	snd_hctl_elem_t *elem;
 	snd_ctl_elem_id_t *elem_id;
 	struct cras_alsa_jack *jack;
@@ -1035,8 +1028,10 @@ static int find_hctl_jack_for_section(struct cras_alsa_jack_list *jack_list,
 		return 0;
 
 	/* Look up ELD control. */
-	jack->eld_control = find_eld_control_by_dev_index(
-		jack_list->hctl, jack_list->device_index);
+	snd_ctl_elem_id_set_name(elem_id, eld_control_name);
+	elem = snd_hctl_find_elem(jack_list->hctl, elem_id);
+	if (elem)
+		jack->eld_control = elem;
 	return 0;
 }
 

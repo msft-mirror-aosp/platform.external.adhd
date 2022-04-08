@@ -102,8 +102,7 @@ static int put_buffer(struct cras_iodev *iodev, unsigned frames)
 	struct test_iodev *testio = (struct test_iodev *)iodev;
 
 	/* Input */
-	buf_increment_read(testio->audbuff,
-			   (size_t)frames * (size_t)testio->fmt_bytes);
+	buf_increment_read(testio->audbuff, frames * testio->fmt_bytes);
 
 	return 0;
 }
@@ -195,13 +194,7 @@ struct cras_iodev *test_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 	iodev->put_buffer = put_buffer;
 	iodev->update_active_node = update_active_node;
 
-	/*
-	 * Record max supported channels into cras_iodev_info.
-	 * The value is the max of test_supported_channel_counts.
-	 */
-	iodev->info.max_supported_channels = 1;
-
-	/* Create an empty ionode */
+	/* Create a dummy ionode */
 	node = (struct cras_ionode *)calloc(1, sizeof(*node));
 	node->dev = iodev;
 	node->plugged = 1;
@@ -211,7 +204,7 @@ struct cras_iodev *test_iodev_create(enum CRAS_STREAM_DIRECTION direction,
 		node->type = CRAS_NODE_TYPE_UNKNOWN;
 	node->volume = 100;
 	node->software_volume_needed = 0;
-	node->ui_gain_scaler = 1.0f;
+	node->max_software_gain = 0;
 	strcpy(node->name, "(default)");
 	cras_iodev_add_node(iodev, node);
 	cras_iodev_set_active_node(iodev, node);
@@ -242,9 +235,8 @@ unsigned int test_iodev_add_samples(struct test_iodev *testio, uint8_t *samples,
 
 	write_ptr = buf_write_pointer_size(testio->audbuff, &avail);
 	count = MIN(count, avail);
-	memcpy(write_ptr, samples, (size_t)count * (size_t)testio->fmt_bytes);
-	buf_increment_write(testio->audbuff,
-			    (size_t)count * (size_t)testio->fmt_bytes);
+	memcpy(write_ptr, samples, count * testio->fmt_bytes);
+	buf_increment_write(testio->audbuff, count * testio->fmt_bytes);
 	return count;
 }
 

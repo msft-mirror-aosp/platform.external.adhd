@@ -9,7 +9,6 @@
 #include <syslog.h>
 #include <endian.h>
 #include <limits.h>
-#include <math.h>
 
 #include "cras_fmt_conv.h"
 #include "cras_fmt_conv_ops.h"
@@ -59,35 +58,17 @@ static int is_channel_layout_equal(const struct cras_audio_format *a,
 	return 1;
 }
 
-/*
- * Calculates the normalize_factor abs_sum(ci) from given coefficients.
- * Since sum(ci / abs_sum(ci)) <= 1, this could prevent sample overflow while
- * upmixing or downmixing.
- */
-static float normalize_factor(float *buf, size_t n)
+static void normalize_buf(float *buf, size_t size)
 {
 	int i;
-	float abs_sum = 0.0;
-	for (i = 0; i < n; i++)
-		abs_sum += fabs(buf[i]);
-
-	return 1.0 / abs_sum;
+	float squre_sum = 0.0;
+	for (i = 0; i < size; i++)
+		squre_sum += buf[i] * buf[i];
+	for (i = 0; i < size; i++)
+		buf[i] /= squre_sum;
 }
 
-/*
- * Normalize all channels with the same factor to maintain
- * the energy ratio between original channels.
- */
-static void normalize(float **mtx, size_t m, size_t n, float factor)
-{
-	int i, j;
-	for (i = 0; i < m; i++)
-		for (j = 0; j < n; j++)
-			mtx[i][j] *= factor;
-}
-
-/*
- * Populates the down mix matrix by rules:
+/* Populates the down mix matrix by rules:
  * 1. Front/side left(right) channel will mix to left(right) of
  *    full scale.
  * 2. Center and LFE will be split equally to left and right.
@@ -121,46 +102,9 @@ static void surround51_to_stereo_downmix_mtx(float **mtx,
 		mtx[STEREO_L][layout[CRAS_CH_LFE]] = 0.707;
 		mtx[STEREO_R][layout[CRAS_CH_LFE]] = 0.707;
 	}
-	normalize(mtx, 2, 6, normalize_factor(mtx[STEREO_L], 6));
-}
 
-/* Populates the down mix matrix by rules:
- * 1. Front left(right) channel will mix to the front left(right) of
- *    full scale.
- * 2. Rear and side left(right) channel will mix to the rear left(right) of
- *    full scale.
- * 3. Center will be split equally to the front left and right.
- * 4. LFE will be split equally to the other channels.
- */
-static void surround51_to_quad_downmix_mtx(float **mtx,
-					   int8_t layout[CRAS_CH_MAX])
-{
-	if (layout[CRAS_CH_FL] != -1 && layout[CRAS_CH_FR] != -1) {
-		mtx[CRAS_CH_FL][layout[CRAS_CH_FL]] = 1.0;
-		mtx[CRAS_CH_FR][layout[CRAS_CH_FR]] = 1.0;
-	}
-	if (layout[CRAS_CH_RL] != -1 && layout[CRAS_CH_RR] != -1) {
-		mtx[CRAS_CH_RL][layout[CRAS_CH_RL]] = 1.0;
-		mtx[CRAS_CH_RR][layout[CRAS_CH_RR]] = 1.0;
-	}
-	if (layout[CRAS_CH_SL] != -1 && layout[CRAS_CH_SR] != -1) {
-		mtx[CRAS_CH_RL][layout[CRAS_CH_SL]] = 1.0;
-		mtx[CRAS_CH_RR][layout[CRAS_CH_SR]] = 1.0;
-	}
-	if (layout[CRAS_CH_FC] != -1) {
-		/* Split 1/2 power to the front L/R */
-		mtx[CRAS_CH_FL][layout[CRAS_CH_FC]] = 0.707;
-		mtx[CRAS_CH_FR][layout[CRAS_CH_FC]] = 0.707;
-	}
-	if (layout[CRAS_CH_LFE] != -1) {
-		/* Split 1/4 power to the other channel */
-		mtx[CRAS_CH_FL][layout[CRAS_CH_LFE]] = 0.5;
-		mtx[CRAS_CH_FR][layout[CRAS_CH_LFE]] = 0.5;
-		mtx[CRAS_CH_RL][layout[CRAS_CH_LFE]] = 0.5;
-		mtx[CRAS_CH_RR][layout[CRAS_CH_LFE]] = 0.5;
-	}
-
-	normalize(mtx, 4, 6, normalize_factor(mtx[CRAS_CH_FL], 6));
+	normalize_buf(mtx[STEREO_L], 6);
+	normalize_buf(mtx[STEREO_R], 6);
 }
 
 static int is_supported_format(const struct cras_audio_format *fmt)
@@ -216,29 +160,10 @@ static size_t stereo_to_51(struct cras_fmt_conv *conv, const uint8_t *in,
 	return s16_stereo_to_51(left, right, center, in, in_frames, out);
 }
 
-static size_t quad_to_51(struct cras_fmt_conv *conv, const uint8_t *in,
-			 size_t in_frames, uint8_t *out)
-{
-	size_t fl, fr, rl, rr;
-
-	fl = conv->out_fmt.channel_layout[CRAS_CH_FL];
-	fr = conv->out_fmt.channel_layout[CRAS_CH_FR];
-	rl = conv->out_fmt.channel_layout[CRAS_CH_RL];
-	rr = conv->out_fmt.channel_layout[CRAS_CH_RR];
-
-	return s16_quad_to_51(fl, fr, rl, rr, in, in_frames, out);
-}
-
 static size_t _51_to_stereo(struct cras_fmt_conv *conv, const uint8_t *in,
 			    size_t in_frames, uint8_t *out)
 {
 	return s16_51_to_stereo(in, in_frames, out);
-}
-
-static size_t _51_to_quad(struct cras_fmt_conv *conv, const uint8_t *in,
-			  size_t in_frames, uint8_t *out)
-{
-	return s16_51_to_quad(in, in_frames, out);
 }
 
 static size_t stereo_to_quad(struct cras_fmt_conv *conv, const uint8_t *in,
@@ -279,21 +204,6 @@ static size_t default_all_to_all(struct cras_fmt_conv *conv, const uint8_t *in,
 
 	return s16_default_all_to_all(&conv->out_fmt, num_in_ch, num_out_ch, in,
 				      in_frames, out);
-}
-
-// Fill min(in channels, out_channels), leave the rest 0s.
-static size_t default_some_to_some(struct cras_fmt_conv *conv,
-				   const uint8_t *in,
-				   size_t in_frames,
-				   uint8_t *out)
-{
-	size_t num_in_ch, num_out_ch;
-
-	num_in_ch = conv->in_fmt.num_channels;
-	num_out_ch = conv->out_fmt.num_channels;
-
-	return s16_some_to_some(&conv->out_fmt, num_in_ch, num_out_ch, in,
-				in_frames, out);
 }
 
 static size_t convert_channels(struct cras_fmt_conv *conv, const uint8_t *in,
@@ -411,10 +321,7 @@ struct cras_fmt_conv *cras_fmt_conv_create(const struct cras_audio_format *in,
 			conv->channel_converter = quad_to_stereo;
 		} else if (in->num_channels == 2 && out->num_channels == 6) {
 			conv->channel_converter = stereo_to_51;
-		} else if (in->num_channels == 4 && out->num_channels == 6) {
-			conv->channel_converter = quad_to_51;
-		} else if (in->num_channels == 6 &&
-			   (out->num_channels == 2 || out->num_channels == 4)) {
+		} else if (in->num_channels == 6 && out->num_channels == 2) {
 			int in_channel_layout_set = 0;
 
 			/* Checks if channel_layout is set in the incoming format */
@@ -435,44 +342,28 @@ struct cras_fmt_conv *cras_fmt_conv_create(const struct cras_audio_format *in,
 					return NULL;
 				}
 				conv->channel_converter = convert_channels;
-				if (out->num_channels == 4) {
-					surround51_to_quad_downmix_mtx(
-						conv->ch_conv_mtx,
-						conv->in_fmt.channel_layout);
-				} else {
-					surround51_to_stereo_downmix_mtx(
-						conv->ch_conv_mtx,
-						conv->in_fmt.channel_layout);
-				}
+				surround51_to_stereo_downmix_mtx(
+					conv->ch_conv_mtx,
+					conv->in_fmt.channel_layout);
 			} else {
-				if (out->num_channels == 4)
-					conv->channel_converter = _51_to_quad;
-				else
-					conv->channel_converter = _51_to_stereo;
+				conv->channel_converter = _51_to_stereo;
 			}
-		} else if (in->num_channels <= 8 && out->num_channels <= 8) {
-			// For average channel counts mix from all to all.
-			syslog(LOG_WARNING,
-			       "Using all_to_all map for %zu to %zu",
-			       in->num_channels, out->num_channels);
-			conv->channel_converter = default_all_to_all;
 		} else {
 			syslog(LOG_WARNING,
-			       "Using some_to_some channel map for %zu to %zu",
+			       "Using default channel map for %zu to %zu",
 			       in->num_channels, out->num_channels);
-			conv->channel_converter = default_some_to_some;
+			conv->channel_converter = default_all_to_all;
 		}
 	} else if (in->num_channels > 2 && !is_channel_layout_equal(in, out)) {
 		conv->num_converters++;
 		conv->ch_conv_mtx = cras_channel_conv_matrix_create(in, out);
 		if (conv->ch_conv_mtx == NULL) {
 			syslog(LOG_ERR,
-			       "Failed to create channel conversion matrix."
-			       "Fallback to default_all_to_all.");
-			conv->channel_converter = default_all_to_all;
-		} else {
-			conv->channel_converter = convert_channels;
+			       "Failed to create channel conversion matrix");
+			cras_fmt_conv_destroy(&conv);
+			return NULL;
 		}
+		conv->channel_converter = convert_channels;
 	}
 	/* Set up sample rate conversion. */
 	if (in->frame_rate != out->frame_rate) {

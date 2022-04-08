@@ -36,7 +36,7 @@ struct cras_dsp_context {
 
 static struct dumper *syslog_dumper;
 static const char *ini_filename;
-static struct ini *global_ini;
+static struct ini *ini;
 static struct cras_dsp_context *context_list;
 
 static void initialize_environment(struct cras_expr_env *env)
@@ -60,7 +60,7 @@ static void destroy_pipeline(struct pipeline *pipeline)
 	 * this ini so its life cycle is aligned with the associated dsp
 	 * pipeline.
 	 */
-	if (private_ini && (private_ini != global_ini))
+	if (private_ini && (private_ini != ini))
 		cras_dsp_ini_free(private_ini);
 }
 
@@ -123,20 +123,18 @@ static void cmd_load_pipeline(struct cras_dsp_context *ctx,
 
 static void cmd_reload_ini()
 {
-	struct ini *old_ini = global_ini;
+	struct ini *old_ini = ini;
 	struct cras_dsp_context *ctx;
 
-	struct ini *new_ini = cras_dsp_ini_create(ini_filename);
-	if (!new_ini) {
+	ini = cras_dsp_ini_create(ini_filename);
+	if (!ini) {
 		syslog(LOG_DEBUG, "cannot create dsp ini");
 		return;
 	}
 
 	DL_FOREACH (context_list, ctx) {
-		cmd_load_pipeline(ctx, new_ini);
+		cmd_load_pipeline(ctx, ini);
 	}
-
-	global_ini = new_ini;
 
 	if (old_ini)
 		cras_dsp_ini_free(old_ini);
@@ -155,11 +153,10 @@ void cras_dsp_init(const char *filename)
 void cras_dsp_stop()
 {
 	syslog_dumper_free(syslog_dumper);
-	if (ini_filename)
-		free((char *)ini_filename);
-	if (global_ini) {
-		cras_dsp_ini_free(global_ini);
-		global_ini = NULL;
+	free((char *)ini_filename);
+	if (ini) {
+		cras_dsp_ini_free(ini);
+		ini = NULL;
 	}
 }
 
@@ -205,18 +202,18 @@ void cras_dsp_set_variable_boolean(struct cras_dsp_context *ctx,
 
 void cras_dsp_load_pipeline(struct cras_dsp_context *ctx)
 {
-	cmd_load_pipeline(ctx, global_ini);
+	cmd_load_pipeline(ctx, ini);
 }
 
-void cras_dsp_load_mock_pipeline(struct cras_dsp_context *ctx,
-				 unsigned int num_channels)
+void cras_dsp_load_dummy_pipeline(struct cras_dsp_context *ctx,
+				  unsigned int num_channels)
 {
-	struct ini *mock_ini;
-	mock_ini = create_mock_ini(ctx->purpose, num_channels);
-	if (mock_ini == NULL)
-		syslog(LOG_ERR, "Failed to create mock ini");
+	struct ini *dummy_ini;
+	dummy_ini = create_dummy_ini(ctx->purpose, num_channels);
+	if (dummy_ini == NULL)
+		syslog(LOG_ERR, "Failed to create dummy ini");
 	else
-		cmd_load_pipeline(ctx, mock_ini);
+		cmd_load_pipeline(ctx, dummy_ini);
 }
 
 struct pipeline *cras_dsp_get_pipeline(struct cras_dsp_context *ctx)
@@ -244,8 +241,8 @@ void cras_dsp_dump_info()
 	struct pipeline *pipeline;
 	struct cras_dsp_context *ctx;
 
-	if (global_ini)
-		cras_dsp_ini_dump(syslog_dumper, global_ini);
+	if (ini)
+		cras_dsp_ini_dump(syslog_dumper, ini);
 	DL_FOREACH (context_list, ctx) {
 		cras_expr_env_dump(syslog_dumper, &ctx->env);
 		pipeline = ctx->pipeline;
